@@ -1,0 +1,254 @@
+{
+  "version": 1,
+  "defaults": {
+    "samplesPerScenario": 12,
+    "confidenceThreshold": 0.78
+  },
+  "shortcuts": [
+    {
+      "id": "shortcut_open_terminal",
+      "phrases": [
+        "打开一个黑窗口",
+        "给我开个命令行",
+        "开一个终端窗口"
+      ],
+      "routeType": "shortcut",
+      "intentId": "open_gnome_terminal",
+      "actionType": "shell"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "shortcut_open_terminal",
+      "description": "已学习快捷话术直接执行",
+      "texts": [
+        "打开一个黑窗口",
+        "给我开个命令行",
+        "开一个终端窗口"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "shortcut",
+        "source": "shortcut",
+        "intentId": "open_gnome_terminal"
+      }
+    },
+    {
+      "id": "intent_example_translate",
+      "description": "voice-actions examples 直接命中翻译 intent",
+      "texts": [
+        "翻译成中文",
+        "把剪贴板翻译成中文",
+        "翻译剪贴板成中文",
+        "把选中的内容翻译成中文"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "intent",
+        "source": "keyword",
+        "intentId": "translate_clipboard_to_zh"
+      }
+    },
+    {
+      "id": "intent_example_reply_confirm",
+      "description": "voice-actions examples 直接命中回复确认 intent",
+      "texts": [
+        "帮我回复确认",
+        "回复确认",
+        "输入确认"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "intent",
+        "source": "keyword",
+        "intentId": "reply_confirm"
+      }
+    },
+    {
+      "id": "codex_weather_new_task",
+      "description": "新复杂任务进入 Codex terminal",
+      "texts": [
+        "我想查一下今天天气",
+        "帮我看一下今天的天气怎么样",
+        "查一下今天会不会下雨",
+        "今天出门要不要带伞"
+      ],
+      "context": "none",
+      "qwenDecision": {
+        "routeType": "codex_terminal",
+        "intentId": null,
+        "confidence": 0.91,
+        "reason": "需要 Codex 查询和回答开放问题"
+      },
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "keyword",
+        "reuseCodexSession": false
+      }
+    },
+    {
+      "id": "codex_weather_city_followup",
+      "description": "Codex 追问城市后，短回答复用最近会话",
+      "texts": [
+        "深圳",
+        "深圳市",
+        "我在深圳",
+        "我所在的城市是深圳",
+        "城市是深圳"
+      ],
+      "context": "weather_followup",
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "context_followup",
+        "reuseCodexSession": true
+      }
+    },
+    {
+      "id": "city_without_context_is_not_followup",
+      "description": "没有 Codex 追问上下文时，单独城市名不能误判续聊",
+      "texts": [
+        "深圳",
+        "深圳市",
+        "我在深圳"
+      ],
+      "context": "none",
+      "qwenDecision": {
+        "routeType": "ask",
+        "intentId": null,
+        "confidence": 0.72,
+        "reason": "缺少任务上下文"
+      },
+      "expected": {
+        "routeType": "ask",
+        "source": "low_confidence"
+      },
+      "liveExpected": {
+        "routeType": "ask"
+      }
+    },
+    {
+      "id": "server_llm_selects_reply_confirm",
+      "description": "未直接命中 keyword/examples 时，服务端小模型选择 intent",
+      "texts": [
+        "用肯定答复一下",
+        "给对方一个肯定答复",
+        "这条消息用同意的语气确认",
+        "帮我回个收到可以"
+      ],
+      "context": "none",
+      "qwenDecision": {
+        "routeType": "intent",
+        "intentId": "reply_confirm",
+        "confidence": 0.87,
+        "reason": "用户想发送确认类回复"
+      },
+      "expected": {
+        "routeType": "intent",
+        "source": "qwen_route",
+        "intentId": "reply_confirm"
+      }
+    },
+    {
+      "id": "qwen_invalid_intent_protected",
+      "description": "Qwen 返回不存在的 intent 时进入保护",
+      "texts": [
+        "帮我做一下那个常用动作",
+        "执行一下我之前说的那个",
+        "弄一下那个配置"
+      ],
+      "context": "none",
+      "qwenDecision": {
+        "routeType": "intent",
+        "intentId": "missing_intent",
+        "confidence": 0.9,
+        "reason": "模拟错误 intent"
+      },
+      "expected": {
+        "routeType": "ask",
+        "source": "invalid_intent"
+      },
+      "liveExpected": {
+        "routeType": "ask"
+      }
+    },
+    {
+      "id": "qwen_low_confidence_protected",
+      "description": "Qwen 低置信时不执行危险动作",
+      "texts": [
+        "弄一下",
+        "处理一下这个",
+        "帮我搞一下"
+      ],
+      "context": "none",
+      "qwenDecision": {
+        "routeType": "intent",
+        "intentId": "open_gnome_terminal",
+        "confidence": 0.41,
+        "reason": "模拟低置信"
+      },
+      "expected": {
+        "routeType": "ask",
+        "source": "low_confidence"
+      },
+      "liveExpected": {
+        "routeType": "ask"
+      }
+    }
+  ],
+  "contexts": {
+    "none": {
+      "recentUtterances": [],
+      "activeWindow": {
+        "windowTitle": "",
+        "windowClass": "",
+        "isTerminal": false
+      },
+      "codexSession": null
+    },
+    "weather_followup": {
+      "recentUtterances": [
+        "我想查一下今天天气"
+      ],
+      "activeWindow": {
+        "windowTitle": "CapsWriter Codex Voice",
+        "windowClass": "Ptyxis",
+        "isTerminal": true
+      },
+      "codexSession": {
+        "windowId": "12345",
+        "awaitingFollowup": true,
+        "lastQuestion": "你在哪个城市？",
+        "lastSummary": "用户想查询今天的天气，Codex 正在询问城市。",
+        "updatedAt": "2026-05-13T00:00:00+08:00"
+      }
+    }
+  },
+  "noise": {
+    "prefixes": [
+      "",
+      "帮我",
+      "麻烦",
+      "那个",
+      "请"
+    ],
+    "suffixes": [
+      "",
+      "一下",
+      "吧",
+      "可以吗",
+      "谢谢"
+    ],
+    "fillers": [
+      "",
+      "嗯",
+      "呃",
+      "就是"
+    ],
+    "punctuation": [
+      "",
+      "。",
+      "，",
+      "！"
+    ]
+  }
+}

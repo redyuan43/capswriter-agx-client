@@ -1,0 +1,230 @@
+{
+  "version": 1,
+  "defaults": {
+    "confidenceThreshold": 0.78,
+    "samplesPerScenario": 4
+  },
+  "noise": {
+    "prefixes": ["帮我", "麻烦", "请", "那个", "可以"],
+    "suffixes": ["一下", "吧", "可以吗", "谢谢", ""],
+    "fillers": ["嗯", "就是", "然后", ""],
+    "punctuation": ["", "。", "，", "！"]
+  },
+  "shortcuts": [],
+  "contexts": {
+    "none": {
+      "recentUtterances": [],
+      "activeWindow": null,
+      "codexSession": null
+    },
+    "terminal": {
+      "recentUtterances": [],
+      "activeWindow": {
+        "title": "Terminal",
+        "class": "org.gnome.Ptyxis",
+        "isTerminal": true
+      },
+      "codexSession": null
+    },
+    "weather_followup": {
+      "recentUtterances": ["查一下今天的天气"],
+      "activeWindow": null,
+      "codexSession": {
+        "awaitingFollowup": true,
+        "lastQuestion": "你在哪个城市？",
+        "lastSummary": "用户想查询今天天气"
+      }
+    },
+    "codex_choice_followup": {
+      "recentUtterances": ["把推理模式选成 Instant"],
+      "activeWindow": null,
+      "codexSession": {
+        "awaitingFollowup": true,
+        "windowAlive": true,
+        "windowTitle": "CapsWriter Codex Voice - gpt-5.3-codex-spark id abc",
+        "windowClass": "org.gnome.Ptyxis",
+        "lastQuestion": "我可以用鼠标或键盘完成，需要你确认操作方式。",
+        "lastSummary": "用户要求在对话框里把推理模式选成 Instant"
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "id": "translate_clipboard_variants",
+      "description": "口语化翻译剪贴板",
+      "texts": [
+        "把刚复制的英文翻成中文",
+        "剪贴板里的英文帮我翻译一下",
+        "这个英文内容翻成中文",
+        "把复制的内容翻译成中文"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "translate_clipboard_to_zh"
+      }
+    },
+    {
+      "id": "open_terminal_variants",
+      "description": "打开终端窗口",
+      "texts": [
+        "开一个新的命令行",
+        "给我起一个终端窗口",
+        "打开一个可以输入命令的窗口",
+        "新建终端"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "open_gnome_terminal"
+      }
+    },
+    {
+      "id": "reply_confirm_variants",
+      "description": "输入确认并回车",
+      "texts": [
+        "在这里回复确认",
+        "给他发确认",
+        "输入确认然后提交",
+        "这个窗口回复确认"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "reply_confirm"
+      }
+    },
+    {
+      "id": "codex_weather_task",
+      "description": "天气查询交给 Codex",
+      "texts": [
+        "查一下今天深圳会不会下雨",
+        "帮我看看今天出门要不要带伞",
+        "今天深圳天气怎么样",
+        "查一下明天深圳的天气"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "codex_terminal"
+      }
+    },
+    {
+      "id": "codex_open_research",
+      "description": "开放研究和分析任务交给 Codex",
+      "texts": [
+        "帮我查一下语音路由有哪些最佳实践",
+        "分析一下这个策略哪里容易误判",
+        "写一版语音路由的测试计划",
+        "帮我整理一下刚才讨论的方案"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "codex_terminal"
+      }
+    },
+    {
+      "id": "weather_city_followup",
+      "description": "Codex 追问城市时复用原会话",
+      "texts": [
+        "深圳",
+        "我在深圳",
+        "城市是深圳",
+        "深圳市"
+      ],
+      "context": "weather_followup",
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "context_followup"
+      }
+    },
+    {
+      "id": "codex_choice_followup",
+      "description": "Codex 追问操作方式时复用原会话",
+      "texts": [
+        "可以用鼠标也可以用键盘",
+        "用鼠标也行",
+        "你看方便就行",
+        "我没意见"
+      ],
+      "context": "codex_choice_followup",
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "context_followup"
+      }
+    },
+    {
+      "id": "intent_wins_over_codex_followup",
+      "description": "Codex 等待追问时固定 intent 仍优先",
+      "texts": [
+        "打开一个新终端",
+        "新建终端",
+        "开一个命令行窗口",
+        "给我起一个终端"
+      ],
+      "context": "codex_choice_followup",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "open_gnome_terminal"
+      }
+    },
+    {
+      "id": "ambiguous_short_phrases",
+      "description": "含糊指令不要自动执行",
+      "texts": [
+        "这个处理一下",
+        "帮我弄一下",
+        "就按刚才那个来",
+        "配置一下"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "ask"
+      }
+    },
+    {
+      "id": "add_voice_intent_variants",
+      "description": "明确添加语音意图",
+      "texts": [
+        "新增一个语音快捷指令",
+        "我想添加一个语音意图",
+        "帮我创建一个语音命令",
+        "进入语音意图配置"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "add_voice_intent"
+      }
+    },
+    {
+      "id": "open_vscode_terminal_context",
+      "description": "活动终端里打开 VS Code",
+      "texts": [
+        "用 VS Code 打开这个目录",
+        "当前目录用 code 打开",
+        "把这个终端所在目录开到 vscode",
+        "在这里启动 VS Code"
+      ],
+      "context": "terminal",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "open_vscode"
+      }
+    },
+    {
+      "id": "summarize_terminal_context",
+      "description": "总结当前终端",
+      "texts": [
+        "总结这个终端刚才发生了什么",
+        "把当前终端的内容概括一下",
+        "看看这个终端现在卡在哪里",
+        "帮我总结一下终端输出"
+      ],
+      "context": "terminal",
+      "expected": {
+        "routeType": "intent",
+        "intentId": "summarize_current_terminal"
+      }
+    }
+  ]
+}

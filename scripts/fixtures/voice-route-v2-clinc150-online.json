@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "source": {
+    "name": "CLINC150 / CLINC OOS evaluation dataset",
+    "url": "https://raw.githubusercontent.com/clinc/oos-eval/master/data/data_full.json",
+    "localRawPath": "/tmp/capswriter-online-datasets/clinc150-data_full.json",
+    "note": "Generated from public CLINC150 utterances, not from the original synthetic CapsWriter fixture."
+  },
+  "defaults": {
+    "samplesPerScenario": 8,
+    "confidenceThreshold": 0.78,
+    "disableNoise": true
+  },
+  "shortcuts": [],
+  "scenarios": [
+    {
+      "id": "clinc150_weather",
+      "description": "CLINC150 weather utterances should become Codex terminal open queries",
+      "texts": [
+        "what is the weather",
+        "current weather",
+        "tell me the weather",
+        "what's the weather like today",
+        "what is the weather like",
+        "show me what the weather is like",
+        "let's take a look at the weather",
+        "how is the weather looking in seattle"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "qwen_route",
+        "reuseCodexSession": false
+      }
+    },
+    {
+      "id": "clinc150_translate",
+      "description": "CLINC150 translate utterances translate explicit text/phrases, not clipboard, so route to Codex terminal",
+      "texts": [
+        "how would you say fly in italian",
+        "what's the spanish word for pasta",
+        "how would they say butter in zambia",
+        "how do you say fast in spanish",
+        "what's the word for trees in norway",
+        "how does one say wonderful in german",
+        "how do they say tacos in mexico",
+        "how would one say cruiser in china"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "qwen_route",
+        "reuseCodexSession": false
+      }
+    },
+    {
+      "id": "clinc150_definition",
+      "description": "CLINC150 definition utterances are open knowledge tasks for Codex terminal",
+      "texts": [
+        "define antebellum",
+        "define discontent",
+        "what is the meaning of incandescent",
+        "what does confrontation mean",
+        "what does serendipity mean",
+        "what's the definition of luminescent",
+        "what is the definiton of auspicious",
+        "what does circuitous mean"
+      ],
+      "context": "none",
+      "expected": {
+        "routeType": "codex_terminal",
+        "source": "qwen_route",
+        "reuseCodexSession": false
+      }
+    }
+  ],
+  "contexts": {
+    "none": {
+      "recentUtterances": [],
+      "activeWindow": {
+        "windowTitle": "",
+        "windowClass": "",
+        "isTerminal": false
+      },
+      "codexSession": null
+    }
+  },
+  "noise": {
+    "prefixes": [
+      ""
+    ],
+    "suffixes": [
+      ""
+    ],
+    "fillers": [
+      ""
+    ],
+    "punctuation": [
+      ""
+    ]
+  }
+}
