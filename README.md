@@ -201,6 +201,132 @@ uv sync  # 会自动下载 Python 3.11
 
 ---
 
+## Linux ARM64 / AGX Release 安装后配置
+
+从 GitHub Release 下载 `CapsWriter-GUI-*-linux-arm64.AppImage` 后，AGX / Jetson / ARM64 Linux 桌面需要额外完成以下系统配置，才能让按住 Right Shift 唤醒录音和识别后自动粘贴稳定工作。
+
+### 1. AppImage 运行方式
+
+如果系统缺少 `libfuse.so.2`，AppImage 直接运行会报错：
+
+```text
+dlopen(): error loading libfuse.so.2
+AppImages require FUSE to run.
+```
+
+不想安装系统 FUSE 时，可以解包运行：
+
+```bash
+mkdir -p "$HOME/.local/opt/capswriter-agx-client"
+cd "$HOME/.local/opt/capswriter-agx-client"
+
+# 将下载的 AppImage 放到当前目录后执行：
+chmod +x CapsWriter-GUI-*-linux-arm64.AppImage
+./CapsWriter-GUI-*-linux-arm64.AppImage --appimage-extract
+mv squashfs-root app
+```
+
+建议创建用户级启动入口：
+
+```bash
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/capswriter-agx-client" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APPDIR="$HOME/.local/opt/capswriter-agx-client/app"
+LOG_DIR="$HOME/.cache/capswriter-agx-client"
+LOG_FILE="$LOG_DIR/capswriter-agx-client.log"
+
+mkdir -p "$LOG_DIR"
+
+if pgrep -u "$(id -u)" -f "$APPDIR/speech-transcription" >/dev/null 2>&1; then
+  exit 0
+fi
+
+export APPDIR
+export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"
+exec "$APPDIR/AppRun" --no-sandbox "$@" >>"$LOG_FILE" 2>&1
+EOF
+chmod +x "$HOME/.local/bin/capswriter-agx-client"
+```
+
+### 2. Right Shift 按住无反应
+
+Linux ARM64 release 里的 `uiohook-napi` 预构建文件可能不是有效的 ARM64 Linux native module。AGX/Jetson 上建议显式使用 evdev 后端：
+
+```bash
+export CAPS_LISTENER_BACKEND=evdev
+```
+
+evdev 后端需要读取 `/dev/input/event*`。把当前用户加入 `input` 组，并给当前会话临时 ACL：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y acl
+sudo usermod -aG input "$USER"
+sudo setfacl -m "u:$USER:r" /dev/input/event*
+```
+
+说明：
+
+- `usermod -aG input` 对后续登录会话生效，建议重新登录或重启桌面会话。
+- `setfacl` 让当前会话立即生效，但设备重建或重启后可能需要重新应用。
+- 如果日志出现 `EACCES`，说明当前用户还没有 `/dev/input/event*` 读取权限。
+
+验证日志：
+
+```bash
+tail -f "$HOME/.cache/capswriter-agx-client/capswriter-agx-client.log"
+```
+
+看到类似以下内容，表示 Right Shift 已被监听：
+
+```text
+Wayland input listener 已连接 ... 个键盘设备
+Right Shift 按下, keycode: 54
+Right Shift 松开, keycode: 54
+```
+
+### 3. 识别后无法自动粘贴
+
+自动粘贴依赖 Linux 剪贴板和按键注入工具。若日志出现 `spawn xdotool ENOENT`、`spawn ydotool ENOENT` 或 `spawn wl-copy ENOENT`，安装：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y xdotool wl-clipboard
+```
+
+X11 桌面通常使用 `xdotool`；Wayland 剪贴板写入使用 `wl-copy`。安装后重新启动客户端。
+
+### 4. 登录自启动
+
+创建 XDG autostart 文件：
+
+```bash
+mkdir -p "$HOME/.config/autostart"
+cat > "$HOME/.config/autostart/capswriter-agx-client.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=CapsWriter AGX Client
+Comment=Start CapsWriter AGX Client on desktop login
+Exec=$HOME/.local/bin/capswriter-agx-client
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+EOF
+```
+
+验证：
+
+```bash
+desktop-file-validate "$HOME/.config/autostart/capswriter-agx-client.desktop"
+"$HOME/.local/bin/capswriter-agx-client"
+```
+
+---
+
 ## 🪟 Windows 安装指南（客户端）
 
 以下脚本位于 `scripts/` 目录，均需在 PowerShell 中执行。建议以“管理员权限”运行，以保证全局热键可用。
