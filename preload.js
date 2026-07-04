@@ -110,6 +110,33 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("codex-hold-up", callback);
   },
 
+  onExternalRecordingStart: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-start", listener);
+    return () => ipcRenderer.removeListener("external-recording-start", listener);
+  },
+
+  onExternalRecordingChunk: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-chunk", listener);
+    return () => ipcRenderer.removeListener("external-recording-chunk", listener);
+  },
+
+  onExternalRecordingStop: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-stop", listener);
+    return () => ipcRenderer.removeListener("external-recording-stop", listener);
+  },
+
+  onExternalRecordingError: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-error", listener);
+    return () => ipcRenderer.removeListener("external-recording-error", listener);
+  },
+
+  reportExternalRecordingResult: (payload) =>
+    ipcRenderer.invoke("m5-voice-recording-result", payload),
+
   interruptMiniCPMVoice: () => ipcRenderer.invoke("interrupt-minicpm-voice"),
   submitMiniCPMVoicePrompt: (prompt) => ipcRenderer.invoke("submit-minicpm-voice-prompt", prompt),
   submitCodexVoicePrompt: (prompt) => ipcRenderer.invoke("submit-codex-voice-prompt", prompt),

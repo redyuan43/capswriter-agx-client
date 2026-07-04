@@ -13,7 +13,8 @@ const TTS_PLAN_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_PLAN_REQUEST
 const TTS_CONTROL_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_CONTROL_REQUEST_TIMEOUT_MS || 10000);
 const ASR_STREAM_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_ASR_STREAM_CONNECT_TIMEOUT_MS || 15000);
 const ASR_STREAM_IDLE_TIMEOUT_MS = Number(import.meta.env.VITE_ASR_STREAM_IDLE_TIMEOUT_MS || 20000);
-const REALTIME_ASR_URL = (import.meta.env.VITE_REALTIME_ASR_URL || '').trim();
+const DEFAULT_REALTIME_ASR_URL = 'ws://agx.taild500c8.ts.net:18011/api/asr/realtime';
+const REALTIME_ASR_URL = (import.meta.env.VITE_REALTIME_ASR_URL || DEFAULT_REALTIME_ASR_URL).trim();
 const REALTIME_ASR_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS || 2500);
 const REALTIME_ASR_FINAL_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MS || 15000);
 const REALTIME_ASR_FINAL_TIMEOUT_MAX_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MAX_MS || 120000);
@@ -688,6 +689,195 @@ export class RealtimeASRSession {
 
   cancel() {
     this.stopAudioPump();
+    if (!this.websocket) {
+      return;
+    }
+    if (this.websocket.readyState === WebSocket.OPEN) {
+      this.websocket.send(JSON.stringify({ type: 'cancel' }));
+      this.websocket.close();
+    } else if (this.websocket.readyState === WebSocket.CONNECTING) {
+      this.websocket.close();
+    }
+  }
+}
+
+export class ExternalPCMRealtimeSession {
+  constructor(options = {}) {
+    this.url = options.url || REALTIME_ASR_URL;
+    this.language = options.language || '';
+    this.hotword = options.hotword || '';
+    this.optimizeMode = options.optimizeMode || 'none';
+    this.translateTarget = options.translateTarget || 'zh';
+    this.intentMode = options.intentMode || 'none';
+    this.clientIntents = Array.isArray(options.clientIntents) ? options.clientIntents : [];
+    this.clientIntentConfidenceThreshold = Number.isFinite(Number(options.clientIntentConfidenceThreshold))
+      ? Number(options.clientIntentConfidenceThreshold)
+      : 0.78;
+    this.onEvent = options.onEvent || null;
+    this.targetSampleRate = Number(options.sampleRate || 16000);
+    this.websocket = null;
+    this.started = false;
+    this.stopped = false;
+    this.finalPayload = null;
+    this.latestTextPayload = null;
+    this.pendingChunks = [];
+    this.finalPromise = new Promise((resolve, reject) => {
+      this.finalResolve = resolve;
+      this.finalReject = reject;
+    });
+    this.finalPromise.catch(() => {});
+  }
+
+  async start() {
+    if (!this.url) {
+      throw new Error('Realtime ASR URL is not configured');
+    }
+    if (typeof WebSocket === 'undefined') {
+      throw new Error('当前浏览器不支持 WebSocket');
+    }
+    await withClientTimeout(this.openWebSocket(), REALTIME_ASR_CONNECT_TIMEOUT_MS, `Realtime ASR connect timeout (${REALTIME_ASR_CONNECT_TIMEOUT_MS}ms)`);
+    this.started = true;
+    this.flushPendingChunks();
+  }
+
+  openWebSocket() {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(this.url);
+      this.websocket = ws;
+      let ready = false;
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({
+          type: 'start',
+          sample_rate: this.targetSampleRate,
+          language: this.language,
+          hotword: this.hotword,
+          optimize_mode: this.optimizeMode,
+          translate_target: this.translateTarget,
+          intent_mode: this.intentMode,
+          client_intents: this.intentMode === 'client_intent' ? this.clientIntents : [],
+          client_intent_confidence_threshold: this.clientIntentConfidenceThreshold,
+        }));
+      };
+
+      ws.onerror = () => {
+        const error = new Error('Realtime ASR websocket error');
+        if (!ready) {
+          reject(error);
+        } else if (!this.finalPayload) {
+          this.finalReject(error);
+        }
+      };
+
+      ws.onclose = () => {
+        if (!ready) {
+          reject(new Error('Realtime ASR websocket closed before ready'));
+        } else if (!this.finalPayload && !this.stopped) {
+          this.finalReject(new Error('Realtime ASR websocket closed before final'));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        let payload = null;
+        try {
+          payload = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        if (typeof this.onEvent === 'function') {
+          this.onEvent(payload);
+        }
+        const type = (payload?.type || '').toLowerCase();
+        if (type === 'partial' || type === 'final') {
+          this.latestTextPayload = payload;
+        }
+        if (type === 'ready') {
+          ready = true;
+          resolve(payload);
+          return;
+        }
+        if (type === 'final') {
+          this.finalPayload = payload;
+          this.finalResolve(payload);
+          return;
+        }
+        if (type === 'closed') {
+          if (!this.finalPayload) {
+            this.finalReject(new Error(payload?.error || payload?.message || 'Realtime ASR closed before final'));
+          }
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.close();
+          }
+          return;
+        }
+        if (type === 'error') {
+          const error = new Error(payload?.error || payload?.message || 'Realtime ASR returned an error event');
+          if (!ready) {
+            reject(error);
+          } else {
+            this.finalReject(error);
+          }
+        }
+      };
+    });
+  }
+
+  sendPCM(chunk) {
+    if (this.stopped || !chunk?.byteLength) {
+      return;
+    }
+    const buffer = chunk instanceof ArrayBuffer
+      ? chunk
+      : chunk.buffer.slice(chunk.byteOffset || 0, (chunk.byteOffset || 0) + chunk.byteLength);
+    if (this.websocket?.readyState === WebSocket.OPEN && this.started) {
+      this.websocket.send(buffer);
+      return;
+    }
+    this.pendingChunks.push(buffer);
+  }
+
+  flushPendingChunks() {
+    if (this.websocket?.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const chunks = this.pendingChunks;
+    this.pendingChunks = [];
+    for (const chunk of chunks) {
+      this.websocket.send(chunk);
+    }
+  }
+
+  getLatestTextPayload() {
+    if (!this.latestTextPayload) {
+      return null;
+    }
+    return { ...this.latestTextPayload };
+  }
+
+  async finish(options = {}) {
+    this.stopped = true;
+    if (!this.started || !this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
+      throw new Error('Realtime ASR session is not open');
+    }
+    this.flushPendingChunks();
+    const timeoutMs = normalizePositiveNumber(
+      options.timeoutMs,
+      normalizePositiveNumber(REALTIME_ASR_FINAL_TIMEOUT_MS, 15000)
+    );
+    this.websocket.send(JSON.stringify({ type: 'finish' }));
+    const payload = await withClientTimeout(
+      this.finalPromise,
+      timeoutMs,
+      `Realtime ASR final timeout (${timeoutMs}ms)`
+    );
+    this.websocket.close();
+    return payload;
+  }
+
+  cancel() {
+    this.stopped = true;
+    this.pendingChunks = [];
     if (!this.websocket) {
       return;
     }

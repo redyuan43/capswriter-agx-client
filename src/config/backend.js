@@ -25,8 +25,10 @@ const ENDPOINTS = {
 };
 
 // 基础配置
+const DEFAULT_BACKEND_URL = 'http://agx.taild500c8.ts.net:8001';
+
 const config = {
-  baseURL: (import.meta.env.VITE_BACKEND_URL || '').trim(),
+  baseURL: (import.meta.env.VITE_BACKEND_URL || DEFAULT_BACKEND_URL).trim(),
   ttsBaseURL: (import.meta.env.VITE_TTS_BASE_URL || import.meta.env.VITE_BACKEND_URL || '').trim(),
   timeout: 30000,
   endpoints: ENDPOINTS

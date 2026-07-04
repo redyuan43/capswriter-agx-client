@@ -4,7 +4,21 @@ import appLogoUrl from "../../../assets/icon.png?url";
 import codexCompletionChimeUrl from "../../assets/audio/codex-complete.oga?url";
 import { useRecording } from "../../hooks/useRecording";
 import { useModelStatus } from "../../hooks/useModelStatus";
-import { planTtsChunks, speakText, translateText, loadTtsModel, unloadTtsModel, loadService, unloadService, isHttpBackendConfigured, learnHotwords } from "../../services/backendAPI.js";
+import {
+  ExternalPCMRealtimeSession,
+  computeRealtimeASRFinalTimeoutMs,
+  isRealtimeASRConfigured,
+  planTtsChunks,
+  speakText,
+  translateText,
+  transcribeAudioStream,
+  loadTtsModel,
+  unloadTtsModel,
+  loadService,
+  unloadService,
+  isHttpBackendConfigured,
+  learnHotwords,
+} from "../../services/backendAPI.js";
 import { isExactSilentASRArtifactText } from "../../helpers/silentAsrArtifacts.js";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -281,6 +295,119 @@ function sliceByCharacters(text, count) {
   return Array.from(String(text || "")).slice(0, Math.max(0, count)).join("");
 }
 
+function payloadToArrayBuffer(chunk) {
+  if (!chunk) return new ArrayBuffer(0);
+  if (chunk instanceof ArrayBuffer) return chunk;
+  if (ArrayBuffer.isView(chunk)) {
+    return chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+  }
+  return new Uint8Array(chunk).buffer;
+}
+
+function concatArrayBuffers(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+  return merged.buffer;
+}
+
+function writeAscii(view, offset, value) {
+  for (let i = 0; i < value.length; i += 1) {
+    view.setUint8(offset + i, value.charCodeAt(i));
+  }
+}
+
+function createWavBlobFromPCM(chunks, sampleRate = 16000) {
+  const pcm = concatArrayBuffers(chunks);
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  const bytesPerSample = 2;
+  const channels = 1;
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + pcm.byteLength, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * bytesPerSample, true);
+  view.setUint16(32, channels * bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, pcm.byteLength, true);
+  return new Blob([header, pcm], { type: "audio/wav" });
+}
+
+function computePCMStats(chunks, sampleRate = 16000) {
+  const pcm = concatArrayBuffers(chunks);
+  const view = new DataView(pcm);
+  const sampleCount = Math.floor(pcm.byteLength / 2);
+  let peakAbs = 0;
+  let sumSquares = 0;
+  let activeSamples = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const sample = view.getInt16(i * 2, true) / 32768;
+    const abs = Math.abs(sample);
+    if (abs > peakAbs) peakAbs = abs;
+    sumSquares += sample * sample;
+    if (abs >= 0.0025) activeSamples += 1;
+  }
+  const durationSec = sampleRate > 0 ? sampleCount / sampleRate : 0;
+  return {
+    sampleRate,
+    chunkCount: chunks.length,
+    totalSamples: sampleCount,
+    durationMs: Math.round(durationSec * 1000),
+    durationSec: Number(durationSec.toFixed(3)),
+    bufferSize: pcm.byteLength,
+    peakAbs: Number(peakAbs.toFixed(6)),
+    rms: sampleCount ? Number(Math.sqrt(sumSquares / sampleCount).toFixed(6)) : 0,
+    activeSamples,
+    activeRatio: sampleCount ? Number((activeSamples / sampleCount).toFixed(6)) : 0,
+  };
+}
+
+function normalizeASRPayload(payload, wavBlob) {
+  const text = String(
+    payload?.final_text ||
+    payload?.translated_text ||
+    payload?.optimized_text ||
+    payload?.asr_text ||
+    payload?.text ||
+    ""
+  ).trim();
+  return {
+    success: payload?.success !== false,
+    text,
+    asr_text: payload?.asr_text || payload?.text || text,
+    raw_asr_text: payload?.raw_asr_text || "",
+    duration: payload?.duration || payload?.timing?.audio_duration_s || 0,
+    language: payload?.language || "zh-CN",
+    confidence: payload?.confidence || 0.95,
+    request_id: payload?.request_id,
+    audio_stats: payload?.audio_stats || null,
+    postprocess_mode: payload?.postprocess_mode || "none",
+    translation_success: payload?.translation_success,
+    translation_error: payload?.translation_error,
+    voice_command_applied: payload?.voice_command_applied === true,
+    voice_command_type: payload?.voice_command_type || "",
+    voice_command_phrase: payload?.voice_command_phrase || "",
+    voice_command_source: payload?.voice_command_source || "",
+    voice_command_confidence: payload?.voice_command_confidence,
+    voice_intent_id: payload?.voice_intent_id || "",
+    voice_intent_source: payload?.voice_intent_source || "",
+    voice_intent_confidence: payload?.voice_intent_confidence,
+    voice_intent_reason: payload?.voice_intent_reason || "",
+    voice_intent_action_type: payload?.voice_intent_action_type || "",
+    file_size: wavBlob?.size || 0,
+  };
+}
+
 export default function FloatingBallApp() {
   const [realtimeText, setRealtimeText] = useState("");
   const [displayedRealtimeText, setDisplayedRealtimeText] = useState("");
@@ -341,6 +468,9 @@ export default function FloatingBallApp() {
   const typewriterStepMsRef = useRef(TYPEWRITER_TYPE_STEP_MS);
   const lastAnimatedTargetAtRef = useRef(0);
   const lastAnimatedTargetTextRef = useRef("");
+  const externalRecordingRef = useRef(null);
+  const externalPCMChunksRef = useRef([]);
+  const externalRealtimeSessionRef = useRef(null);
   const TTS_CHUNK_RETRY = 1;
   const TTS_FAIL_STOP_THRESHOLD = 3;
 
@@ -1834,6 +1964,241 @@ export default function FloatingBallApp() {
     }
   }, [setAnimatedRealtimeTarget, startInitialLoadingTimer, stopInitialLoadingTimer, transitionStatus]);
 
+  const reportExternalRecordingResult = useCallback((payload) => {
+    window.electronAPI?.reportExternalRecordingResult?.(payload).catch((error) => {
+      logRuntime("warn", "Failed to report external recording result", {
+        error: error?.message || String(error),
+      });
+    });
+  }, [logRuntime]);
+
+  const startExternalRecording = useCallback(async (payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    if (!sessionId) {
+      return;
+    }
+    if (externalRealtimeSessionRef.current) {
+      externalRealtimeSessionRef.current.cancel();
+      externalRealtimeSessionRef.current = null;
+    }
+    externalPCMChunksRef.current = [];
+    externalRecordingRef.current = {
+      sessionId,
+      sampleRate: Number(payload.sample_rate || 16000),
+      startedAt: Date.now(),
+      realtimeStartPromise: null,
+      realtimeFailed: false,
+      realtimeError: null,
+    };
+
+    recordingModeRef.current = "dictation";
+    outputControlRef.current = {
+      generation: outputControlRef.current.generation + 1,
+      interrupted: false,
+      reason: "",
+    };
+    setAnimatedRealtimeTarget("", { immediate: true });
+    setMessage("");
+    setColdStartLoading(false);
+    stopInitialLoadingTimer();
+    await transitionStatus("recording");
+
+    if (!modelStatus.isReady) {
+      const message = modelStatus.isLoading ? "服务正在启动中，请稍候" : "模型未就绪";
+      await transitionStatus("error");
+      setMessage(message);
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: false,
+        status: "start_failed",
+        error: message,
+      });
+      return;
+    }
+
+    if (isRealtimeASRConfigured()) {
+      const realtimeSession = new ExternalPCMRealtimeSession({
+        sampleRate: externalRecordingRef.current.sampleRate,
+        hotword: sessionHotwordsRef.current.join("\n"),
+        optimizeMode: translateMode === "translate" ? "translate" : "none",
+        translateTarget: translateTarget || "zh",
+        onEvent: (event) => {
+          const type = (event?.type || "").toLowerCase();
+          const text = event?.text || event?.partial_text || event?.asr_text || "";
+          if (type === "ready") {
+            handleTranscriptionProgress({
+              stage: "realtime_ready",
+              message: "",
+              source: "external_m5",
+            });
+          } else if (type === "partial" && text) {
+            handleTranscriptionProgress({
+              stage: "recognizing",
+              message: "识别中...",
+              source: "realtime",
+              text,
+            });
+          }
+        },
+      });
+      externalRealtimeSessionRef.current = realtimeSession;
+      externalRecordingRef.current.realtimeStartPromise = realtimeSession.start().catch((error) => {
+        externalRecordingRef.current.realtimeFailed = true;
+        externalRecordingRef.current.realtimeError = error;
+        logRuntime("warn", "External M5 realtime ASR unavailable, will use upload fallback", {
+          error: error?.message || String(error),
+        });
+        if (externalRealtimeSessionRef.current === realtimeSession) {
+          externalRealtimeSessionRef.current = null;
+        }
+        realtimeSession.cancel();
+      });
+    }
+
+    logRuntime("info", "External M5 recording started", {
+      sessionId,
+      sampleRate: externalRecordingRef.current.sampleRate,
+    });
+  }, [handleTranscriptionProgress, logRuntime, modelStatus.isLoading, modelStatus.isReady, reportExternalRecordingResult, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
+
+  const receiveExternalRecordingChunk = useCallback((payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = externalRecordingRef.current;
+    if (!session || session.sessionId !== sessionId) {
+      return;
+    }
+    const chunk = payloadToArrayBuffer(payload.chunk);
+    if (!chunk.byteLength) {
+      return;
+    }
+    externalPCMChunksRef.current.push(chunk);
+    if (externalRealtimeSessionRef.current) {
+      externalRealtimeSessionRef.current.sendPCM(chunk);
+    }
+  }, []);
+
+  const stopExternalRecording = useCallback(async (payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = externalRecordingRef.current;
+    if (!session || session.sessionId !== sessionId) {
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: false,
+        status: "stop_failed",
+        error: "External recording session not found",
+      });
+      return;
+    }
+
+    try {
+      stopInitialLoadingTimer();
+      setColdStartLoading(false);
+      handleTranscriptionProgress({ stage: "uploading_or_starting", message: "处理中..." });
+
+      const chunks = externalPCMChunksRef.current.slice();
+      if (!chunks.length) {
+        throw new Error("M5 没有上传到音频数据");
+      }
+      const sampleRate = session.sampleRate || 16000;
+      const stats = computePCMStats(chunks, sampleRate);
+      const wavBlob = createWavBlobFromPCM(chunks, sampleRate);
+      let finalPayload = null;
+      let realtimeError = null;
+
+      if (session.realtimeStartPromise) {
+        await session.realtimeStartPromise.catch(() => null);
+      }
+      if (externalRealtimeSessionRef.current) {
+        try {
+          finalPayload = await externalRealtimeSessionRef.current.finish({
+            timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
+          });
+        } catch (error) {
+          realtimeError = error;
+          const latest = externalRealtimeSessionRef.current.getLatestTextPayload?.();
+          if (latest?.text || latest?.partial_text || latest?.asr_text) {
+            finalPayload = {
+              ...latest,
+              type: "final",
+              success: true,
+              final_text: latest.text || latest.partial_text || latest.asr_text || "",
+              realtime_final_fallback: true,
+              realtime_final_error: error?.message || String(error),
+            };
+          } else {
+            externalRealtimeSessionRef.current.cancel();
+          }
+        }
+      }
+
+      if (!finalPayload || !String(finalPayload.final_text || finalPayload.text || finalPayload.asr_text || "").trim()) {
+        if (realtimeError) {
+          logRuntime("warn", "External M5 realtime final failed, using upload fallback", {
+            error: realtimeError?.message || String(realtimeError),
+          });
+        }
+        finalPayload = await transcribeAudioStream(wavBlob, {
+          useVad: true,
+          usePunc: true,
+          hotword: sessionHotwordsRef.current.join("\n"),
+          optimizeMode: translateMode === "translate" ? "translate" : "none",
+          translateTarget: translateTarget || "zh",
+          onEvent: (event) => {
+            const stage = (event?.stage || "").toLowerCase();
+            if (stage === "start" || stage === "asr_started") {
+              handleTranscriptionProgress({ stage: "recognizing", message: event?.message || "识别中..." });
+            } else if (stage === "asr_complete") {
+              handleTranscriptionProgress({
+                stage: "preview_ready",
+                message: "识别完成",
+                text: event?.text || event?.asr_text || "",
+              });
+            }
+          },
+        });
+      }
+
+      const transcriptionResult = normalizeASRPayload(finalPayload, wavBlob);
+      transcriptionResult.audio_stats = transcriptionResult.audio_stats || stats;
+      await handleRecordingComplete(transcriptionResult);
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: transcriptionResult.success !== false && Boolean(transcriptionResult.text || transcriptionResult.asr_text),
+        status: transcriptionResult.text || transcriptionResult.asr_text ? "pasted" : "transcription_failed",
+        text: transcriptionResult.text || transcriptionResult.asr_text || "",
+        message: "External M5 recording handled by CapsWriter",
+      });
+      logRuntime("info", "External M5 recording completed", {
+        sessionId,
+        bytes: wavBlob.size,
+        chunks: chunks.length,
+        durationMs: stats.durationMs,
+        textLength: (transcriptionResult.text || "").length,
+      });
+    } catch (error) {
+      await transitionStatus("error");
+      const message = error?.message || String(error);
+      setMessage(`音频处理失败：${message}`);
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: false,
+        status: "transcription_failed",
+        error: message,
+      });
+      setTimeout(() => {
+        resetUI();
+        hideFloatingBall();
+      }, 1600);
+    } finally {
+      if (externalRealtimeSessionRef.current) {
+        externalRealtimeSessionRef.current.cancel();
+        externalRealtimeSessionRef.current = null;
+      }
+      externalRecordingRef.current = null;
+      externalPCMChunksRef.current = [];
+    }
+  }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, reportExternalRecordingResult, resetUI, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
+
   const handleAIOptimizationComplete = useCallback(() => {
   }, []);
 
@@ -2195,6 +2560,41 @@ export default function FloatingBallApp() {
       };
     }
   }, [scheduleStopRecordingAfterRelease, startRecordingWithCheck]);
+
+  useEffect(() => {
+    if (!window.electronAPI) {
+      return undefined;
+    }
+    const unsubscribeStart = window.electronAPI.onExternalRecordingStart?.((payload) => {
+      startExternalRecording(payload).catch((error) => {
+        reportExternalRecordingResult(payload?.session_id, "start_failed", {
+          message: error?.message || "外部录音启动失败"
+        });
+      });
+    });
+    const unsubscribeChunk = window.electronAPI.onExternalRecordingChunk?.((payload) => {
+      receiveExternalRecordingChunk(payload);
+    });
+    const unsubscribeStop = window.electronAPI.onExternalRecordingStop?.((payload) => {
+      stopExternalRecording(payload).catch((error) => {
+        reportExternalRecordingResult(payload?.session_id, "failed", {
+          message: error?.message || "外部录音处理失败"
+        });
+      });
+    });
+    const unsubscribeError = window.electronAPI.onExternalRecordingError?.((payload) => {
+      const message = payload?.error || payload?.message || "外部录音设备错误";
+      transitionStatus("error");
+      setMessage(message);
+    });
+
+    return () => {
+      if (unsubscribeStart) unsubscribeStart();
+      if (unsubscribeChunk) unsubscribeChunk();
+      if (unsubscribeStop) unsubscribeStop();
+      if (unsubscribeError) unsubscribeError();
+    };
+  }, [receiveExternalRecordingChunk, reportExternalRecordingResult, startExternalRecording, stopExternalRecording, transitionStatus]);
 
   useEffect(() => {
     if (!window.electronAPI?.onCodexVoiceUpdate) return undefined;

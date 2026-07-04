@@ -48,6 +48,7 @@ const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
 const { LinkBookmarkManager } = require("./src/helpers/linkBookmarkManager");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
+const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
 
 // Setup production PATH for Python
 function setupProductionPath() {
@@ -326,6 +327,11 @@ const voiceLearningManager = new VoiceLearningManager({ logger });
 const voiceTeacherClassifier = new VoiceTeacherClassifier({ logger, cwd: __dirname });
 const linkBookmarkManager = new LinkBookmarkManager({ logger });
 linkBookmarkManager.initializeDefaults();
+const m5VoiceBridge = new M5VoiceBridge({
+  logger,
+  windowManager,
+  sendToRenderer: safeSendToMainWindow,
+});
 const voiceActionManager = new VoiceActionManager({
   logger,
   clipboardManager,
@@ -680,6 +686,10 @@ ipcMain.handle("route-nx1-qwen-terminal-request", async (_event, payload = {}) =
   return await nx1QwenRouter.routeTerminalRequest(payload || {});
 });
 
+ipcMain.handle("m5-voice-recording-result", async (_event, payload = {}) => {
+  return m5VoiceBridge.handleRendererResult(payload);
+});
+
 // Main app startup function
 async function startApp() {
   logger.info('Application starting', {
@@ -830,6 +840,8 @@ async function startApp() {
     logger.warn('Dictation hold-key listener unavailable, 按住唤醒功能已禁用');
   }
 
+  m5VoiceBridge.start();
+
   logger.info('Application startup complete');
 }
 
@@ -856,6 +868,7 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
   stopClipboardWatch();
+  m5VoiceBridge.stop();
   globalShortcut.unregisterAll();
   processMonitorManager.destroy();
   requestManagedStackShutdown();
