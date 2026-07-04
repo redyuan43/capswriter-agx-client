@@ -54,9 +54,10 @@ function parseJson(buffer) {
 }
 
 class M5VoiceBridge {
-  constructor({ logger, windowManager, sendToRenderer }) {
+  constructor({ logger, windowManager, clipboardManager, sendToRenderer }) {
     this.logger = logger;
     this.windowManager = windowManager;
+    this.clipboardManager = clipboardManager;
     this.sendToRenderer = sendToRenderer;
     this.server = null;
     this.sessions = new Map();
@@ -214,11 +215,13 @@ class M5VoiceBridge {
       chunks: 0,
       done: false,
       createdAt: Date.now(),
+      targetWindowId: "",
       resolver: null,
       stopTimer: null,
     };
     this.sessions.set(sessionId, session);
     this.windowManager?.showFloatingBall?.();
+    session.targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
     this.sendToRenderer("external-recording-start", {
       session_id: sessionId,
       source: body.source || "m5stickc_plus",
@@ -228,7 +231,10 @@ class M5VoiceBridge {
       channels: 1,
       mode: "dictation",
     });
-    this.logger?.info?.("M5 recording started", { sessionId });
+    this.logger?.info?.("M5 recording started", {
+      sessionId,
+      targetWindowId: session.targetWindowId || null,
+    });
     this.sendJson(res, 200, {
       success: true,
       recording: { status: "recording", session_id: sessionId },
@@ -278,6 +284,15 @@ class M5VoiceBridge {
       return;
     }
     session.status = "processing";
+    if (session.targetWindowId) {
+      this.clipboardManager?.setTargetWindow?.(session.targetWindowId);
+      this.logger?.info?.("M5 recording target window set", {
+        sessionId,
+        targetWindowId: session.targetWindowId,
+      });
+    } else {
+      this.logger?.warn?.("M5 recording has no target window", { sessionId });
+    }
     this.sendToRenderer("external-recording-stop", {
       session_id: sessionId,
       paste: body.paste !== false,

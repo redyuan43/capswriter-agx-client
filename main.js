@@ -330,6 +330,7 @@ linkBookmarkManager.initializeDefaults();
 const m5VoiceBridge = new M5VoiceBridge({
   logger,
   windowManager,
+  clipboardManager,
   sendToRenderer: safeSendToMainWindow,
 });
 const voiceActionManager = new VoiceActionManager({
