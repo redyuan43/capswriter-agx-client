@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { randomUUID } = require("crypto");
 
 const DEFAULT_HOST = "0.0.0.0";
@@ -6,6 +8,7 @@ const DEFAULT_PORT = 8765;
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
 const STOP_WAIT_MS = 28000;
+const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
 
 function cleanToken(value) {
   const token = String(value || "").trim();
@@ -53,6 +56,29 @@ function parseJson(buffer) {
   return JSON.parse(buffer.toString("utf8"));
 }
 
+function defaultOtaDir() {
+  const repoRoot = path.resolve(__dirname, "../..");
+  return path.resolve(repoRoot, "../VibeStick/firmware/sticks3/ota");
+}
+
+function safeOtaBoard(value) {
+  const board = String(value || "").trim();
+  return OTA_BOARDS.has(board) ? board : "";
+}
+
+function readOtaManifest(otaDir, board) {
+  const safeBoard = safeOtaBoard(board);
+  if (!safeBoard) {
+    return null;
+  }
+  const manifestPath = path.join(otaDir, `${safeBoard}.json`);
+  try {
+    return JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 class M5VoiceBridge {
   constructor({ logger, windowManager, clipboardManager, sendToRenderer }) {
     this.logger = logger;
@@ -65,6 +91,7 @@ class M5VoiceBridge {
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
     this.token = cleanToken(process.env.M5_VOICE_BRIDGE_TOKEN || process.env.VIBE_STICK_BRIDGE_TOKEN);
+    this.otaDir = process.env.M5_VOICE_BRIDGE_OTA_DIR || process.env.VIBE_STICK_OTA_DIR || defaultOtaDir();
   }
 
   start() {
@@ -129,6 +156,14 @@ class M5VoiceBridge {
       this.sendJson(res, 200, this.buildState());
       return;
     }
+    if (req.method === "GET" && url.pathname === "/ota/manifest") {
+      this.handleOtaManifest(res, url);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/ota/bin") {
+      this.handleOtaBinary(res, url);
+      return;
+    }
     if (req.method !== "POST") {
       this.sendJson(res, 405, { success: false, error: "method not allowed" });
       return;
@@ -191,6 +226,49 @@ class M5VoiceBridge {
       bridge_name: "capswriter-m5-voice-bridge",
       bridge_version: "1.0.0",
     };
+  }
+
+  handleOtaManifest(res, url) {
+    const board = safeOtaBoard(url.searchParams.get("board"));
+    if (!board) {
+      this.sendJson(res, 200, { available: false, error: "unknown board" });
+      return;
+    }
+    const manifest = readOtaManifest(this.otaDir, board);
+    if (!manifest) {
+      this.sendJson(res, 200, { available: false, board });
+      return;
+    }
+    this.sendJson(res, 200, {
+      ...manifest,
+      available: Boolean(manifest.available ?? true),
+      board,
+      url: manifest.url || `/ota/bin?board=${board}`,
+    });
+  }
+
+  handleOtaBinary(res, url) {
+    const board = safeOtaBoard(url.searchParams.get("board"));
+    const manifest = readOtaManifest(this.otaDir, board);
+    if (!board || !manifest) {
+      this.sendJson(res, 404, { success: false, error: "OTA image not found" });
+      return;
+    }
+    const fileName = path.basename(String(manifest.file_name || `${board}.bin`));
+    const binaryPath = path.join(this.otaDir, fileName);
+    let stat;
+    try {
+      stat = fs.statSync(binaryPath);
+    } catch {
+      this.sendJson(res, 404, { success: false, error: "OTA image not found" });
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": stat.size,
+      "Access-Control-Allow-Origin": "*",
+    });
+    fs.createReadStream(binaryPath).pipe(res);
   }
 
   currentRecordingState() {
