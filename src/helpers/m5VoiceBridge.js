@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 const { randomUUID } = require("crypto");
 
 const DEFAULT_HOST = "0.0.0.0";
@@ -8,8 +9,13 @@ const DEFAULT_PORT = 8765;
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
 const STOP_WAIT_MS = 28000;
+const ENTER_KEY_SETTLE_MS = 120;
 const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
 const DEVICE_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function cleanToken(value) {
   const token = String(value || "").trim();
@@ -181,8 +187,7 @@ class M5VoiceBridge {
     }
     this.requireToken(req);
     if (url.pathname === "/event" || url.pathname === "/quota/refresh") {
-      await readRequestBody(req, MAX_JSON_BYTES);
-      this.sendJson(res, 200, this.buildState());
+      await this.handleEvent(req, res);
       return;
     }
     if (url.pathname === "/recording/start") {
@@ -312,6 +317,15 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     }
   }
 
+  async handleEvent(req, res) {
+    const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
+    if (body.event === "button_followup_enter") {
+      await this.handleFollowupEnter(body, res);
+      return;
+    }
+    this.sendJson(res, 200, this.buildState());
+  }
+
   buildState() {
     return {
       time: new Date().toISOString(),
@@ -396,6 +410,165 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     };
   }
 
+  async handleFollowupEnter(body, res) {
+    const sessionId = String(body.session_id || "").trim();
+    if (!sessionId) {
+      this.sendJson(res, 400, {
+        success: false,
+        followup_enter: { status: "missing_session_id" },
+        state: this.buildState(),
+      });
+      return;
+    }
+
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      this.logger?.warn?.("M5 follow-up enter ignored: session not found", { sessionId });
+      this.sendJson(res, 200, {
+        success: false,
+        followup_enter: { status: "session_not_found", session_id: sessionId },
+        state: this.buildState(),
+      });
+      return;
+    }
+
+    if (!session.done) {
+      session.pendingEnter = true;
+      this.logger?.info?.("M5 follow-up enter queued", { sessionId });
+      this.sendJson(res, 200, {
+        success: true,
+        followup_enter: { status: "queued", session_id: sessionId },
+        state: this.buildState(),
+      });
+      return;
+    }
+
+    const followup = await this.sendEnterForSession(session, session.result, "immediate");
+    this.sendJson(res, 200, {
+      success: followup.success,
+      followup_enter: { ...followup, session_id: sessionId },
+      state: this.buildState(),
+    });
+  }
+
+  isPasteSuccess(result = {}, session = {}) {
+    const status = String(result.status || session.status || "").trim();
+    return result.success !== false && status === "pasted";
+  }
+
+  async sendEnterForSession(session, result = {}, reason = "queued") {
+    if (!session) {
+      return { success: false, status: "session_not_found", reason };
+    }
+    if (session.enterSent) {
+      return { success: true, status: "already_sent", reason };
+    }
+    if (!this.isPasteSuccess(result, session)) {
+      this.logger?.info?.("M5 follow-up enter skipped: paste did not succeed", {
+        sessionId: session.id,
+        status: result.status || session.status,
+        success: result.success !== false,
+        reason,
+      });
+      return { success: false, status: "paste_not_successful", reason };
+    }
+    if (!session.targetWindowId) {
+      this.logger?.warn?.("M5 follow-up enter skipped: no target window", {
+        sessionId: session.id,
+        reason,
+      });
+      return { success: false, status: "no_target_window", reason };
+    }
+    if (process.platform !== "linux") {
+      this.logger?.warn?.("M5 follow-up enter unsupported on this platform", {
+        sessionId: session.id,
+        platform: process.platform,
+        reason,
+      });
+      return { success: false, status: "unsupported_platform", reason };
+    }
+
+    const targetWindowId = String(session.targetWindowId);
+    const activate = await this.runCommand("xdotool", ["windowactivate", "--sync", targetWindowId], 2000);
+    if (!activate.success) {
+      this.logger?.warn?.("M5 follow-up enter failed to activate target window", {
+        sessionId: session.id,
+        targetWindowId,
+        error: activate.error || activate.stderr,
+        reason,
+      });
+      return { success: false, status: "activate_failed", reason };
+    }
+
+    await sleep(ENTER_KEY_SETTLE_MS);
+    const key = await this.runCommand("xdotool", ["key", "--delay", "35", "Return"], 1500);
+    if (!key.success) {
+      this.logger?.warn?.("M5 follow-up enter failed to send Return", {
+        sessionId: session.id,
+        targetWindowId,
+        error: key.error || key.stderr,
+        reason,
+      });
+      return { success: false, status: "send_failed", reason };
+    }
+
+    session.enterSent = true;
+    this.logger?.info?.("M5 follow-up enter sent", {
+      sessionId: session.id,
+      targetWindowId,
+      reason,
+    });
+    return { success: true, status: "sent", reason };
+  }
+
+  runCommand(command, args = [], timeoutMs = 2000) {
+    return new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      let child;
+
+      const finish = (payload) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          ...payload,
+        });
+      };
+
+      const timer = setTimeout(() => {
+        child?.kill?.("SIGTERM");
+        finish({ success: false, error: "timeout" });
+      }, timeoutMs);
+      timer.unref?.();
+
+      try {
+        child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+      } catch (error) {
+        finish({ success: false, error: error?.message || String(error) });
+        return;
+      }
+
+      child.stdout?.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", (error) => {
+        finish({ success: false, error: error?.message || String(error) });
+      });
+      child.on("close", (code) => {
+        finish({ success: code === 0, code });
+      });
+    });
+  }
+
   async handleRecordingStart(req, res) {
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     const sessionId = String(body.session_id || randomUUID().replace(/-/g, "")).trim();
@@ -407,6 +580,9 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       done: false,
       createdAt: Date.now(),
       targetWindowId: "",
+      pendingEnter: false,
+      enterSent: false,
+      result: null,
       resolver: null,
       stopTimer: null,
     };
@@ -537,14 +713,15 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     if (!session || session.done) {
       return;
     }
+    session.result = result || {};
     session.done = true;
-    session.status = result.status || (result.success === false ? "transcription_failed" : "pasted");
+    session.status = session.result.status || (session.result.success === false ? "transcription_failed" : "pasted");
     if (session.stopTimer) {
       clearTimeout(session.stopTimer);
       session.stopTimer = null;
     }
     if (session.resolver) {
-      session.resolver(result);
+      session.resolver(session.result);
       session.resolver = null;
     }
     this.logger?.info?.("M5 recording finished", {
@@ -552,8 +729,16 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       status: session.status,
       bytes: session.bytes,
       chunks: session.chunks,
-      success: result.success !== false,
+      success: session.result.success !== false,
     });
+    if (session.pendingEnter) {
+      this.sendEnterForSession(session, session.result, "queued").catch((error) => {
+        this.logger?.warn?.("M5 follow-up enter failed", {
+          sessionId: session.id,
+          error: error?.message || String(error),
+        });
+      });
+    }
     const cleanupTimer = setTimeout(() => this.sessions.delete(session.id), 60000);
     cleanupTimer.unref?.();
   }
