@@ -12,6 +12,22 @@ const STOP_WAIT_MS = 28000;
 const ENTER_KEY_SETTLE_MS = 120;
 const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
 const DEVICE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const FOLLOWUP_KEYS = {
+  enter: {
+    name: "enter",
+    keyName: "Return",
+    pendingField: "pendingEnter",
+    sentField: "enterSent",
+    requirePaste: true,
+  },
+  escape: {
+    name: "escape",
+    keyName: "Escape",
+    pendingField: "pendingEscape",
+    sentField: "escapeSent",
+    requirePaste: false,
+  },
+};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -320,7 +336,11 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   async handleEvent(req, res) {
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     if (body.event === "button_followup_enter") {
-      await this.handleFollowupEnter(body, res);
+      await this.handleFollowupKey(body, res, FOLLOWUP_KEYS.enter);
+      return;
+    }
+    if (body.event === "button_followup_escape") {
+      await this.handleFollowupKey(body, res, FOLLOWUP_KEYS.escape);
       return;
     }
     this.sendJson(res, 200, this.buildState());
@@ -410,12 +430,13 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     };
   }
 
-  async handleFollowupEnter(body, res) {
+  async handleFollowupKey(body, res, options) {
+    const responseKey = `followup_${options.name}`;
     const sessionId = String(body.session_id || "").trim();
     if (!sessionId) {
       this.sendJson(res, 400, {
         success: false,
-        followup_enter: { status: "missing_session_id" },
+        [responseKey]: { status: "missing_session_id" },
         state: this.buildState(),
       });
       return;
@@ -423,30 +444,30 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
 
     const session = this.sessions.get(sessionId);
     if (!session) {
-      this.logger?.warn?.("M5 follow-up enter ignored: session not found", { sessionId });
+      this.logger?.warn?.(`M5 follow-up ${options.name} ignored: session not found`, { sessionId });
       this.sendJson(res, 200, {
         success: false,
-        followup_enter: { status: "session_not_found", session_id: sessionId },
+        [responseKey]: { status: "session_not_found", session_id: sessionId },
         state: this.buildState(),
       });
       return;
     }
 
     if (!session.done) {
-      session.pendingEnter = true;
-      this.logger?.info?.("M5 follow-up enter queued", { sessionId });
+      session[options.pendingField] = true;
+      this.logger?.info?.(`M5 follow-up ${options.name} queued`, { sessionId });
       this.sendJson(res, 200, {
         success: true,
-        followup_enter: { status: "queued", session_id: sessionId },
+        [responseKey]: { status: "queued", session_id: sessionId },
         state: this.buildState(),
       });
       return;
     }
 
-    const followup = await this.sendEnterForSession(session, session.result, "immediate");
+    const followup = await this.sendKeyForSession(session, session.result, options, "immediate");
     this.sendJson(res, 200, {
       success: followup.success,
-      followup_enter: { ...followup, session_id: sessionId },
+      [responseKey]: { ...followup, session_id: sessionId },
       state: this.buildState(),
     });
   }
@@ -456,15 +477,15 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     return result.success !== false && status === "pasted";
   }
 
-  async sendEnterForSession(session, result = {}, reason = "queued") {
+  async sendKeyForSession(session, result = {}, options, reason = "queued") {
     if (!session) {
       return { success: false, status: "session_not_found", reason };
     }
-    if (session.enterSent) {
+    if (session[options.sentField]) {
       return { success: true, status: "already_sent", reason };
     }
-    if (!this.isPasteSuccess(result, session)) {
-      this.logger?.info?.("M5 follow-up enter skipped: paste did not succeed", {
+    if (options.requirePaste && !this.isPasteSuccess(result, session)) {
+      this.logger?.info?.(`M5 follow-up ${options.name} skipped: paste did not succeed`, {
         sessionId: session.id,
         status: result.status || session.status,
         success: result.success !== false,
@@ -473,14 +494,14 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return { success: false, status: "paste_not_successful", reason };
     }
     if (!session.targetWindowId) {
-      this.logger?.warn?.("M5 follow-up enter skipped: no target window", {
+      this.logger?.warn?.(`M5 follow-up ${options.name} skipped: no target window`, {
         sessionId: session.id,
         reason,
       });
       return { success: false, status: "no_target_window", reason };
     }
     if (process.platform !== "linux") {
-      this.logger?.warn?.("M5 follow-up enter unsupported on this platform", {
+      this.logger?.warn?.(`M5 follow-up ${options.name} unsupported on this platform`, {
         sessionId: session.id,
         platform: process.platform,
         reason,
@@ -491,7 +512,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const targetWindowId = String(session.targetWindowId);
     const activate = await this.runCommand("xdotool", ["windowactivate", "--sync", targetWindowId], 2000);
     if (!activate.success) {
-      this.logger?.warn?.("M5 follow-up enter failed to activate target window", {
+      this.logger?.warn?.(`M5 follow-up ${options.name} failed to activate target window`, {
         sessionId: session.id,
         targetWindowId,
         error: activate.error || activate.stderr,
@@ -501,9 +522,9 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     }
 
     await sleep(ENTER_KEY_SETTLE_MS);
-    const key = await this.runCommand("xdotool", ["key", "--delay", "35", "Return"], 1500);
+    const key = await this.runCommand("xdotool", ["key", "--delay", "35", options.keyName], 1500);
     if (!key.success) {
-      this.logger?.warn?.("M5 follow-up enter failed to send Return", {
+      this.logger?.warn?.(`M5 follow-up ${options.name} failed to send ${options.keyName}`, {
         sessionId: session.id,
         targetWindowId,
         error: key.error || key.stderr,
@@ -512,10 +533,11 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return { success: false, status: "send_failed", reason };
     }
 
-    session.enterSent = true;
-    this.logger?.info?.("M5 follow-up enter sent", {
+    session[options.sentField] = true;
+    this.logger?.info?.(`M5 follow-up ${options.name} sent`, {
       sessionId: session.id,
       targetWindowId,
+      keyName: options.keyName,
       reason,
     });
     return { success: true, status: "sent", reason };
@@ -581,7 +603,9 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       createdAt: Date.now(),
       targetWindowId: "",
       pendingEnter: false,
+      pendingEscape: false,
       enterSent: false,
+      escapeSent: false,
       result: null,
       resolver: null,
       stopTimer: null,
@@ -732,8 +756,16 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       success: session.result.success !== false,
     });
     if (session.pendingEnter) {
-      this.sendEnterForSession(session, session.result, "queued").catch((error) => {
+      this.sendKeyForSession(session, session.result, FOLLOWUP_KEYS.enter, "queued").catch((error) => {
         this.logger?.warn?.("M5 follow-up enter failed", {
+          sessionId: session.id,
+          error: error?.message || String(error),
+        });
+      });
+    }
+    if (session.pendingEscape) {
+      this.sendKeyForSession(session, session.result, FOLLOWUP_KEYS.escape, "queued").catch((error) => {
+        this.logger?.warn?.("M5 follow-up escape failed", {
           sessionId: session.id,
           error: error?.message || String(error),
         });
