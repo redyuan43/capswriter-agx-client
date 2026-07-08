@@ -9,6 +9,7 @@ const MAX_JSON_BYTES = 64 * 1024;
 const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
 const STOP_WAIT_MS = 28000;
 const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
+const DEVICE_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 function cleanToken(value) {
   const token = String(value || "").trim();
@@ -87,6 +88,7 @@ class M5VoiceBridge {
     this.sendToRenderer = sendToRenderer;
     this.server = null;
     this.sessions = new Map();
+    this.devices = new Map();
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
@@ -144,6 +146,7 @@ class M5VoiceBridge {
 
   async handleRequest(req, res) {
     const url = new URL(req.url || "/", "http://127.0.0.1");
+    this.rememberDevice(req, url.pathname);
     if (req.method === "GET" && url.pathname === "/health") {
       this.sendJson(res, 200, {
         ok: true,
@@ -154,6 +157,14 @@ class M5VoiceBridge {
     }
     if (req.method === "GET" && url.pathname === "/state") {
       this.sendJson(res, 200, this.buildState());
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/devices") {
+      this.sendJson(res, 200, { devices: this.listDevices() });
+      return;
+    }
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
+      this.sendHtml(res, 200, this.buildDashboardHtml());
       return;
     }
     if (req.method === "GET" && url.pathname === "/ota/manifest") {
@@ -187,6 +198,108 @@ class M5VoiceBridge {
       return;
     }
     this.sendJson(res, 404, { success: false, error: "not found" });
+  }
+
+  rememberDevice(req, requestPath) {
+    const firmwareName = String(req.headers["x-vibe-stick-firmware-name"] || "").trim();
+    const deviceId = String(req.headers["x-vibe-stick-device-id"] || "").trim();
+    if (!firmwareName && !deviceId) {
+      return;
+    }
+
+    const now = Date.now();
+    const clientIp = normalizeRemoteAddress(req.socket?.remoteAddress || "");
+    const key = deviceId || clientIp || "unknown-device";
+    const previous = this.devices.get(key) || {};
+    const device = {
+      device_id: key,
+      client_ip: clientIp,
+      path: requestPath,
+      last_seen: now,
+      last_seen_text: new Date(now).toLocaleString(),
+      firmware_name: firmwareName,
+      firmware_version: String(req.headers["x-vibe-stick-firmware-version"] || ""),
+      transport: String(req.headers["x-vibe-stick-firmware-transport"] || ""),
+      build_date: String(req.headers["x-vibe-stick-firmware-build-date"] || ""),
+      board: String(req.headers["x-vibe-stick-board"] || ""),
+      device_ip: String(req.headers["x-vibe-stick-device-ip"] || clientIp),
+      wifi_ssid: String(req.headers["x-vibe-stick-wifi-ssid"] || ""),
+      wifi_bssid: String(req.headers["x-vibe-stick-wifi-bssid"] || ""),
+      wifi_rssi: parseInteger(req.headers["x-vibe-stick-wifi-rssi"], previous.wifi_rssi ?? null),
+    };
+    this.devices.set(key, device);
+    this.pruneDevices(now);
+  }
+
+  pruneDevices(now = Date.now()) {
+    for (const [key, device] of this.devices.entries()) {
+      if (now - Number(device.last_seen || 0) > DEVICE_RETENTION_MS) {
+        this.devices.delete(key);
+      }
+    }
+  }
+
+  listDevices() {
+    this.pruneDevices();
+    return [...this.devices.values()].sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0));
+  }
+
+  buildDashboardHtml() {
+    const devices = this.listDevices();
+    const rows = devices.map((device) => this.deviceRowHtml(device)).join("");
+    const bodyRows = rows || '<tr><td colspan="8" class="empty">No M5Stack devices seen yet.</td></tr>';
+    const updatedAt = escapeHtml(new Date().toLocaleString());
+    return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>CapsWriter M5 Bridge</title>
+<style>
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #f8fafc; }
+main { max-width: 1120px; margin: 0 auto; padding: 28px 20px; }
+h1 { margin: 0 0 8px; font-size: 28px; font-weight: 700; }
+.meta { color: #94a3b8; margin-bottom: 24px; }
+table { width: 100%; border-collapse: collapse; background: #1e293b; border: 1px solid #334155; }
+th, td { padding: 10px 12px; border-bottom: 1px solid #334155; text-align: left; font-size: 14px; white-space: nowrap; }
+th { color: #cbd5e1; background: #111827; font-weight: 600; }
+.empty { color: #94a3b8; text-align: center; padding: 24px; }
+.muted { color: #94a3b8; }
+.ok { color: #86efac; }
+.warn { color: #fde68a; }
+.bad { color: #fca5a5; }
+</style>
+</head>
+<body>
+<main>
+<h1>CapsWriter M5 Bridge</h1>
+<div class="meta">Listening on ${escapeHtml(this.host)}:${this.port} &middot; Updated ${updatedAt}</div>
+<table>
+<thead>
+<tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr>
+</thead>
+<tbody>${bodyRows}</tbody>
+</table>
+</main>
+</body>
+</html>`;
+  }
+
+  deviceRowHtml(device) {
+    const rssi = device.wifi_rssi;
+    const rssiClass = rssi === null || rssi === undefined ? "muted" : rssi >= -67 ? "ok" : rssi < -75 ? "bad" : "warn";
+    const firmware = [device.firmware_name, device.firmware_version].filter(Boolean).join(" ");
+    return `<tr>
+<td>${escapeHtml(device.device_id)}</td>
+<td>${escapeHtml(device.device_ip || device.client_ip)}</td>
+<td>${escapeHtml(device.board)}</td>
+<td>${escapeHtml(firmware)}</td>
+<td>${escapeHtml(device.wifi_ssid)}</td>
+<td class="${rssiClass}">${escapeHtml(rssi ?? "")}</td>
+<td>${escapeHtml(device.last_seen_text)}</td>
+<td class="muted">${escapeHtml(device.path)}</td>
+</tr>`;
   }
 
   requireToken(req) {
@@ -457,6 +570,36 @@ class M5VoiceBridge {
     });
     res.end(body);
   }
+
+  sendHtml(res, statusCode, body) {
+    if (res.headersSent || res.writableEnded) {
+      return;
+    }
+    res.writeHead(statusCode, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Length": Buffer.byteLength(body),
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.end(body);
+  }
+}
+
+function normalizeRemoteAddress(value) {
+  return String(value || "").replace(/^::ffff:/, "");
+}
+
+function parseInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 module.exports = M5VoiceBridge;
