@@ -36,6 +36,17 @@ const DICTATION_CONTROL_STATUSES = ["recording", "processing", "preview_ready", 
 const CODEX_FLOATING_PREVIEW_MAX_CHARS = 420;
 const CODEX_COMPLETION_CHIME_COOLDOWN_MS = 1200;
 
+function normalizeExternalRecordingMode(value) {
+  const normalized = String(value || "dictation").trim().toLowerCase().replace(/-/g, "_");
+  if (["cyber_fortune", "fortune", "fort"].includes(normalized)) return "cyber_fortune";
+  if (["cyber_almanac", "almanac", "huangli", "alm"].includes(normalized)) return "cyber_almanac";
+  return "dictation";
+}
+
+function isCyberRecordingMode(mode) {
+  return ["cyber_fortune", "cyber_almanac"].includes(String(mode || ""));
+}
+
 function isCodexPreviewNoiseLine(line) {
   const trimmed = String(line || "").trim();
   if (!trimmed) return true;
@@ -1977,6 +1988,7 @@ export default function FloatingBallApp() {
     if (!sessionId) {
       return;
     }
+    const externalMode = normalizeExternalRecordingMode(payload.intent || payload.mode);
     if (externalRealtimeSessionRef.current) {
       externalRealtimeSessionRef.current.cancel();
       externalRealtimeSessionRef.current = null;
@@ -1984,6 +1996,7 @@ export default function FloatingBallApp() {
     externalPCMChunksRef.current = [];
     externalRecordingRef.current = {
       sessionId,
+      mode: externalMode,
       sampleRate: Number(payload.sample_rate || 16000),
       startedAt: Date.now(),
       realtimeStartPromise: null,
@@ -2003,7 +2016,7 @@ export default function FloatingBallApp() {
     stopInitialLoadingTimer();
     await transitionStatus("recording");
 
-    if (!modelStatus.isReady) {
+    if (!isCyberRecordingMode(externalMode) && !modelStatus.isReady) {
       const message = modelStatus.isLoading ? "服务正在启动中，请稍候" : "模型未就绪";
       await transitionStatus("error");
       setMessage(message);
@@ -2016,7 +2029,7 @@ export default function FloatingBallApp() {
       return;
     }
 
-    if (isRealtimeASRConfigured()) {
+    if (!isCyberRecordingMode(externalMode) && isRealtimeASRConfigured()) {
       const realtimeSession = new ExternalPCMRealtimeSession({
         sampleRate: externalRecordingRef.current.sampleRate,
         hotword: sessionHotwordsRef.current.join("\n"),
@@ -2102,6 +2115,33 @@ export default function FloatingBallApp() {
       const sampleRate = session.sampleRate || 16000;
       const stats = computePCMStats(chunks, sampleRate);
       const wavBlob = createWavBlobFromPCM(chunks, sampleRate);
+      if (isCyberRecordingMode(session.mode)) {
+        setAnimatedRealtimeTarget("", { immediate: true });
+        await transitionStatus("completed");
+        setMessage("已发送给赛博助手");
+        reportExternalRecordingResult({
+          session_id: sessionId,
+          success: true,
+          status: "cyber_audio_ready",
+          mode: session.mode,
+          intent: session.mode,
+          text: "",
+          audio_stats: stats,
+          message: "External M5 cyber recording audio is ready",
+        });
+        logRuntime("info", "External M5 cyber recording audio ready", {
+          sessionId,
+          mode: session.mode,
+          bytes: wavBlob.size,
+          chunks: chunks.length,
+          durationMs: stats.durationMs,
+        });
+        setTimeout(() => {
+          resetUI();
+          hideFloatingBall();
+        }, 900);
+        return;
+      }
       let finalPayload = null;
       let realtimeError = null;
 
@@ -2197,7 +2237,7 @@ export default function FloatingBallApp() {
       externalRecordingRef.current = null;
       externalPCMChunksRef.current = [];
     }
-  }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, reportExternalRecordingResult, resetUI, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
+  }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, reportExternalRecordingResult, resetUI, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
 
   const handleAIOptimizationComplete = useCallback(() => {
   }, []);

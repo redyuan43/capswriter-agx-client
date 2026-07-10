@@ -1,5 +1,6 @@
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { randomUUID } = require("crypto");
@@ -8,7 +9,9 @@ const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 8765;
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
-const STOP_WAIT_MS = 28000;
+const STOP_WAIT_MS = 210000;
+const CYBER_AGENT_TIMEOUT_MS = 180000;
+const MAX_TTS_AUDIO_BYTES = 1024 * 1024;
 const ENTER_KEY_SETTLE_MS = 120;
 const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
 const DEVICE_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -79,6 +82,124 @@ function parseJson(buffer) {
   return JSON.parse(buffer.toString("utf8"));
 }
 
+function normalizeRecordingIntent(value, fallback = "dictation") {
+  const normalized = String(value || fallback || "dictation").trim().toLowerCase().replace(/-/g, "_");
+  if (["cyber_fortune", "fortune", "fort"].includes(normalized)) {
+    return "cyber_fortune";
+  }
+  if (["cyber_almanac", "almanac", "huangli", "alm"].includes(normalized)) {
+    return "cyber_almanac";
+  }
+  return "dictation";
+}
+
+function isCyberIntent(intent) {
+  return ["cyber_fortune", "cyber_almanac"].includes(String(intent || ""));
+}
+
+function cyberServiceForIntent(intent) {
+  if (intent === "cyber_almanac") {
+    return {
+      name: "almanac",
+      envName: "VIBE_STICK_ALMANAC_AGENT_CMD",
+    };
+  }
+  return {
+    name: "fortune",
+    envName: "VIBE_STICK_FORTUNE_AGENT_CMD",
+  };
+}
+
+function selectCyberAgentCommand(intent, env = process.env) {
+  const normalizedIntent = normalizeRecordingIntent(intent);
+  if (!isCyberIntent(normalizedIntent)) {
+    return {
+      intent: normalizedIntent,
+      service: "dictation",
+      command: "",
+      envName: "",
+      fallback: false,
+    };
+  }
+
+  const service = cyberServiceForIntent(normalizedIntent);
+  const command = String(env[service.envName] || "").trim();
+  if (command) {
+    return {
+      intent: normalizedIntent,
+      service: service.name,
+      command,
+      envName: service.envName,
+      fallback: false,
+    };
+  }
+
+  const fallbackCommand = String(env.VIBE_STICK_CYBER_AGENT_CMD || "").trim();
+  return {
+    intent: normalizedIntent,
+    service: service.name,
+    command: fallbackCommand,
+    envName: fallbackCommand ? "VIBE_STICK_CYBER_AGENT_CMD" : service.envName,
+    fallback: Boolean(fallbackCommand),
+  };
+}
+
+function parseCyberAgentOutput(stdout) {
+  const text = String(stdout || "").trim();
+  if (!text) {
+    return { text: "", ttsAudioFile: "", source: "", service: "" };
+  }
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      const data = JSON.parse(lines[index]);
+      if (data && typeof data === "object") {
+        return {
+          text: String(data.text || data.message || ""),
+          ttsAudioFile: String(data.tts_audio_file || data.audio_file || ""),
+          source: String(data.tts_source || data.agent_source || data.source || ""),
+          service: String(data.service || data.agent_service || ""),
+        };
+      }
+    } catch {
+      // Keep scanning older lines.
+    }
+  }
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data === "object") {
+      return {
+        text: String(data.text || data.message || ""),
+        ttsAudioFile: String(data.tts_audio_file || data.audio_file || ""),
+        source: String(data.tts_source || data.agent_source || data.source || ""),
+        service: String(data.service || data.agent_service || ""),
+      };
+    }
+  } catch {
+    // Plain text stdout is also accepted.
+  }
+  return { text, ttsAudioFile: "", source: "", service: "" };
+}
+
+function createPcmWavBuffer(chunks, sampleRate = 16000) {
+  const pcm = Buffer.concat((chunks || []).map((chunk) => Buffer.from(chunk || [])));
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
 function defaultOtaDir() {
   const repoRoot = path.resolve(__dirname, "../..");
   return path.resolve(repoRoot, "../VibeStick/firmware/sticks3/ota");
@@ -116,6 +237,10 @@ class M5VoiceBridge {
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
     this.token = cleanToken(process.env.M5_VOICE_BRIDGE_TOKEN || process.env.VIBE_STICK_BRIDGE_TOKEN);
     this.otaDir = process.env.M5_VOICE_BRIDGE_OTA_DIR || process.env.VIBE_STICK_OTA_DIR || defaultOtaDir();
+    this.latestTtsAudioFile = "";
+    this.ttsPlaybackRequestId = "";
+    this.ttsPlaybackQueue = [];
+    this.currentTtsPlayback = null;
   }
 
   start() {
@@ -195,6 +320,14 @@ class M5VoiceBridge {
     }
     if (req.method === "GET" && url.pathname === "/ota/bin") {
       this.handleOtaBinary(res, url);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/recording/tts") {
+      this.handleRecordingTts(res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/recording/source") {
+      this.handleRecordingSource(res, url);
       return;
     }
     if (req.method !== "POST") {
@@ -311,11 +444,13 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const rssi = device.wifi_rssi;
     const rssiClass = rssi === null || rssi === undefined ? "muted" : rssi >= -67 ? "ok" : rssi < -75 ? "bad" : "warn";
     const firmware = [device.firmware_name, device.firmware_version].filter(Boolean).join(" ");
+    const buildDate = String(device.build_date || "").trim();
+    const firmwareText = buildDate ? `${firmware} (${buildDate})` : firmware;
     return `<tr>
 <td>${escapeHtml(device.device_id)}</td>
 <td>${escapeHtml(device.device_ip || device.client_ip)}</td>
 <td>${escapeHtml(device.board)}</td>
-<td>${escapeHtml(firmware)}</td>
+<td>${escapeHtml(firmwareText)}</td>
 <td>${escapeHtml(device.wifi_ssid)}</td>
 <td class="${rssiClass}">${escapeHtml(rssi ?? "")}</td>
 <td>${escapeHtml(device.last_seen_text)}</td>
@@ -335,6 +470,11 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
 
   async handleEvent(req, res) {
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
+    if (["tts_played", "tts_failed", "tts_probe_played", "tts_probe_failed"].includes(String(body.event || ""))) {
+      this.completeCurrentTtsPlayback(String(body.event || ""), body);
+      this.sendJson(res, 200, this.buildState());
+      return;
+    }
     if (body.event === "button_followup_enter") {
       await this.handleFollowupKey(body, res, FOLLOWUP_KEYS.enter);
       return;
@@ -370,6 +510,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
         quota_updated_at: "",
       },
       recording: this.currentRecordingState(),
+      tts_playback_request_id: this.ttsPlaybackRequestId,
       bridge_name: "capswriter-m5-voice-bridge",
       bridge_version: "1.0.0",
     };
@@ -418,6 +559,62 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     fs.createReadStream(binaryPath).pipe(res);
   }
 
+  handleRecordingTts(res) {
+    const audioPath = String(this.latestTtsAudioFile || "").trim();
+    if (!audioPath) {
+      this.sendJson(res, 404, { success: false, error: "TTS audio not found" });
+      return;
+    }
+    let stat;
+    try {
+      stat = fs.statSync(audioPath);
+    } catch {
+      this.sendJson(res, 404, { success: false, error: "TTS audio not found" });
+      return;
+    }
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_TTS_AUDIO_BYTES) {
+      this.sendJson(res, 404, { success: false, error: "TTS audio invalid" });
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "audio/wav",
+      "Content-Length": stat.size,
+      "Access-Control-Allow-Origin": "*",
+    });
+    fs.createReadStream(audioPath).pipe(res);
+  }
+
+  handleRecordingSource(res, url) {
+    if (this.token && String(url.searchParams.get("token") || "") !== this.token) {
+      this.sendJson(res, 401, { success: false, error: "unauthorized" });
+      return;
+    }
+    const sessionId = String(url.searchParams.get("session_id") || "").trim();
+    const session = this.sessions.get(sessionId);
+    const audioPath = String(session?.audioFile || "").trim();
+    if (!session || !audioPath) {
+      this.sendJson(res, 404, { success: false, error: "recording source not found" });
+      return;
+    }
+    let stat;
+    try {
+      stat = fs.statSync(audioPath);
+    } catch {
+      this.sendJson(res, 404, { success: false, error: "recording source not found" });
+      return;
+    }
+    if (!stat.isFile() || stat.size <= 0) {
+      this.sendJson(res, 404, { success: false, error: "recording source invalid" });
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "audio/wav",
+      "Content-Length": stat.size,
+      "Access-Control-Allow-Origin": "*",
+    });
+    fs.createReadStream(audioPath).pipe(res);
+  }
+
   currentRecordingState() {
     const active = [...this.sessions.values()].find((session) => !session.done);
     if (!active) {
@@ -427,6 +624,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       status: active.status,
       session_id: active.id,
       source: "m5stickc_plus",
+      intent: active.intent || "dictation",
     };
   }
 
@@ -594,11 +792,18 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   async handleRecordingStart(req, res) {
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     const sessionId = String(body.session_id || randomUUID().replace(/-/g, "")).trim();
+    const intent = normalizeRecordingIntent(body.intent, body.mode);
+    const mode = String(body.mode || intent).trim() || intent;
     const session = {
       id: sessionId,
       status: "recording",
+      intent,
+      mode,
       bytes: 0,
       chunks: 0,
+      audioChunks: [],
+      sampleRate: 16000,
+      audioFile: "",
       done: false,
       createdAt: Date.now(),
       targetWindowId: "",
@@ -620,15 +825,19 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       sample_rate: 16000,
       bits_per_sample: 16,
       channels: 1,
-      mode: "dictation",
+      mode: intent,
+      trigger_mode: mode,
+      intent,
     });
     this.logger?.info?.("M5 recording started", {
       sessionId,
+      intent,
+      mode,
       targetWindowId: session.targetWindowId || null,
     });
     this.sendJson(res, 200, {
       success: true,
-      recording: { status: "recording", session_id: sessionId },
+      recording: { status: "recording", session_id: sessionId, intent },
       state: this.buildState(),
     });
   }
@@ -644,6 +853,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     if (body.length > 0) {
       session.bytes += body.length;
       session.chunks += 1;
+      session.audioChunks.push(Buffer.from(body));
       const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
       this.sendToRenderer("external-recording-chunk", {
         session_id: sessionId,
@@ -675,6 +885,9 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
     session.status = "processing";
+    session.intent = normalizeRecordingIntent(body.intent, session.intent);
+    session.mode = String(body.mode || session.mode || session.intent).trim() || session.intent;
+    const paste = body.paste !== false && !isCyberIntent(session.intent);
     if (session.targetWindowId) {
       this.clipboardManager?.setTargetWindow?.(session.targetWindowId);
       this.logger?.info?.("M5 recording target window set", {
@@ -686,7 +899,10 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     }
     this.sendToRenderer("external-recording-stop", {
       session_id: sessionId,
-      paste: body.paste !== false,
+      paste,
+      mode: session.intent,
+      trigger_mode: session.mode,
+      intent: session.intent,
       bytes: session.bytes,
       chunks: session.chunks,
     });
@@ -698,6 +914,10 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
         status: result.status || (result.success === false ? "transcription_failed" : "pasted"),
         session_id: sessionId,
         transcript: result.text || "",
+        intent: session.intent,
+        agent_text: result.agent_text || "",
+        tts_audio_file: result.tts_audio_file || "",
+        agent_source: result.agent_source || "",
         message: result.error || result.message || "",
       },
       state: this.buildState(),
@@ -723,14 +943,292 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     });
   }
 
-  handleRendererResult(payload = {}) {
+  async handleRendererResult(payload = {}) {
     const sessionId = String(payload.session_id || "").trim();
     const session = this.sessions.get(sessionId);
     if (!session) {
       return { success: false, error: "recording session not found" };
     }
+    if (isCyberIntent(session.intent)) {
+      this.startCyberAgentForSession(session, payload);
+      this.finishSession(session, {
+        success: true,
+        status: "cyber_processing",
+        intent: session.intent,
+        text: String(payload.text || payload.asr_text || "").trim(),
+        message: "Cyber agent streaming",
+      });
+      return { success: true };
+    }
     this.finishSession(session, payload);
     return { success: true };
+  }
+
+  startCyberAgentForSession(session, payload = {}) {
+    this.runCyberAgentForSession(session, payload).then((result) => {
+      session.result = {
+        ...(session.result || {}),
+        ...result,
+      };
+      this.logger?.info?.("M5 cyber agent completed", {
+        sessionId: session.id,
+        status: result.status,
+        intent: session.intent,
+        agentSource: result.agent_source || null,
+      });
+    }).catch((error) => {
+      session.result = {
+        ...(session.result || {}),
+        success: false,
+        status: "cyber_failed",
+        message: error?.message || String(error),
+      };
+      this.logger?.warn?.("M5 cyber agent failed", {
+        sessionId: session.id,
+        error: error?.message || String(error),
+      });
+    });
+  }
+
+  async runCyberAgentForSession(session, payload = {}) {
+    const transcript = String(payload.text || payload.asr_text || "").trim();
+    const audioFile = this.writeSessionWavFile(session);
+    if (payload.success === false || (!transcript && !audioFile)) {
+      return {
+        success: false,
+        status: "transcription_failed",
+        intent: session.intent,
+        text: transcript,
+        error: payload.error || "未收到可处理的语音",
+      };
+    }
+
+    const route = selectCyberAgentCommand(session.intent);
+    if (!route.command) {
+      return {
+        success: false,
+        status: "cyber_unconfigured",
+        intent: session.intent,
+        agent_service: route.service,
+        agent_command_env: route.envName,
+        text: transcript,
+        message: `${route.envName} is not configured`,
+      };
+    }
+
+    const request = {
+      session_id: session.id,
+      source: "m5stickc_plus",
+      intent: session.intent,
+      mode: session.mode || session.intent,
+      transcript,
+      text: transcript,
+      bytes: session.bytes,
+      chunks: session.chunks,
+      audio_file: audioFile,
+      audio_url: this.recordingSourceUrl(session),
+      agent_service: route.service,
+    };
+    this.logger?.info?.("M5 cyber agent selected", {
+      sessionId: session.id,
+      intent: session.intent,
+      service: route.service,
+      commandEnv: route.envName,
+      fallback: route.fallback,
+    });
+    const hook = await this.runShellJsonHook(route.command, request, CYBER_AGENT_TIMEOUT_MS, {
+      onJsonLine: (data) => this.handleCyberAgentEvent(session, data),
+    });
+    if (!hook.success) {
+      return {
+        success: false,
+        status: "cyber_failed",
+        intent: session.intent,
+        agent_service: route.service,
+        agent_command_env: route.envName,
+        text: transcript,
+        message: hook.error || hook.stderr || hook.stdout || "Cyber agent failed",
+      };
+    }
+
+    const agent = parseCyberAgentOutput(hook.stdout);
+    if (agent.ttsAudioFile && !session.cyberTtsChunkCount) {
+      this.enqueueTtsPlayback(session, {
+        tts_audio_file: agent.ttsAudioFile,
+        text: agent.text,
+        source: agent.source,
+      });
+    }
+    return {
+      success: true,
+      status: "cyber_done",
+      intent: session.intent,
+      text: transcript,
+      agent_text: agent.text,
+      tts_audio_file: agent.ttsAudioFile,
+      agent_source: agent.source,
+      agent_service: agent.service || route.service,
+      agent_command_env: route.envName,
+      message: "Cyber agent completed",
+    };
+  }
+
+  handleCyberAgentEvent(session, data = {}) {
+    if (data.event === "tts_chunk" && data.tts_audio_file) {
+      this.enqueueTtsPlayback(session, data);
+    }
+  }
+
+  enqueueTtsPlayback(session, data = {}) {
+    const audioPath = String(data.tts_audio_file || data.audio_file || "").trim();
+    if (!audioPath) {
+      return;
+    }
+    const item = {
+      requestId: `${session.id}-${data.index || this.ttsPlaybackQueue.length + 1}-${Date.now()}`,
+      sessionId: session.id,
+      audioPath,
+      text: String(data.text || ""),
+      source: String(data.tts_source || data.source || ""),
+      index: Number(data.index || 0),
+      total: Number(data.total || 0),
+    };
+    this.ttsPlaybackQueue.push(item);
+    session.cyberTtsChunkCount = Number(session.cyberTtsChunkCount || 0) + 1;
+    this.logger?.info?.("M5 TTS chunk queued", {
+      sessionId: item.sessionId,
+      requestId: item.requestId,
+      index: item.index || null,
+      total: item.total || null,
+      audioPath: item.audioPath,
+    });
+    this.advanceTtsPlayback();
+  }
+
+  advanceTtsPlayback() {
+    if (this.currentTtsPlayback || this.ttsPlaybackQueue.length === 0) {
+      return;
+    }
+    const item = this.ttsPlaybackQueue.shift();
+    this.currentTtsPlayback = item;
+    this.latestTtsAudioFile = item.audioPath;
+    this.ttsPlaybackRequestId = item.requestId;
+    this.logger?.info?.("M5 TTS chunk ready for device", {
+      sessionId: item.sessionId,
+      requestId: item.requestId,
+      index: item.index || null,
+      total: item.total || null,
+    });
+  }
+
+  completeCurrentTtsPlayback(eventName, body = {}) {
+    const completed = this.currentTtsPlayback;
+    this.currentTtsPlayback = null;
+    this.ttsPlaybackRequestId = "";
+    this.latestTtsAudioFile = "";
+    this.logger?.info?.("M5 TTS playback acknowledged", {
+      event: eventName,
+      sessionId: body.session_id || completed?.sessionId || "",
+      requestId: completed?.requestId || "",
+      status: body.status || "",
+    });
+    this.advanceTtsPlayback();
+  }
+
+  recordingSourceUrl(session) {
+    const publicBase = String(
+      process.env.VIBE_STICK_BRIDGE_PUBLIC_URL ||
+      process.env.M5_VOICE_BRIDGE_PUBLIC_URL ||
+      ""
+    ).trim().replace(/\/+$/, "");
+    if (!publicBase || !session?.audioFile) {
+      return "";
+    }
+    const params = new URLSearchParams({ session_id: session.id });
+    if (this.token) {
+      params.set("token", this.token);
+    }
+    return `${publicBase}/recording/source?${params.toString()}`;
+  }
+
+  runShellJsonHook(command, payload, timeoutMs, options = {}) {
+    return new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      let lineBuffer = "";
+      let child = null;
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          ...result,
+        });
+      };
+
+      const timer = setTimeout(() => {
+        child?.kill?.("SIGTERM");
+        finish({ success: false, error: "timeout" });
+      }, timeoutMs);
+      timer.unref?.();
+
+      try {
+        child = spawn(command, {
+          shell: true,
+          stdio: ["pipe", "pipe", "pipe"],
+          detached: process.platform !== "win32",
+        });
+      } catch (error) {
+        finish({ success: false, error: error?.message || String(error) });
+        return;
+      }
+
+      child.stdout?.on("data", (chunk) => {
+        const text = chunk.toString();
+        stdout += text;
+        lineBuffer += text;
+        const lines = lineBuffer.split(/\r?\n/);
+        lineBuffer = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const data = JSON.parse(trimmed);
+            options.onJsonLine?.(data);
+          } catch {
+            // Non-JSON stdout remains part of final hook output.
+          }
+        }
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", (error) => {
+        finish({ success: false, error: error?.message || String(error) });
+      });
+      child.on("close", (code) => {
+        finish({ success: code === 0, code });
+      });
+      child.stdin?.end(JSON.stringify(payload));
+    });
+  }
+
+  writeSessionWavFile(session) {
+    if (session.audioFile) {
+      return session.audioFile;
+    }
+    if (!session.audioChunks?.length) {
+      return "";
+    }
+    const fileName = `vibestick-${session.id.replace(/[^a-zA-Z0-9_-]/g, "") || randomUUID()}.wav`;
+    const filePath = path.join(os.tmpdir(), fileName);
+    fs.writeFileSync(filePath, createPcmWavBuffer(session.audioChunks, session.sampleRate || 16000));
+    session.audioFile = filePath;
+    return filePath;
   }
 
   finishSession(session, result) {
@@ -820,3 +1318,6 @@ function escapeHtml(value) {
 }
 
 module.exports = M5VoiceBridge;
+module.exports.normalizeRecordingIntent = normalizeRecordingIntent;
+module.exports.selectCyberAgentCommand = selectCyberAgentCommand;
+module.exports.createPcmWavBuffer = createPcmWavBuffer;
