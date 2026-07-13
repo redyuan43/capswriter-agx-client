@@ -1,4 +1,13 @@
-const { app, globalShortcut, BrowserWindow, ipcMain, dialog, Notification, shell } = require("electron");
+const {
+  app,
+  globalShortcut,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  Notification,
+  shell,
+  systemPreferences
+} = require("electron");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
@@ -834,7 +843,25 @@ async function startApp() {
     safeSendToMainWindow('dictation-confirm-requested');
   });
 
-  const capsLockListenerStarted = capsLockListener.start();
+  let capsLockListenerStarted = false;
+  const macAccessibilityGranted =
+    process.platform !== 'darwin' ||
+    systemPreferences.isTrustedAccessibilityClient(false);
+
+  if (!macAccessibilityGranted) {
+    logger.warn(
+      'macOS Accessibility permission is required for global hold-key listening; listener startup deferred'
+    );
+    systemPreferences.isTrustedAccessibilityClient(true);
+    shell.openExternal(
+      'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'
+    ).catch((error) => {
+      logger.warn('Failed to open macOS Accessibility settings:', error?.message || error);
+    });
+  } else {
+    capsLockListenerStarted = capsLockListener.start();
+  }
+
   if (capsLockListenerStarted) {
     logger.info(`${capsLockListener.getDictationKeyDisplayName()} listener started`);
   } else {
