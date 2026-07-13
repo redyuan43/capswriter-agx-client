@@ -50,6 +50,15 @@ function cleanToken(value) {
   return token;
 }
 
+function cleanBridgeIdentity(value, fallback) {
+  const identity = String(value || "").trim().replace(/[^a-zA-Z0-9._-]/g, "-");
+  return identity.slice(0, 64) || fallback;
+}
+
+function cleanBridgeLabel(value, fallback) {
+  return String(value || "").trim().slice(0, 64) || fallback;
+}
+
 function parseBool(value, defaultValue = true) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -236,6 +245,14 @@ class M5VoiceBridge {
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
     this.token = cleanToken(process.env.M5_VOICE_BRIDGE_TOKEN || process.env.VIBE_STICK_BRIDGE_TOKEN);
+    this.bridgeId = cleanBridgeIdentity(
+      process.env.M5_VOICE_BRIDGE_ID || process.env.VIBE_STICK_BRIDGE_ID,
+      "capswriter-m5-voice-bridge"
+    );
+    this.bridgeLabel = cleanBridgeLabel(
+      process.env.M5_VOICE_BRIDGE_LABEL || process.env.VIBE_STICK_BRIDGE_LABEL,
+      this.bridgeId
+    );
     this.otaDir = process.env.M5_VOICE_BRIDGE_OTA_DIR || process.env.VIBE_STICK_OTA_DIR || defaultOtaDir();
     this.latestTtsAudioFile = "";
     this.ttsPlaybackRequestId = "";
@@ -271,6 +288,8 @@ class M5VoiceBridge {
       this.logger?.info?.("M5 voice bridge listening", {
         host: this.host,
         port: this.port,
+        bridgeId: this.bridgeId,
+        bridgeLabel: this.bridgeLabel,
         tokenRequired: Boolean(this.token),
       });
     });
@@ -295,11 +314,8 @@ class M5VoiceBridge {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     this.rememberDevice(req, url.pathname);
     if (req.method === "GET" && url.pathname === "/health") {
-      this.sendJson(res, 200, {
-        ok: true,
-        bridge_name: "capswriter-m5-voice-bridge",
-        bridge_version: "1.0.0",
-      });
+      this.requireToken(req);
+      this.sendJson(res, 200, this.healthPayload());
       return;
     }
     if (req.method === "GET" && url.pathname === "/state") {
@@ -428,7 +444,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
 <body>
 <main>
 <h1>CapsWriter M5 Bridge</h1>
-<div class="meta">Listening on ${escapeHtml(this.host)}:${this.port} &middot; Updated ${updatedAt}</div>
+<div class="meta">${escapeHtml(this.bridgeLabel)} (${escapeHtml(this.bridgeId)}) &middot; Listening on ${escapeHtml(this.host)}:${this.port} &middot; Updated ${updatedAt}</div>
 <table>
 <thead>
 <tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr>
@@ -466,6 +482,17 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     if (provided !== this.token) {
       throw Object.assign(new Error("unauthorized"), { statusCode: 401 });
     }
+  }
+
+  healthPayload() {
+    return {
+      ok: true,
+      bridge_id: this.bridgeId,
+      bridge_label: this.bridgeLabel,
+      bridge_name: "capswriter-m5-voice-bridge",
+      bridge_version: "1.0.0",
+      token_required: Boolean(this.token),
+    };
   }
 
   async handleEvent(req, res) {
@@ -511,8 +538,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       },
       recording: this.currentRecordingState(),
       tts_playback_request_id: this.ttsPlaybackRequestId,
-      bridge_name: "capswriter-m5-voice-bridge",
-      bridge_version: "1.0.0",
+      ...this.healthPayload(),
     };
   }
 

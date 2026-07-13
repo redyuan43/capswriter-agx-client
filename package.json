@@ -24,6 +24,7 @@
     "pack": "npm run build:renderer && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir",
     "dist": "npm run build:renderer && electron-builder",
     "lint": "cd src && eslint .",
+    "test": "node --test",
     "postinstall": "electron-builder install-app-deps",
     "prepare:python": "echo \"Local ASR workflow removed\"",
     "prepare:python:uv": "echo \"Local ASR workflow removed\"",
