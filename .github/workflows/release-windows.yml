@@ -1,0 +1,55 @@
+name: Release Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Git tag for the release assets
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build:win:agx-client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/CapsWriter-GUI-*-win-*
+          if-no-files-found: error
+
+  publish:
+    name: Upload Windows release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: release-assets
+
+      - name: Generate Windows checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS-windows.txt
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber
