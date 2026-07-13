@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*-agx-client"
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Existing workflow run whose artifacts should be published
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +17,7 @@ permissions:
 jobs:
   build:
     name: Build Linux ${{ matrix.arch }}
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -41,12 +48,16 @@ jobs:
   publish:
     name: Publish GitHub release
     needs: build
+    if: ${{ always() && (github.event_name == 'push' || inputs.source_run_id != '') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.run_id }}
 
       - name: Generate checksums
         working-directory: release-assets
