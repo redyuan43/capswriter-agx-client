@@ -151,7 +151,10 @@ test("M5 confirmation is accepted while transcription is still pending and runs 
     body: { event: "button_followup_enter", session_id: sessionId },
   });
   assert.ok(Date.now() - acceptedAt < 150);
-  assert.deepEqual(JSON.parse(confirmation.body).followup_enter, {
+  assert.ok(Buffer.byteLength(confirmation.body) < 256);
+  const confirmationResponse = JSON.parse(confirmation.body);
+  assert.equal("state" in confirmationResponse, false);
+  assert.deepEqual(confirmationResponse.followup_enter, {
     status: "queued",
     session_id: sessionId,
   });
@@ -193,5 +196,114 @@ test("M5 confirmation never sends Enter after a failed paste", async (t) => {
     status: "transcription_failed",
   });
   await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(commands.length, 0);
+});
+
+test("M5 confirmation is rejected after the recording session has completed", async (t) => {
+  const { bridge, commands, port } = await startBridge(t);
+  const sessionId = "completed-confirmation";
+
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    body: { session_id: sessionId, intent: "dictation" },
+  });
+  await bridge.handleRendererResult({
+    session_id: sessionId,
+    success: true,
+    status: "pasted",
+    text: "already done",
+  });
+
+  const confirmation = await requestJson(port, "/event", {
+    method: "POST",
+    body: { event: "button_followup_enter", session_id: sessionId },
+  });
+  const response = JSON.parse(confirmation.body);
+  assert.equal(response.success, false);
+  assert.deepEqual(response.followup_enter, {
+    status: "session_completed",
+    session_id: sessionId,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(commands.length, 0);
+});
+
+test("M5 double click cancels the current dictation without sending Escape", async (t) => {
+  const rendererEvents = [];
+  let resolveStopDispatched;
+  const stopDispatched = new Promise((resolve) => {
+    resolveStopDispatched = resolve;
+  });
+  const { bridge, commands, port } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+    if (eventName === "external-recording-stop") {
+      resolveStopDispatched();
+    }
+  });
+  const sessionId = "cancel-current-dictation";
+
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    body: { session_id: sessionId, intent: "dictation" },
+  });
+  const stopRequest = requestJson(port, "/recording/stop", {
+    method: "POST",
+    body: { session_id: sessionId, intent: "dictation", paste: true },
+  });
+  await stopDispatched;
+
+  const cancellation = await requestJson(port, "/event", {
+    method: "POST",
+    body: { event: "button_followup_escape", session_id: sessionId },
+  });
+  const response = JSON.parse(cancellation.body);
+  assert.equal(response.success, true);
+  assert.deepEqual(response.followup_escape, {
+    status: "cancelled",
+    session_id: sessionId,
+  });
+  assert.ok(Buffer.byteLength(cancellation.body) < 256);
+  assert.deepEqual(rendererEvents.at(-1), {
+    eventName: "external-recording-cancel",
+    payload: {
+      session_id: sessionId,
+      reason: "button_followup_escape",
+    },
+  });
+
+  const stop = await stopRequest;
+  const stopResponse = JSON.parse(stop.body);
+  assert.equal(stop.statusCode, 200);
+  assert.equal(stopResponse.recording.status, "cancelled");
+  await bridge.handleRendererResult({
+    session_id: sessionId,
+    success: true,
+    status: "pasted",
+    text: "must be ignored after cancellation",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(commands.length, 0);
+});
+
+test("M5 cancellation remains successful when it arrives before recording stop", async (t) => {
+  const { commands, port } = await startBridge(t);
+  const sessionId = "cancel-before-stop";
+
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    body: { session_id: sessionId, intent: "dictation" },
+  });
+  const cancellation = await requestJson(port, "/event", {
+    method: "POST",
+    body: { event: "button_followup_escape", session_id: sessionId },
+  });
+  assert.equal(JSON.parse(cancellation.body).followup_escape.status, "cancelled");
+
+  const stop = await requestJson(port, "/recording/stop", {
+    method: "POST",
+    body: { session_id: sessionId, intent: "dictation", paste: true },
+  });
+  assert.equal(stop.statusCode, 200);
+  assert.equal(JSON.parse(stop.body).recording.status, "cancelled");
   assert.equal(commands.length, 0);
 });

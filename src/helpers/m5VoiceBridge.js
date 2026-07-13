@@ -24,14 +24,6 @@ const FOLLOWUP_KEYS = {
     dispatchingField: "enterDispatching",
     requirePaste: true,
   },
-  escape: {
-    name: "escape",
-    keyName: "Escape",
-    pendingField: "pendingEscape",
-    sentField: "escapeSent",
-    dispatchingField: "escapeDispatching",
-    requirePaste: false,
-  },
 };
 
 function sleep(ms) {
@@ -513,7 +505,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
     if (body.event === "button_followup_escape") {
-      await this.handleFollowupKey(body, res, FOLLOWUP_KEYS.escape);
+      this.handleFollowupCancel(body, res);
       return;
     }
     this.sendJson(res, 200, this.buildState());
@@ -667,7 +659,6 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       this.sendJson(res, 400, {
         success: false,
         [responseKey]: { status: "missing_session_id" },
-        state: this.buildState(),
       });
       return;
     }
@@ -678,25 +669,82 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       this.sendJson(res, 200, {
         success: false,
         [responseKey]: { status: "session_not_found", session_id: sessionId },
-        state: this.buildState(),
+      });
+      return;
+    }
+
+    if (session.done) {
+      this.logger?.info?.(`M5 follow-up ${options.name} rejected: session completed`, {
+        sessionId,
+        status: session.status,
+      });
+      this.sendJson(res, 200, {
+        success: false,
+        [responseKey]: { status: "session_completed", session_id: sessionId },
       });
       return;
     }
 
     session[options.pendingField] = true;
-    const status = session.done ? "accepted" : "queued";
-    this.logger?.info?.(`M5 follow-up ${options.name} ${status}`, {
+    this.logger?.info?.(`M5 follow-up ${options.name} queued`, {
       sessionId,
       status: session.status,
     });
     this.sendJson(res, 200, {
       success: true,
-      [responseKey]: { status, session_id: sessionId },
-      state: this.buildState(),
+      [responseKey]: { status: "queued", session_id: sessionId },
     });
-    if (session.done) {
-      this.scheduleFollowupKey(session, session.result, options, "immediate");
+  }
+
+  handleFollowupCancel(body, res) {
+    const sessionId = String(body.session_id || "").trim();
+    if (!sessionId) {
+      this.sendJson(res, 400, {
+        success: false,
+        followup_escape: { status: "missing_session_id" },
+      });
+      return;
     }
+
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      this.logger?.warn?.("M5 follow-up cancel ignored: session not found", { sessionId });
+      this.sendJson(res, 200, {
+        success: false,
+        followup_escape: { status: "session_not_found", session_id: sessionId },
+      });
+      return;
+    }
+
+    if (session.done) {
+      this.logger?.info?.("M5 follow-up cancel rejected: session completed", {
+        sessionId,
+        status: session.status,
+      });
+      this.sendJson(res, 200, {
+        success: false,
+        followup_escape: { status: "session_completed", session_id: sessionId },
+      });
+      return;
+    }
+
+    session.cancelRequested = true;
+    session.pendingEnter = false;
+    this.sendToRenderer("external-recording-cancel", {
+      session_id: sessionId,
+      reason: "button_followup_escape",
+    });
+    this.finishSession(session, {
+      success: true,
+      status: "cancelled",
+      cancelled: true,
+      message: "External M5 recording cancelled",
+    });
+    this.logger?.info?.("M5 follow-up cancelled current recording", { sessionId });
+    this.sendJson(res, 200, {
+      success: true,
+      followup_escape: { status: "cancelled", session_id: sessionId },
+    });
   }
 
   isPasteSuccess(result = {}, session = {}) {
@@ -854,11 +902,9 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       createdAt: Date.now(),
       targetWindowId: "",
       pendingEnter: false,
-      pendingEscape: false,
       enterSent: false,
-      escapeSent: false,
       enterDispatching: false,
-      escapeDispatching: false,
+      cancelRequested: false,
       result: null,
       resolver: null,
       stopTimer: null,
@@ -924,11 +970,33 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     const sessionId = String(body.session_id || this.latestSessionId() || "").trim();
     const session = this.sessions.get(sessionId);
-    if (!session || session.done) {
+    if (!session) {
       this.sendJson(res, 404, {
         success: false,
         recording: { status: "stop_failed", session_id: sessionId },
         error: "recording session not found",
+      });
+      return;
+    }
+    if (session.done) {
+      if (session.status === "cancelled") {
+        this.sendJson(res, 200, {
+          success: true,
+          recording: {
+            status: "cancelled",
+            session_id: sessionId,
+            transcript: "",
+            intent: session.intent,
+            message: session.result?.message || "External M5 recording cancelled",
+          },
+          state: this.buildState(),
+        });
+        return;
+      }
+      this.sendJson(res, 404, {
+        success: false,
+        recording: { status: "stop_failed", session_id: sessionId },
+        error: "recording session already completed",
       });
       return;
     }
@@ -996,6 +1064,9 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const session = this.sessions.get(sessionId);
     if (!session) {
       return { success: false, error: "recording session not found" };
+    }
+    if (session.done) {
+      return { success: true, status: session.status };
     }
     if (isCyberIntent(session.intent)) {
       this.startCyberAgentForSession(session, payload);
@@ -1303,9 +1374,6 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     });
     if (session.pendingEnter) {
       this.scheduleFollowupKey(session, session.result, FOLLOWUP_KEYS.enter, "queued");
-    }
-    if (session.pendingEscape) {
-      this.scheduleFollowupKey(session, session.result, FOLLOWUP_KEYS.escape, "queued");
     }
     const cleanupTimer = setTimeout(() => this.sessions.delete(session.id), 60000);
     cleanupTimer.unref?.();

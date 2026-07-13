@@ -2002,6 +2002,8 @@ export default function FloatingBallApp() {
       realtimeStartPromise: null,
       realtimeFailed: false,
       realtimeError: null,
+      cancelled: false,
+      cancelReported: false,
     };
 
     recordingModeRef.current = "dictation";
@@ -2090,6 +2092,36 @@ export default function FloatingBallApp() {
     }
   }, []);
 
+  const cancelExternalRecording = useCallback((payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = externalRecordingRef.current;
+    if (!session || session.sessionId !== sessionId || session.cancelled) {
+      return;
+    }
+
+    session.cancelled = true;
+    if (externalRealtimeSessionRef.current) {
+      externalRealtimeSessionRef.current.cancel();
+      externalRealtimeSessionRef.current = null;
+    }
+    externalPCMChunksRef.current = [];
+    cancelCurrentOutput(payload.reason || "m5_followup_cancel");
+    if (!session.cancelReported) {
+      session.cancelReported = true;
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: true,
+        status: "cancelled",
+        cancelled: true,
+        message: "External M5 recording cancelled",
+      });
+    }
+    if (externalRecordingRef.current === session) {
+      externalRecordingRef.current = null;
+    }
+    logRuntime("info", "External M5 recording cancelled", { sessionId });
+  }, [cancelCurrentOutput, logRuntime, reportExternalRecordingResult]);
+
   const stopExternalRecording = useCallback(async (payload = {}) => {
     const sessionId = String(payload.session_id || "").trim();
     const session = externalRecordingRef.current;
@@ -2100,6 +2132,9 @@ export default function FloatingBallApp() {
         status: "stop_failed",
         error: "External recording session not found",
       });
+      return;
+    }
+    if (session.cancelled) {
       return;
     }
 
@@ -2148,6 +2183,9 @@ export default function FloatingBallApp() {
       if (session.realtimeStartPromise) {
         await session.realtimeStartPromise.catch(() => null);
       }
+      if (session.cancelled) {
+        return;
+      }
       if (externalRealtimeSessionRef.current) {
         try {
           finalPayload = await externalRealtimeSessionRef.current.finish({
@@ -2169,6 +2207,9 @@ export default function FloatingBallApp() {
             externalRealtimeSessionRef.current.cancel();
           }
         }
+      }
+      if (session.cancelled) {
+        return;
       }
 
       if (!finalPayload || !String(finalPayload.final_text || finalPayload.text || finalPayload.asr_text || "").trim()) {
@@ -2197,10 +2238,16 @@ export default function FloatingBallApp() {
           },
         });
       }
+      if (session.cancelled) {
+        return;
+      }
 
       const transcriptionResult = normalizeASRPayload(finalPayload, wavBlob);
       transcriptionResult.audio_stats = transcriptionResult.audio_stats || stats;
       await handleRecordingComplete(transcriptionResult);
+      if (session.cancelled) {
+        return;
+      }
       reportExternalRecordingResult({
         session_id: sessionId,
         success: transcriptionResult.success !== false && Boolean(transcriptionResult.text || transcriptionResult.asr_text),
@@ -2216,6 +2263,9 @@ export default function FloatingBallApp() {
         textLength: (transcriptionResult.text || "").length,
       });
     } catch (error) {
+      if (session.cancelled) {
+        return;
+      }
       await transitionStatus("error");
       const message = error?.message || String(error);
       setMessage(`音频处理失败：${message}`);
@@ -2230,12 +2280,14 @@ export default function FloatingBallApp() {
         hideFloatingBall();
       }, 1600);
     } finally {
-      if (externalRealtimeSessionRef.current) {
-        externalRealtimeSessionRef.current.cancel();
-        externalRealtimeSessionRef.current = null;
+      if (externalRecordingRef.current === session) {
+        if (externalRealtimeSessionRef.current) {
+          externalRealtimeSessionRef.current.cancel();
+          externalRealtimeSessionRef.current = null;
+        }
+        externalRecordingRef.current = null;
+        externalPCMChunksRef.current = [];
       }
-      externalRecordingRef.current = null;
-      externalPCMChunksRef.current = [];
     }
   }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, reportExternalRecordingResult, resetUI, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
 
@@ -2622,6 +2674,9 @@ export default function FloatingBallApp() {
         });
       });
     });
+    const unsubscribeCancel = window.electronAPI.onExternalRecordingCancel?.((payload) => {
+      cancelExternalRecording(payload);
+    });
     const unsubscribeError = window.electronAPI.onExternalRecordingError?.((payload) => {
       const message = payload?.error || payload?.message || "外部录音设备错误";
       transitionStatus("error");
@@ -2632,9 +2687,10 @@ export default function FloatingBallApp() {
       if (unsubscribeStart) unsubscribeStart();
       if (unsubscribeChunk) unsubscribeChunk();
       if (unsubscribeStop) unsubscribeStop();
+      if (unsubscribeCancel) unsubscribeCancel();
       if (unsubscribeError) unsubscribeError();
     };
-  }, [receiveExternalRecordingChunk, reportExternalRecordingResult, startExternalRecording, stopExternalRecording, transitionStatus]);
+  }, [cancelExternalRecording, receiveExternalRecordingChunk, reportExternalRecordingResult, startExternalRecording, stopExternalRecording, transitionStatus]);
 
   useEffect(() => {
     if (!window.electronAPI?.onCodexVoiceUpdate) return undefined;

@@ -128,6 +128,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("external-recording-stop", listener);
   },
 
+  onExternalRecordingCancel: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-cancel", listener);
+    return () => ipcRenderer.removeListener("external-recording-cancel", listener);
+  },
+
   onExternalRecordingError: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("external-recording-error", listener);
