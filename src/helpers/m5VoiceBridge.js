@@ -21,6 +21,7 @@ const FOLLOWUP_KEYS = {
     keyName: "Return",
     pendingField: "pendingEnter",
     sentField: "enterSent",
+    dispatchingField: "enterDispatching",
     requirePaste: true,
   },
   escape: {
@@ -28,6 +29,7 @@ const FOLLOWUP_KEYS = {
     keyName: "Escape",
     pendingField: "pendingEscape",
     sentField: "escapeSent",
+    dispatchingField: "escapeDispatching",
     requirePaste: false,
   },
 };
@@ -211,7 +213,11 @@ function createPcmWavBuffer(chunks, sampleRate = 16000) {
 
 function defaultOtaDir() {
   const repoRoot = path.resolve(__dirname, "../..");
-  return path.resolve(repoRoot, "../VibeStick/firmware/sticks3/ota");
+  const candidates = [
+    path.resolve(repoRoot, "../VibeStick-multi-bridge/firmware/sticks3/ota"),
+    path.resolve(repoRoot, "../VibeStick/firmware/sticks3/ota"),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
 }
 
 function safeOtaBoard(value) {
@@ -654,7 +660,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     };
   }
 
-  async handleFollowupKey(body, res, options) {
+  handleFollowupKey(body, res, options) {
     const responseKey = `followup_${options.name}`;
     const sessionId = String(body.session_id || "").trim();
     if (!sessionId) {
@@ -677,23 +683,20 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    if (!session.done) {
-      session[options.pendingField] = true;
-      this.logger?.info?.(`M5 follow-up ${options.name} queued`, { sessionId });
-      this.sendJson(res, 200, {
-        success: true,
-        [responseKey]: { status: "queued", session_id: sessionId },
-        state: this.buildState(),
-      });
-      return;
-    }
-
-    const followup = await this.sendKeyForSession(session, session.result, options, "immediate");
+    session[options.pendingField] = true;
+    const status = session.done ? "accepted" : "queued";
+    this.logger?.info?.(`M5 follow-up ${options.name} ${status}`, {
+      sessionId,
+      status: session.status,
+    });
     this.sendJson(res, 200, {
-      success: followup.success,
-      [responseKey]: { ...followup, session_id: sessionId },
+      success: true,
+      [responseKey]: { status, session_id: sessionId },
       state: this.buildState(),
     });
+    if (session.done) {
+      this.scheduleFollowupKey(session, session.result, options, "immediate");
+    }
   }
 
   isPasteSuccess(result = {}, session = {}) {
@@ -767,6 +770,23 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     return { success: true, status: "sent", reason };
   }
 
+  scheduleFollowupKey(session, result = {}, options, reason = "queued") {
+    if (!session || session[options.sentField] || session[options.dispatchingField]) {
+      return;
+    }
+    session[options.dispatchingField] = true;
+    setImmediate(() => {
+      this.sendKeyForSession(session, result, options, reason).catch((error) => {
+        this.logger?.warn?.(`M5 follow-up ${options.name} failed`, {
+          sessionId: session.id,
+          error: error?.message || String(error),
+        });
+      }).finally(() => {
+        session[options.dispatchingField] = false;
+      });
+    });
+  }
+
   runCommand(command, args = [], timeoutMs = 2000) {
     return new Promise((resolve) => {
       let stdout = "";
@@ -837,6 +857,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       pendingEscape: false,
       enterSent: false,
       escapeSent: false,
+      enterDispatching: false,
+      escapeDispatching: false,
       result: null,
       resolver: null,
       stopTimer: null,
@@ -1280,20 +1302,10 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       success: session.result.success !== false,
     });
     if (session.pendingEnter) {
-      this.sendKeyForSession(session, session.result, FOLLOWUP_KEYS.enter, "queued").catch((error) => {
-        this.logger?.warn?.("M5 follow-up enter failed", {
-          sessionId: session.id,
-          error: error?.message || String(error),
-        });
-      });
+      this.scheduleFollowupKey(session, session.result, FOLLOWUP_KEYS.enter, "queued");
     }
     if (session.pendingEscape) {
-      this.sendKeyForSession(session, session.result, FOLLOWUP_KEYS.escape, "queued").catch((error) => {
-        this.logger?.warn?.("M5 follow-up escape failed", {
-          sessionId: session.id,
-          error: error?.message || String(error),
-        });
-      });
+      this.scheduleFollowupKey(session, session.result, FOLLOWUP_KEYS.escape, "queued");
     }
     const cleanupTimer = setTimeout(() => this.sessions.delete(session.id), 60000);
     cleanupTimer.unref?.();
