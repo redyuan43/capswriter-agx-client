@@ -10,6 +10,10 @@ on:
         description: Existing workflow run whose artifacts should be published
         required: true
         type: string
+      release_tag:
+        description: Existing Git tag that the release should use
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -68,9 +72,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: >-
-          gh release create "${GITHUB_REF_NAME}"
+          gh release create "${RELEASE_TAG}"
           release-assets/CapsWriter-GUI-*.AppImage
           release-assets/SHA256SUMS.txt
-          --title "CapsWriter AGX Client ${GITHUB_REF_NAME#v}"
+          --title "CapsWriter AGX Client ${RELEASE_TAG#v}"
           --generate-notes
