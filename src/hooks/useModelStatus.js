@@ -52,11 +52,23 @@ const fetchRealtimeTtsSnapshot = async () => {
   }
 };
 
-/**
- * 模型状态监控 Hook（优先 HTTP 后端，失败时可回退到实时 ASR）
- */
-export const useModelStatus = () => {
-  const [modelStatus, setModelStatus] = useState({
+const createInitialModelStatus = () => {
+  if (isRealtimeASRConfigured()) {
+    return {
+      isLoading: false,
+      isReady: true,
+      isDownloading: false,
+      modelsDownloaded: true,
+      error: null,
+      progress: 100,
+      downloadProgress: 0,
+      missingModels: [],
+      stage: 'ready',
+      ...createEmptyTtsSnapshot()
+    };
+  }
+
+  return {
     isLoading: true,
     isReady: false,
     isDownloading: false,
@@ -66,13 +78,15 @@ export const useModelStatus = () => {
     downloadProgress: 0,
     missingModels: [],
     stage: 'checking',
-    ttsEnabled: false,
-    ttsLoaded: false,
-    ttsWarmed: false,
-    ttsRemoteService: false,
-    ttsWorkersReady: null,
-    ttsRecommendedPrefetch: null
-  });
+    ...createEmptyTtsSnapshot()
+  };
+};
+
+/**
+ * 模型状态监控 Hook（优先 HTTP 后端，失败时可回退到实时 ASR）
+ */
+export const useModelStatus = () => {
+  const [modelStatus, setModelStatus] = useState(createInitialModelStatus);
 
   const checkModelStatus = useCallback(async () => {
     if (isRealtimeASRConfigured()) {
