@@ -1,6 +1,6 @@
 const { BrowserWindow, screen } = require("electron");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 
 const isHeadless = process.env.SPEECH_TRANSCRIPTION_HEADLESS === '1';
 const devServerPort = process.env.VITE_DEV_PORT || '5175';
@@ -8,7 +8,10 @@ const devServerUrl = `http://localhost:${devServerPort}`;
 const appIconPath = path.join(__dirname, "..", "..", "assets", "icon.png");
 
 class WindowManager {
-  constructor() {
+  constructor(options = {}) {
+    this.platform = options.platform || process.platform;
+    this.execFileSync = options.execFileSync || execFileSync;
+    this.execSync = options.execSync || execSync;
     this.mainWindow = null;
     this.controlPanelWindow = null;
     this.historyWindow = null;
@@ -16,9 +19,49 @@ class WindowManager {
     this.linkDirectoryWindow = null;
     this.isHeadless = isHeadless;
     this.lastPosition = null;
-    this.previousActiveWindow = null; // 记录显示悬浮球前的活动窗口
+    this.previousActiveWindow = null;
     this.floatingWindowDefaultSize = { width: 400, height: 72 };
     this.floatingWindowMaxSize = { width: 1100, height: 640 };
+  }
+
+  rememberActiveWindow() {
+    try {
+      if (this.platform === 'linux') {
+        this.previousActiveWindow = this.execSync(
+          'xdotool getactivewindow 2>/dev/null',
+          { encoding: 'utf-8' }
+        ).trim();
+      } else if (this.platform === 'win32') {
+        const script = [
+          'Add-Type @"',
+          'using System;',
+          'using System.Runtime.InteropServices;',
+          'public static class CapsWriterWindow {',
+          '  [DllImport("user32.dll")]',
+          '  public static extern IntPtr GetForegroundWindow();',
+          '}',
+          '"@',
+          '[CapsWriterWindow]::GetForegroundWindow().ToInt64()',
+        ].join('\n');
+        const windowId = this.execFileSync(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-Command', script],
+          { encoding: 'utf-8', windowsHide: true }
+        ).trim();
+        this.previousActiveWindow = /^\d+$/.test(windowId) && windowId !== '0'
+          ? windowId
+          : null;
+      } else {
+        this.previousActiveWindow = null;
+      }
+    } catch {
+      this.previousActiveWindow = null;
+    }
+
+    if (this.previousActiveWindow) {
+      console.log('Previous active window:', this.previousActiveWindow);
+    }
+    return this.previousActiveWindow;
   }
 
   async createMainWindow() {
@@ -111,14 +154,8 @@ class WindowManager {
   showFloatingBall(options = {}) {
     if (this.mainWindow) {
       const rememberActiveWindow = options.rememberActiveWindow !== false;
-      // 记录当前活动窗口 (Linux only)
-      if (rememberActiveWindow && process.platform === 'linux') {
-        try {
-          this.previousActiveWindow = execSync('xdotool getactivewindow 2>/dev/null', { encoding: 'utf-8' }).trim();
-          console.log('Previous active window:', this.previousActiveWindow);
-        } catch {
-          this.previousActiveWindow = null;
-        }
+      if (rememberActiveWindow) {
+        this.rememberActiveWindow();
       }
       
       this.resizeFloatingBall(

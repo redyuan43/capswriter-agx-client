@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing Git tag for the release assets
-        required: true
+        description: Existing Git tag to publish; leave empty for a test artifact only
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -36,6 +37,7 @@ jobs:
   publish:
     name: Upload Windows release assets
     needs: build
+    if: ${{ inputs.release_tag != '' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

@@ -784,7 +784,7 @@ async function startApp() {
   capsLockListener.setOnCapsLockUp(() => {
     logger.info(`${capsLockListener.getDictationKeyDisplayName()} released - stopping recording, keep floating ball visible for result`);
     
-    // 设置剪贴板管理器的目标窗口 ID (用于 Linux 粘贴)
+    // Restore the window that was active before the floating recorder appeared.
     if (windowManager.previousActiveWindow) {
       clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
     }

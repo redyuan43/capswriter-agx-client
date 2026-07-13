@@ -1,6 +1,6 @@
 {
   "name": "speech-transcription",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "语音转写-基于HTTP后端和可配置AI模型的中文语音转文字应用",
   "main": "main.js",
   "private": true,
@@ -24,7 +24,7 @@
     "pack": "npm run build:renderer && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir",
     "dist": "npm run build:renderer && electron-builder",
     "lint": "cd src && eslint .",
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
     "postinstall": "electron-builder install-app-deps",
     "prepare:python": "echo \"Local ASR workflow removed\"",
     "prepare:python:uv": "echo \"Local ASR workflow removed\"",

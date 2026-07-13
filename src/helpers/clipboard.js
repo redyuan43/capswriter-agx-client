@@ -19,7 +19,7 @@ class ClipboardManager {
   constructor(logger) {
     // 初始化剪贴板管理器
     this.logger = logger;
-    this.targetWindowId = null; // 目标窗口 ID (用于 Linux 粘贴)
+    this.targetWindowId = null;
     this.databaseManager = null;
     this.pasteMethodMap = {};
     
@@ -607,14 +607,67 @@ class ClipboardManager {
 
   async pasteWindows(originalClipboard) {
     return new Promise((resolve) => {
-      // 使用更可靠的 PowerShell 方法
+      const targetWindowId = /^\d+$/.test(String(this.targetWindowId || ""))
+        ? String(this.targetWindowId)
+        : "";
+      const activationScript = targetWindowId
+        ? `
+        Add-Type @"
+        using System;
+        using System.Runtime.InteropServices;
+        public static class CapsWriterWindow {
+          [DllImport("kernel32.dll")]
+          public static extern uint GetCurrentThreadId();
+          [DllImport("user32.dll")]
+          public static extern IntPtr GetForegroundWindow();
+          [DllImport("user32.dll")]
+          public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+          [DllImport("user32.dll")]
+          public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+          [DllImport("user32.dll")]
+          public static extern bool SetForegroundWindow(IntPtr hWnd);
+          [DllImport("user32.dll")]
+          public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+          [DllImport("user32.dll")]
+          public static extern bool BringWindowToTop(IntPtr hWnd);
+        }
+"@
+        $target = [IntPtr]${targetWindowId}
+        $currentThread = [CapsWriterWindow]::GetCurrentThreadId()
+        $targetThread = [CapsWriterWindow]::GetWindowThreadProcessId($target, [IntPtr]::Zero)
+        $foreground = [CapsWriterWindow]::GetForegroundWindow()
+        $foregroundThread = [CapsWriterWindow]::GetWindowThreadProcessId($foreground, [IntPtr]::Zero)
+        if ($targetThread -ne 0) {
+          [CapsWriterWindow]::AttachThreadInput($currentThread, $targetThread, $true) | Out-Null
+        }
+        if ($foregroundThread -ne 0 -and $foregroundThread -ne $targetThread) {
+          [CapsWriterWindow]::AttachThreadInput($currentThread, $foregroundThread, $true) | Out-Null
+        }
+        try {
+          [CapsWriterWindow]::ShowWindowAsync($target, 9) | Out-Null
+          [CapsWriterWindow]::BringWindowToTop($target) | Out-Null
+          [CapsWriterWindow]::SetForegroundWindow($target) | Out-Null
+        } finally {
+          if ($foregroundThread -ne 0 -and $foregroundThread -ne $targetThread) {
+            [CapsWriterWindow]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null
+          }
+          if ($targetThread -ne 0) {
+            [CapsWriterWindow]::AttachThreadInput($currentThread, $targetThread, $false) | Out-Null
+          }
+        }
+        Start-Sleep -Milliseconds 120
+        `
+        : "";
       const pasteProcess = spawn("powershell", [
+        "-NoProfile",
+        "-NonInteractive",
         "-Command",
         `
+        ${activationScript}
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.SendKeys]::SendWait("^v")
         `
-      ]);
+      ], { windowsHide: true });
 
       let errorOutput = "";
       pasteProcess.stderr.on("data", (data) => {
@@ -623,7 +676,9 @@ class ClipboardManager {
 
       pasteProcess.on("close", (code) => {
         if (code === 0) {
-          this.safeLog("✅ Windows 粘贴成功");
+          this.safeLog("✅ Windows 粘贴成功", {
+            targetWindowId: targetWindowId || null,
+          });
           setTimeout(() => {
             clipboard.writeText(originalClipboard);
             this.safeLog("🔄 原始剪贴板内容已恢复");
