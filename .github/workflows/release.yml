@@ -30,7 +30,7 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build:linux:agx-client -- --publish never
+      - run: npm run build:linux:agx-client
 
       - uses: actions/upload-artifact@v4
         with:
