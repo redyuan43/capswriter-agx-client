@@ -1,4 +1,5 @@
 const { Tray, Menu, nativeImage } = require("electron");
+const fs = require("fs");
 const path = require("path");
 
 class TrayManager {
@@ -26,22 +27,13 @@ class TrayManager {
 
   async createTray() {
     try {
-      // 创建托盘图标
-      const iconPath = this.getTrayIconPath();
-      let trayIcon;
-      
-      if (iconPath && require("fs").existsSync(iconPath)) {
-        trayIcon = nativeImage.createFromPath(iconPath);
-        if (process.platform === "darwin") {
-          trayIcon = trayIcon.resize({ width: 16, height: 16 });
-          trayIcon.setTemplateImage(true);
-        }
-      } else {
-        // 如果图标文件不存在，创建一个简单的图标
-        trayIcon = nativeImage.createEmpty();
+      const { iconPath, trayIcon } = this.loadTrayIcon();
+      if (!trayIcon) {
+        throw new Error("No usable tray icon asset was found");
       }
 
       this.tray = new Tray(trayIcon);
+      this.tray.setImage(trayIcon);
       this.tray.setToolTip("语音转写 - 中文语音转文字");
 
       // 创建上下文菜单
@@ -63,22 +55,49 @@ class TrayManager {
         this.tray.popUpContextMenu();
       });
 
+      this.logger?.info?.("System tray icon ready", { iconPath });
+      return true;
     } catch (error) {
       if (this.logger && this.logger.error) {
         this.logger.error("创建托盘失败:", error);
       }
+      return false;
     }
   }
 
-  getTrayIconPath() {
-    const isDev = process.env.NODE_ENV === "development";
-    
-    if (isDev) {
-      return path.join(__dirname, "..", "..", "assets", "tray-icon.png");
-    } else {
-      // 生产环境路径
-      return path.join(process.resourcesPath, "assets", "tray-icon.png");
+  loadTrayIcon() {
+    for (const iconPath of this.getTrayIconPaths()) {
+      if (!fs.existsSync(iconPath)) {
+        continue;
+      }
+
+      let trayIcon = nativeImage.createFromPath(iconPath);
+      if (trayIcon.isEmpty()) {
+        this.logger?.warn?.("Tray icon asset could not be decoded", { iconPath });
+        continue;
+      }
+
+      if (process.platform === "darwin") {
+        trayIcon = trayIcon.resize({ width: 16, height: 16 });
+        trayIcon.setTemplateImage(true);
+      }
+
+      return { iconPath, trayIcon };
     }
+
+    return { iconPath: null, trayIcon: null };
+  }
+
+  getTrayIconPaths() {
+    const isDev = process.env.NODE_ENV === "development";
+    const assetsDir = isDev
+      ? path.join(__dirname, "..", "..", "assets")
+      : path.join(process.resourcesPath, "assets");
+
+    return [
+      path.join(assetsDir, "tray-icon.png"),
+      path.join(assetsDir, "icon.png"),
+    ];
   }
 
   updateContextMenu() {

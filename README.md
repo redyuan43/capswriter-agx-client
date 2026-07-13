@@ -16,7 +16,7 @@
 <!-- 徽章 (Badges) - 您可以后续替换为动态徽章服务 (如 shields.io) -->
 <img src="https://img.shields.io/badge/license-Apache_2.0-blue.svg" alt="License">
 <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platform">
-<img src="https://img.shields.io/badge/release-v1.0.0-brightgreen" alt="Release">
+<img src="https://img.shields.io/badge/release-v1.0.6-brightgreen" alt="Release">
 <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
 
 </div>
@@ -201,59 +201,32 @@ uv sync  # 会自动下载 Python 3.11
 
 ---
 
-## Linux ARM64 / AGX Release 安装后配置
+## Linux / AGX Release 安装
 
-从 GitHub Release 下载 `CapsWriter-GUI-*-linux-arm64.AppImage` 后，AGX / Jetson / ARM64 Linux 桌面需要额外完成以下系统配置，才能让按住 Right Shift 唤醒录音和识别后自动粘贴稳定工作。
-
-### 1. AppImage 运行方式
-
-如果系统缺少 `libfuse.so.2`，AppImage 直接运行会报错：
-
-```text
-dlopen(): error loading libfuse.so.2
-AppImages require FUSE to run.
-```
-
-不想安装系统 FUSE 时，可以解包运行：
+请使用 Release 附带的 `install-capswriter-agx-client.sh`。它会下载适配当前 CPU 架构的 AppImage、校验 SHA-256、安装到用户目录、注册图形桌面登录自启动，并立即以托盘后台模式启动。
 
 ```bash
-mkdir -p "$HOME/.local/opt/capswriter-agx-client"
-cd "$HOME/.local/opt/capswriter-agx-client"
-
-# 将下载的 AppImage 放到当前目录后执行：
-chmod +x CapsWriter-GUI-*-linux-arm64.AppImage
-./CapsWriter-GUI-*-linux-arm64.AppImage --appimage-extract
-mv squashfs-root app
+gh auth login
+mkdir -p "$HOME/.cache/capswriter-installer"
+gh release download \
+  --repo redyuan43/capswriter-agx-client \
+  --pattern "install-capswriter-agx-client.sh" \
+  --dir "$HOME/.cache/capswriter-installer"
+bash "$HOME/.cache/capswriter-installer/install-capswriter-agx-client.sh"
 ```
 
-建议创建用户级启动入口：
+安装器默认会创建：
 
-```bash
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/capswriter-agx-client" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+- AppImage：`~/.local/opt/capswriter-agx-client/CapsWriter-GUI.AppImage`
+- 启动器：`~/.local/bin/capswriter-agx-client`
+- 应用菜单项：`~/.local/share/applications/capswriter-agx-client.desktop`
+- 图形登录自启动项：`~/.config/autostart/capswriter-agx-client.desktop`
 
-APPDIR="$HOME/.local/opt/capswriter-agx-client/app"
-LOG_DIR="$HOME/.cache/capswriter-agx-client"
-LOG_FILE="$LOG_DIR/capswriter-agx-client.log"
+重启系统后，CapsWriter 会在用户登录图形桌面时自动恢复运行。完整说明、验证方式和移除步骤见 [Linux 安装文档](docs/linux-install.md)。
 
-mkdir -p "$LOG_DIR"
+### Linux 输入权限
 
-if pgrep -u "$(id -u)" -f "$APPDIR/speech-transcription" >/dev/null 2>&1; then
-  exit 0
-fi
-
-export APPDIR
-export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"
-exec "$APPDIR/AppRun" --no-sandbox "$@" >>"$LOG_FILE" 2>&1
-EOF
-chmod +x "$HOME/.local/bin/capswriter-agx-client"
-```
-
-### 2. Right Shift 按住无反应
-
-Linux ARM64 release 里的 `uiohook-napi` 预构建文件可能不是有效的 ARM64 Linux native module。AGX/Jetson 上建议显式使用 evdev 后端：
+如果 AGX/Jetson 上的 Right Shift 无响应，使用 evdev 后端：
 
 ```bash
 export CAPS_LISTENER_BACKEND=evdev
@@ -288,7 +261,7 @@ Right Shift 按下, keycode: 54
 Right Shift 松开, keycode: 54
 ```
 
-### 3. 识别后无法自动粘贴
+### Linux 自动粘贴
 
 自动粘贴依赖 Linux 剪贴板和按键注入工具。若日志出现 `spawn xdotool ENOENT`、`spawn ydotool ENOENT` 或 `spawn wl-copy ENOENT`，安装：
 
@@ -298,32 +271,6 @@ sudo apt-get install -y xdotool wl-clipboard
 ```
 
 X11 桌面通常使用 `xdotool`；Wayland 剪贴板写入使用 `wl-copy`。安装后重新启动客户端。
-
-### 4. 登录自启动
-
-创建 XDG autostart 文件：
-
-```bash
-mkdir -p "$HOME/.config/autostart"
-cat > "$HOME/.config/autostart/capswriter-agx-client.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=CapsWriter AGX Client
-Comment=Start CapsWriter AGX Client on desktop login
-Exec=$HOME/.local/bin/capswriter-agx-client
-Terminal=false
-Categories=Utility;
-StartupNotify=false
-X-GNOME-Autostart-enabled=true
-EOF
-```
-
-验证：
-
-```bash
-desktop-file-validate "$HOME/.config/autostart/capswriter-agx-client.desktop"
-"$HOME/.local/bin/capswriter-agx-client"
-```
 
 ---
 
