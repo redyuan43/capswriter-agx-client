@@ -403,6 +403,7 @@ class M5VoiceBridge {
       pmic_wake: String(req.headers["x-vibe-stick-pmic-wake"] || ""),
       pmic_irq: String(req.headers["x-vibe-stick-pmic-irq"] || ""),
       pmic_timer: String(req.headers["x-vibe-stick-pmic-timer"] || ""),
+      pmic_gpio_wake: String(req.headers["x-vibe-stick-pmic-gpio-wake"] || ""),
     };
     this.devices.set(key, device);
     this.pruneDevices(now);
@@ -475,6 +476,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       device.pmic_wake ? `PMIC:${device.pmic_wake}` : "",
       device.pmic_irq ? `IRQ:${device.pmic_irq}` : "",
       device.pmic_timer ? `Timer:${device.pmic_timer}` : "",
+      device.pmic_gpio_wake ? `GPIO:${device.pmic_gpio_wake}` : "",
     ].filter(Boolean).join(" ");
     return `<tr>
 <td>${escapeHtml(device.device_id)}</td>
