@@ -394,6 +394,15 @@ class M5VoiceBridge {
       wifi_ssid: String(req.headers["x-vibe-stick-wifi-ssid"] || ""),
       wifi_bssid: String(req.headers["x-vibe-stick-wifi-bssid"] || ""),
       wifi_rssi: parseInteger(req.headers["x-vibe-stick-wifi-rssi"], previous.wifi_rssi ?? null),
+      wake_cause: String(req.headers["x-vibe-stick-wake-cause"] || ""),
+      wake_cause_code: String(req.headers["x-vibe-stick-wake-cause-code"] || ""),
+      wake_ext1: String(req.headers["x-vibe-stick-wake-ext1"] || ""),
+      reset_reason: String(req.headers["x-vibe-stick-reset-reason"] || ""),
+      reset_reason_code: String(req.headers["x-vibe-stick-reset-reason-code"] || ""),
+      boot_count: String(req.headers["x-vibe-stick-boot-count"] || ""),
+      pmic_wake: String(req.headers["x-vibe-stick-pmic-wake"] || ""),
+      pmic_irq: String(req.headers["x-vibe-stick-pmic-irq"] || ""),
+      pmic_timer: String(req.headers["x-vibe-stick-pmic-timer"] || ""),
     };
     this.devices.set(key, device);
     this.pruneDevices(now);
@@ -415,7 +424,7 @@ class M5VoiceBridge {
   buildDashboardHtml() {
     const devices = this.listDevices();
     const rows = devices.map((device) => this.deviceRowHtml(device)).join("");
-    const bodyRows = rows || '<tr><td colspan="8" class="empty">No M5Stack devices seen yet.</td></tr>';
+    const bodyRows = rows || '<tr><td colspan="9" class="empty">No M5Stack devices seen yet.</td></tr>';
     const updatedAt = escapeHtml(new Date().toLocaleString());
     return `<!doctype html>
 <html lang="zh-CN">
@@ -445,7 +454,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
 <div class="meta">${escapeHtml(this.bridgeLabel)} (${escapeHtml(this.bridgeId)}) &middot; Listening on ${escapeHtml(this.host)}:${this.port} &middot; Updated ${updatedAt}</div>
 <table>
 <thead>
-<tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr>
+<tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>Wake</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr>
 </thead>
 <tbody>${bodyRows}</tbody>
 </table>
@@ -460,11 +469,19 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const firmware = [device.firmware_name, device.firmware_version].filter(Boolean).join(" ");
     const buildDate = String(device.build_date || "").trim();
     const firmwareText = buildDate ? `${firmware} (${buildDate})` : firmware;
+    const wakeBase = [device.reset_reason, device.wake_cause].filter(Boolean).join("/") || "-";
+    const wakeText = [
+      device.boot_count ? `${wakeBase} #${device.boot_count}` : wakeBase,
+      device.pmic_wake ? `PMIC:${device.pmic_wake}` : "",
+      device.pmic_irq ? `IRQ:${device.pmic_irq}` : "",
+      device.pmic_timer ? `Timer:${device.pmic_timer}` : "",
+    ].filter(Boolean).join(" ");
     return `<tr>
 <td>${escapeHtml(device.device_id)}</td>
 <td>${escapeHtml(device.device_ip || device.client_ip)}</td>
 <td>${escapeHtml(device.board)}</td>
 <td>${escapeHtml(firmwareText)}</td>
+<td>${escapeHtml(wakeText)}</td>
 <td>${escapeHtml(device.wifi_ssid)}</td>
 <td class="${rssiClass}">${escapeHtml(rssi ?? "")}</td>
 <td>${escapeHtml(device.last_seen_text)}</td>
