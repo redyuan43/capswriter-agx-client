@@ -6,6 +6,7 @@ const { spawn } = require("child_process");
 const { randomUUID } = require("crypto");
 const M5DeviceRegistry = require("./m5DeviceRegistry");
 const M5OtaService = require("./m5OtaService");
+const M5RecordingSessions = require("./m5RecordingSessions");
 
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 8765;
@@ -210,7 +211,8 @@ class M5VoiceBridge {
     this.clipboardManager = clipboardManager;
     this.sendToRenderer = sendToRenderer;
     this.server = null;
-    this.sessions = new Map();
+    this.recordingSessions = new M5RecordingSessions();
+    this.sessions = this.recordingSessions.sessions;
     this.deviceRegistry = new M5DeviceRegistry();
     this.devices = this.deviceRegistry.devices;
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
@@ -571,16 +573,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   }
 
   currentRecordingState() {
-    const active = [...this.sessions.values()].find((session) => !session.done);
-    if (!active) {
-      return { status: "idle", session_id: "" };
-    }
-    return {
-      status: active.status,
-      session_id: active.id,
-      source: "m5stickc_plus",
-      intent: active.intent || "dictation",
-    };
+    return this.recordingSessions.currentState();
   }
 
   handleFollowupKey(body, res, options) {
@@ -819,30 +812,14 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const sessionId = String(body.session_id || randomUUID().replace(/-/g, "")).trim();
     const intent = normalizeRecordingIntent(body.intent, body.mode);
     const mode = String(body.mode || intent).trim() || intent;
-    const session = {
+    this.windowManager?.showFloatingBall?.();
+    const targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
+    const session = this.recordingSessions.create({
       id: sessionId,
-      status: "recording",
       intent,
       mode,
-      bytes: 0,
-      chunks: 0,
-      audioChunks: [],
-      sampleRate: 16000,
-      audioFile: "",
-      done: false,
-      createdAt: Date.now(),
-      targetWindowId: "",
-      pendingEnter: false,
-      enterSent: false,
-      enterDispatching: false,
-      cancelRequested: false,
-      result: null,
-      resolver: null,
-      stopTimer: null,
-    };
-    this.sessions.set(sessionId, session);
-    this.windowManager?.showFloatingBall?.();
-    session.targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
+      targetWindowId,
+    });
     this.sendToRenderer("external-recording-start", {
       session_id: sessionId,
       source: body.source || "m5stickc_plus",
@@ -875,10 +852,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
     const body = await readRequestBody(req, MAX_AUDIO_CHUNK_BYTES);
-    if (body.length > 0) {
-      session.bytes += body.length;
-      session.chunks += 1;
-      session.audioChunks.push(Buffer.from(body));
+    if (this.recordingSessions.appendAudio(session, body)) {
       const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
       this.sendToRenderer("external-recording-chunk", {
         session_id: sessionId,
@@ -972,21 +946,16 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   }
 
   latestSessionId() {
-    const sessions = [...this.sessions.values()].filter((session) => !session.done);
-    sessions.sort((a, b) => b.createdAt - a.createdAt);
-    return sessions[0]?.id || "";
+    return this.recordingSessions.latestId();
   }
 
   waitForSessionResult(session) {
-    return new Promise((resolve) => {
-      session.resolver = resolve;
-      session.stopTimer = setTimeout(() => {
-        this.finishSession(session, {
-          success: false,
-          status: "transcription_failed",
-          error: "Timed out waiting for CapsWriter renderer",
-        });
-      }, STOP_WAIT_MS);
+    return this.recordingSessions.waitForResult(session, STOP_WAIT_MS, () => {
+      this.finishSession(session, {
+        success: false,
+        status: "transcription_failed",
+        error: "Timed out waiting for CapsWriter renderer",
+      });
     });
   }
 
@@ -1282,19 +1251,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   }
 
   finishSession(session, result) {
-    if (!session || session.done) {
+    if (!this.recordingSessions.finish(session, result)) {
       return;
-    }
-    session.result = result || {};
-    session.done = true;
-    session.status = session.result.status || (session.result.success === false ? "transcription_failed" : "pasted");
-    if (session.stopTimer) {
-      clearTimeout(session.stopTimer);
-      session.stopTimer = null;
-    }
-    if (session.resolver) {
-      session.resolver(session.result);
-      session.resolver = null;
     }
     this.logger?.info?.("M5 recording finished", {
       sessionId: session.id,
@@ -1306,8 +1264,6 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     if (session.pendingEnter) {
       this.scheduleFollowupKey(session, session.result, FOLLOWUP_KEYS.enter, "queued");
     }
-    const cleanupTimer = setTimeout(() => this.sessions.delete(session.id), 60000);
-    cleanupTimer.unref?.();
   }
 
   sendJson(res, statusCode, payload) {
