@@ -73,6 +73,66 @@ class M5RecordingSessions {
     return active[0]?.id || "";
   }
 
+  queueEnter(sessionId) {
+    const session = this.get(sessionId);
+    if (!session) {
+      return { status: "session_not_found" };
+    }
+    if (session.done) {
+      return { status: "session_completed", session };
+    }
+    session.pendingEnter = true;
+    return { status: "queued", session };
+  }
+
+  requestCancel(sessionId) {
+    const session = this.get(sessionId);
+    if (!session) {
+      return { status: "session_not_found" };
+    }
+    if (session.done) {
+      return { status: "session_completed", session };
+    }
+    session.cancelRequested = true;
+    session.pendingEnter = false;
+    return { status: "cancelled", session };
+  }
+
+  claimEnterDispatch(session, result = {}) {
+    if (!session) {
+      return { status: "session_not_found" };
+    }
+    if (session.enterSent) {
+      return { status: "already_sent" };
+    }
+    if (session.enterDispatching) {
+      return { status: "dispatching" };
+    }
+    const status = String(result.status || session.status || "").trim();
+    if (result.success === false || status !== "pasted") {
+      return { status: "paste_not_successful" };
+    }
+    if (!session.targetWindowId) {
+      return { status: "no_target_window" };
+    }
+    session.enterDispatching = true;
+    return {
+      status: "claimed",
+      sessionId: session.id,
+      targetWindowId: String(session.targetWindowId),
+    };
+  }
+
+  settleEnterDispatch(session, { sent = false } = {}) {
+    if (!session) {
+      return;
+    }
+    if (sent) {
+      session.enterSent = true;
+    }
+    session.enterDispatching = false;
+  }
+
   waitForResult(session, timeoutMs, onTimeout) {
     if (!session || session.done) {
       return Promise.resolve(session?.result || {});
@@ -88,7 +148,7 @@ class M5RecordingSessions {
 
   finish(session, result) {
     if (!session || session.done) {
-      return false;
+      return { finished: false, pendingEnter: false };
     }
     session.result = result || {};
     session.done = true;
@@ -107,7 +167,7 @@ class M5RecordingSessions {
       session.cleanupTimer = null;
     }, this.cleanupMs);
     session.cleanupTimer.unref?.();
-    return true;
+    return { finished: true, pendingEnter: session.pendingEnter };
   }
 
   clear() {

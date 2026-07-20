@@ -8,6 +8,8 @@ const M5DeviceRegistry = require("./m5DeviceRegistry");
 const M5OtaService = require("./m5OtaService");
 const M5RecordingSessions = require("./m5RecordingSessions");
 const M5VoiceBridgeRouter = require("./m5VoiceBridgeRouter");
+const M5FollowupKeyDispatcher = require("./m5FollowupKeyDispatcher");
+const { ENTER_FOLLOWUP } = require("./m5FollowupKeyDispatcher");
 
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 8765;
@@ -16,22 +18,6 @@ const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
 const STOP_WAIT_MS = 210000;
 const CYBER_AGENT_TIMEOUT_MS = 180000;
 const MAX_TTS_AUDIO_BYTES = 1024 * 1024;
-const ENTER_KEY_SETTLE_MS = 120;
-const FOLLOWUP_KEYS = {
-  enter: {
-    name: "enter",
-    keyName: "Return",
-    pendingField: "pendingEnter",
-    sentField: "enterSent",
-    dispatchingField: "enterDispatching",
-    requirePaste: true,
-  },
-};
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function cleanToken(value) {
   const token = String(value || "").trim();
   if (!token || [
@@ -215,6 +201,10 @@ class M5VoiceBridge {
     this.recordingSessions = new M5RecordingSessions();
     this.sessions = this.recordingSessions.sessions;
     this.router = new M5VoiceBridgeRouter(this);
+    this.followupKeyDispatcher = new M5FollowupKeyDispatcher({
+      logger: this.logger,
+      runCommand: (...args) => this.runCommand(...args),
+    });
     this.deviceRegistry = new M5DeviceRegistry();
     this.devices = this.deviceRegistry.devices;
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
@@ -405,7 +395,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
     if (body.event === "button_followup_enter") {
-      await this.handleFollowupKey(body, res, FOLLOWUP_KEYS.enter);
+      await this.handleFollowupKey(body, res, ENTER_FOLLOWUP);
       return;
     }
     if (body.event === "button_followup_escape") {
@@ -535,8 +525,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    const session = this.sessions.get(sessionId);
-    if (!session) {
+    const queued = this.recordingSessions.queueEnter(sessionId);
+    if (queued.status === "session_not_found") {
       this.logger?.warn?.(`M5 follow-up ${options.name} ignored: session not found`, { sessionId });
       this.sendJson(res, 200, {
         success: false,
@@ -545,10 +535,10 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    if (session.done) {
+    if (queued.status === "session_completed") {
       this.logger?.info?.(`M5 follow-up ${options.name} rejected: session completed`, {
         sessionId,
-        status: session.status,
+        status: queued.session.status,
       });
       this.sendJson(res, 200, {
         success: false,
@@ -557,7 +547,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    session[options.pendingField] = true;
+    const session = queued.session;
     this.logger?.info?.(`M5 follow-up ${options.name} queued`, {
       sessionId,
       status: session.status,
@@ -578,8 +568,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    const session = this.sessions.get(sessionId);
-    if (!session) {
+    const cancellation = this.recordingSessions.requestCancel(sessionId);
+    if (cancellation.status === "session_not_found") {
       this.logger?.warn?.("M5 follow-up cancel ignored: session not found", { sessionId });
       this.sendJson(res, 200, {
         success: false,
@@ -588,10 +578,10 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    if (session.done) {
+    if (cancellation.status === "session_completed") {
       this.logger?.info?.("M5 follow-up cancel rejected: session completed", {
         sessionId,
-        status: session.status,
+        status: cancellation.session.status,
       });
       this.sendJson(res, 200, {
         success: false,
@@ -600,8 +590,7 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       return;
     }
 
-    session.cancelRequested = true;
-    session.pendingEnter = false;
+    const session = cancellation.session;
     this.sendToRenderer("external-recording-cancel", {
       session_id: sessionId,
       reason: "button_followup_escape",
@@ -619,90 +608,32 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     });
   }
 
-  isPasteSuccess(result = {}, session = {}) {
-    const status = String(result.status || session.status || "").trim();
-    return result.success !== false && status === "pasted";
-  }
-
-  async sendKeyForSession(session, result = {}, options, reason = "queued") {
-    if (!session) {
-      return { success: false, status: "session_not_found", reason };
-    }
-    if (session[options.sentField]) {
-      return { success: true, status: "already_sent", reason };
-    }
-    if (options.requirePaste && !this.isPasteSuccess(result, session)) {
-      this.logger?.info?.(`M5 follow-up ${options.name} skipped: paste did not succeed`, {
-        sessionId: session.id,
-        status: result.status || session.status,
-        success: result.success !== false,
-        reason,
-      });
-      return { success: false, status: "paste_not_successful", reason };
-    }
-    if (!session.targetWindowId) {
-      this.logger?.warn?.(`M5 follow-up ${options.name} skipped: no target window`, {
-        sessionId: session.id,
-        reason,
-      });
-      return { success: false, status: "no_target_window", reason };
-    }
-    if (process.platform !== "linux") {
-      this.logger?.warn?.(`M5 follow-up ${options.name} unsupported on this platform`, {
-        sessionId: session.id,
-        platform: process.platform,
-        reason,
-      });
-      return { success: false, status: "unsupported_platform", reason };
-    }
-
-    const targetWindowId = String(session.targetWindowId);
-    const activate = await this.runCommand("xdotool", ["windowactivate", "--sync", targetWindowId], 2000);
-    if (!activate.success) {
-      this.logger?.warn?.(`M5 follow-up ${options.name} failed to activate target window`, {
-        sessionId: session.id,
-        targetWindowId,
-        error: activate.error || activate.stderr,
-        reason,
-      });
-      return { success: false, status: "activate_failed", reason };
-    }
-
-    await sleep(ENTER_KEY_SETTLE_MS);
-    const key = await this.runCommand("xdotool", ["key", "--delay", "35", options.keyName], 1500);
-    if (!key.success) {
-      this.logger?.warn?.(`M5 follow-up ${options.name} failed to send ${options.keyName}`, {
-        sessionId: session.id,
-        targetWindowId,
-        error: key.error || key.stderr,
-        reason,
-      });
-      return { success: false, status: "send_failed", reason };
-    }
-
-    session[options.sentField] = true;
-    this.logger?.info?.(`M5 follow-up ${options.name} sent`, {
-      sessionId: session.id,
-      targetWindowId,
-      keyName: options.keyName,
-      reason,
-    });
-    return { success: true, status: "sent", reason };
-  }
-
   scheduleFollowupKey(session, result = {}, options, reason = "queued") {
-    if (!session || session[options.sentField] || session[options.dispatchingField]) {
+    const claim = this.recordingSessions.claimEnterDispatch(session, result);
+    if (claim.status !== "claimed") {
+      if (claim.status === "paste_not_successful") {
+        this.logger?.info?.(`M5 follow-up ${options.name} skipped: paste did not succeed`, {
+          sessionId: session?.id,
+          status: result.status || session?.status,
+          success: result.success !== false,
+          reason,
+        });
+      } else if (claim.status === "no_target_window") {
+        this.logger?.warn?.(`M5 follow-up ${options.name} skipped: no target window`, {
+          sessionId: session?.id,
+          reason,
+        });
+      }
       return;
     }
-    session[options.dispatchingField] = true;
-    setImmediate(() => {
-      this.sendKeyForSession(session, result, options, reason).catch((error) => {
-        this.logger?.warn?.(`M5 follow-up ${options.name} failed`, {
-          sessionId: session.id,
-          error: error?.message || String(error),
-        });
-      }).finally(() => {
-        session[options.dispatchingField] = false;
+    this.followupKeyDispatcher.enqueue({
+      sessionId: claim.sessionId,
+      targetWindowId: claim.targetWindowId,
+      keyName: options.keyName,
+      reason,
+    }, (dispatchResult) => {
+      this.recordingSessions.settleEnterDispatch(session, {
+        sent: dispatchResult.success && dispatchResult.status === "sent",
       });
     });
   }
@@ -1199,7 +1130,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   }
 
   finishSession(session, result) {
-    if (!this.recordingSessions.finish(session, result)) {
+    const completion = this.recordingSessions.finish(session, result);
+    if (!completion.finished) {
       return;
     }
     this.logger?.info?.("M5 recording finished", {
@@ -1209,8 +1141,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       chunks: session.chunks,
       success: session.result.success !== false,
     });
-    if (session.pendingEnter) {
-      this.scheduleFollowupKey(session, session.result, FOLLOWUP_KEYS.enter, "queued");
+    if (completion.pendingEnter) {
+      this.scheduleFollowupKey(session, session.result, ENTER_FOLLOWUP, "queued");
     }
   }
 

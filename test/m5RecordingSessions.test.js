@@ -31,7 +31,7 @@ test("recording sessions track audio and expose the newest active session", () =
     intent: "dictation",
   });
 
-  sessions.finish(first, { success: true, status: "pasted" });
+  assert.equal(sessions.finish(first, { success: true, status: "pasted" }).finished, true);
   assert.deepEqual(sessions.currentState(), {
     status: "recording",
     session_id: "second",
@@ -60,11 +60,11 @@ test("recording session wait resolves once and clears its timeout", async (t) =>
     success: true,
     status: "pasted",
     text: "ready",
-  }), true);
+  }).finished, true);
   assert.equal(sessions.finish(session, {
     success: false,
     status: "transcription_failed",
-  }), false);
+  }).finished, false);
   assert.deepEqual(await waiting, {
     success: true,
     status: "pasted",
@@ -96,4 +96,62 @@ test("recording session wait applies the timeout result", async (t) => {
   assert.equal(session.status, "transcription_failed");
   assert.equal(result.error, "Timed out waiting for CapsWriter renderer");
   t.after(() => sessions.clear());
+});
+
+test("recording sessions own follow-up queue, cancellation, and dispatch claims", () => {
+  const sessions = new M5RecordingSessions();
+  const session = sessions.create({
+    id: "followup",
+    intent: "dictation",
+    mode: "dictation",
+    targetWindowId: "42",
+  });
+
+  assert.equal(sessions.queueEnter("missing").status, "session_not_found");
+  assert.equal(sessions.queueEnter("followup").status, "queued");
+  assert.equal(session.pendingEnter, true);
+  assert.equal(sessions.claimEnterDispatch(session, {
+    success: false,
+    status: "transcription_failed",
+  }).status, "paste_not_successful");
+
+  const claim = sessions.claimEnterDispatch(session, {
+    success: true,
+    status: "pasted",
+  });
+  assert.equal(claim.status, "claimed");
+  assert.equal(claim.targetWindowId, "42");
+  assert.equal(sessions.claimEnterDispatch(session, {
+    success: true,
+    status: "pasted",
+  }).status, "dispatching");
+
+  sessions.settleEnterDispatch(session, { sent: true });
+  assert.equal(session.enterSent, true);
+  assert.equal(session.enterDispatching, false);
+  assert.equal(sessions.claimEnterDispatch(session, {
+    success: true,
+    status: "pasted",
+  }).status, "already_sent");
+});
+
+test("recording cancellation clears a queued Enter and rejects completed sessions", () => {
+  const sessions = new M5RecordingSessions();
+  const session = sessions.create({
+    id: "cancel",
+    intent: "dictation",
+    mode: "dictation",
+  });
+
+  sessions.queueEnter("cancel");
+  const cancellation = sessions.requestCancel("cancel");
+  assert.equal(cancellation.status, "cancelled");
+  assert.equal(cancellation.session, session);
+  assert.equal(session.cancelRequested, true);
+  assert.equal(session.pendingEnter, false);
+
+  sessions.finish(session, { success: true, status: "cancelled" });
+  assert.equal(sessions.queueEnter("cancel").status, "session_completed");
+  assert.equal(sessions.requestCancel("cancel").status, "session_completed");
+  sessions.clear();
 });
