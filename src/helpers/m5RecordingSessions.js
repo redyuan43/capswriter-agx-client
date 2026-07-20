@@ -142,7 +142,6 @@ class M5RecordingSessions {
       session.stopTimer = this.setTimer(() => {
         onTimeout?.();
       }, timeoutMs);
-      session.stopTimer.unref?.();
     });
   }
 
