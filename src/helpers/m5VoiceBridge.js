@@ -7,6 +7,7 @@ const { randomUUID } = require("crypto");
 const M5DeviceRegistry = require("./m5DeviceRegistry");
 const M5OtaService = require("./m5OtaService");
 const M5RecordingSessions = require("./m5RecordingSessions");
+const M5VoiceBridgeRouter = require("./m5VoiceBridgeRouter");
 
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 8765;
@@ -213,6 +214,7 @@ class M5VoiceBridge {
     this.server = null;
     this.recordingSessions = new M5RecordingSessions();
     this.sessions = this.recordingSessions.sessions;
+    this.router = new M5VoiceBridgeRouter(this);
     this.deviceRegistry = new M5DeviceRegistry();
     this.devices = this.deviceRegistry.devices;
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
@@ -290,61 +292,7 @@ class M5VoiceBridge {
   async handleRequest(req, res) {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     this.rememberDevice(req, url.pathname);
-    if (req.method === "GET" && url.pathname === "/health") {
-      this.requireToken(req);
-      this.sendJson(res, 200, this.healthPayload());
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/state") {
-      this.sendJson(res, 200, this.buildState());
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/devices") {
-      this.sendJson(res, 200, { devices: this.listDevices() });
-      return;
-    }
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
-      this.sendHtml(res, 200, this.buildDashboardHtml());
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/ota/manifest") {
-      this.handleOtaManifest(res, url);
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/ota/bin") {
-      this.handleOtaBinary(res, url);
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/recording/tts") {
-      this.handleRecordingTts(res);
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/recording/source") {
-      this.handleRecordingSource(res, url);
-      return;
-    }
-    if (req.method !== "POST") {
-      this.sendJson(res, 405, { success: false, error: "method not allowed" });
-      return;
-    }
-    this.requireToken(req);
-    if (url.pathname === "/event" || url.pathname === "/quota/refresh") {
-      await this.handleEvent(req, res);
-      return;
-    }
-    if (url.pathname === "/recording/start") {
-      await this.handleRecordingStart(req, res);
-      return;
-    }
-    if (url.pathname === "/recording/audio") {
-      await this.handleRecordingAudio(req, res, url);
-      return;
-    }
-    if (url.pathname === "/recording/stop") {
-      await this.handleRecordingStop(req, res);
-      return;
-    }
-    this.sendJson(res, 404, { success: false, error: "not found" });
+    await this.router.handle(req, res, url);
   }
 
   rememberDevice(req, requestPath) {

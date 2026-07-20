@@ -121,6 +121,27 @@ test("health requires the configured token and returns bridge identity", async (
   });
 });
 
+test("HTTP routing preserves method and unknown-path responses", async (t) => {
+  const { port } = await startBridge(t);
+
+  const unknownGet = await requestJson(port, "/unknown");
+  assert.equal(unknownGet.statusCode, 405);
+  assert.deepEqual(JSON.parse(unknownGet.body), {
+    success: false,
+    error: "method not allowed",
+  });
+
+  const unknownPost = await requestJson(port, "/unknown", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(unknownPost.statusCode, 404);
+  assert.deepEqual(JSON.parse(unknownPost.body), {
+    success: false,
+    error: "not found",
+  });
+});
+
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {
   let resolveStopDispatched;
   const stopDispatched = new Promise((resolve) => {
