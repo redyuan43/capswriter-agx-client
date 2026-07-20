@@ -4,6 +4,8 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { randomUUID } = require("crypto");
+const M5DeviceRegistry = require("./m5DeviceRegistry");
+const M5OtaService = require("./m5OtaService");
 
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 8765;
@@ -13,8 +15,6 @@ const STOP_WAIT_MS = 210000;
 const CYBER_AGENT_TIMEOUT_MS = 180000;
 const MAX_TTS_AUDIO_BYTES = 1024 * 1024;
 const ENTER_KEY_SETTLE_MS = 120;
-const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
-const DEVICE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const FOLLOWUP_KEYS = {
   enter: {
     name: "enter",
@@ -203,33 +203,6 @@ function createPcmWavBuffer(chunks, sampleRate = 16000) {
   return Buffer.concat([header, pcm]);
 }
 
-function defaultOtaDir() {
-  const repoRoot = path.resolve(__dirname, "../..");
-  const candidates = [
-    path.resolve(repoRoot, "../VibeStick-multi-bridge/firmware/sticks3/ota"),
-    path.resolve(repoRoot, "../VibeStick/firmware/sticks3/ota"),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
-}
-
-function safeOtaBoard(value) {
-  const board = String(value || "").trim();
-  return OTA_BOARDS.has(board) ? board : "";
-}
-
-function readOtaManifest(otaDir, board) {
-  const safeBoard = safeOtaBoard(board);
-  if (!safeBoard) {
-    return null;
-  }
-  const manifestPath = path.join(otaDir, `${safeBoard}.json`);
-  try {
-    return JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
 class M5VoiceBridge {
   constructor({ logger, windowManager, clipboardManager, sendToRenderer }) {
     this.logger = logger;
@@ -238,7 +211,8 @@ class M5VoiceBridge {
     this.sendToRenderer = sendToRenderer;
     this.server = null;
     this.sessions = new Map();
-    this.devices = new Map();
+    this.deviceRegistry = new M5DeviceRegistry();
+    this.devices = this.deviceRegistry.devices;
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
@@ -251,7 +225,10 @@ class M5VoiceBridge {
       process.env.M5_VOICE_BRIDGE_LABEL || process.env.VIBE_STICK_BRIDGE_LABEL,
       this.bridgeId
     );
-    this.otaDir = process.env.M5_VOICE_BRIDGE_OTA_DIR || process.env.VIBE_STICK_OTA_DIR || defaultOtaDir();
+    this.otaService = new M5OtaService({
+      otaDir: process.env.M5_VOICE_BRIDGE_OTA_DIR || process.env.VIBE_STICK_OTA_DIR,
+    });
+    this.otaDir = this.otaService.otaDir;
     this.latestTtsAudioFile = "";
     this.ttsPlaybackRequestId = "";
     this.ttsPlaybackQueue = [];
@@ -369,57 +346,15 @@ class M5VoiceBridge {
   }
 
   rememberDevice(req, requestPath) {
-    const firmwareName = String(req.headers["x-vibe-stick-firmware-name"] || "").trim();
-    const deviceId = String(req.headers["x-vibe-stick-device-id"] || "").trim();
-    if (!firmwareName && !deviceId) {
-      return;
-    }
-
-    const now = Date.now();
-    const clientIp = normalizeRemoteAddress(req.socket?.remoteAddress || "");
-    const key = deviceId || clientIp || "unknown-device";
-    const previous = this.devices.get(key) || {};
-    const device = {
-      device_id: key,
-      client_ip: clientIp,
-      path: requestPath,
-      last_seen: now,
-      last_seen_text: new Date(now).toLocaleString(),
-      firmware_name: firmwareName,
-      firmware_version: String(req.headers["x-vibe-stick-firmware-version"] || ""),
-      transport: String(req.headers["x-vibe-stick-firmware-transport"] || ""),
-      build_date: String(req.headers["x-vibe-stick-firmware-build-date"] || ""),
-      board: String(req.headers["x-vibe-stick-board"] || ""),
-      device_ip: String(req.headers["x-vibe-stick-device-ip"] || clientIp),
-      wifi_ssid: String(req.headers["x-vibe-stick-wifi-ssid"] || ""),
-      wifi_bssid: String(req.headers["x-vibe-stick-wifi-bssid"] || ""),
-      wifi_rssi: parseInteger(req.headers["x-vibe-stick-wifi-rssi"], previous.wifi_rssi ?? null),
-      wake_cause: String(req.headers["x-vibe-stick-wake-cause"] || ""),
-      wake_cause_code: String(req.headers["x-vibe-stick-wake-cause-code"] || ""),
-      wake_ext1: String(req.headers["x-vibe-stick-wake-ext1"] || ""),
-      reset_reason: String(req.headers["x-vibe-stick-reset-reason"] || ""),
-      reset_reason_code: String(req.headers["x-vibe-stick-reset-reason-code"] || ""),
-      boot_count: String(req.headers["x-vibe-stick-boot-count"] || ""),
-      pmic_wake: String(req.headers["x-vibe-stick-pmic-wake"] || ""),
-      pmic_irq: String(req.headers["x-vibe-stick-pmic-irq"] || ""),
-      pmic_timer: String(req.headers["x-vibe-stick-pmic-timer"] || ""),
-      pmic_gpio_wake: String(req.headers["x-vibe-stick-pmic-gpio-wake"] || ""),
-    };
-    this.devices.set(key, device);
-    this.pruneDevices(now);
+    return this.deviceRegistry.remember(req, requestPath);
   }
 
   pruneDevices(now = Date.now()) {
-    for (const [key, device] of this.devices.entries()) {
-      if (now - Number(device.last_seen || 0) > DEVICE_RETENTION_MS) {
-        this.devices.delete(key);
-      }
-    }
+    this.deviceRegistry.prune(now);
   }
 
   listDevices() {
-    this.pruneDevices();
-    return [...this.devices.values()].sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0));
+    return this.deviceRegistry.list();
   }
 
   buildDashboardHtml() {
@@ -560,46 +495,23 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
   }
 
   handleOtaManifest(res, url) {
-    const board = safeOtaBoard(url.searchParams.get("board"));
-    if (!board) {
-      this.sendJson(res, 200, { available: false, error: "unknown board" });
-      return;
-    }
-    const manifest = readOtaManifest(this.otaDir, board);
-    if (!manifest) {
-      this.sendJson(res, 200, { available: false, board });
-      return;
-    }
-    this.sendJson(res, 200, {
-      ...manifest,
-      available: Boolean(manifest.available ?? true),
-      board,
-      url: manifest.url || `/ota/bin?board=${board}`,
-    });
+    this.otaService.otaDir = this.otaDir;
+    this.sendJson(res, 200, this.otaService.manifest(url.searchParams.get("board")));
   }
 
   handleOtaBinary(res, url) {
-    const board = safeOtaBoard(url.searchParams.get("board"));
-    const manifest = readOtaManifest(this.otaDir, board);
-    if (!board || !manifest) {
-      this.sendJson(res, 404, { success: false, error: "OTA image not found" });
-      return;
-    }
-    const fileName = path.basename(String(manifest.file_name || `${board}.bin`));
-    const binaryPath = path.join(this.otaDir, fileName);
-    let stat;
-    try {
-      stat = fs.statSync(binaryPath);
-    } catch {
+    this.otaService.otaDir = this.otaDir;
+    const binary = this.otaService.binary(url.searchParams.get("board"));
+    if (!binary) {
       this.sendJson(res, 404, { success: false, error: "OTA image not found" });
       return;
     }
     res.writeHead(200, {
       "Content-Type": "application/octet-stream",
-      "Content-Length": stat.size,
+      "Content-Length": binary.size,
       "Access-Control-Allow-Origin": "*",
     });
-    fs.createReadStream(binaryPath).pipe(res);
+    fs.createReadStream(binary.binaryPath).pipe(res);
   }
 
   handleRecordingTts(res) {
@@ -1422,15 +1334,6 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     });
     res.end(body);
   }
-}
-
-function normalizeRemoteAddress(value) {
-  return String(value || "").replace(/^::ffff:/, "");
-}
-
-function parseInteger(value, fallback) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function escapeHtml(value) {
