@@ -52,11 +52,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$RELEASE_TAG" = "@RELEASE_TAG@" ]; then
-  echo "This installer must be downloaded from a GitHub Release." >&2
-  exit 1
-fi
-
 case "$(uname -m)" in
   x86_64|amd64)
     ARCH="x86_64"
@@ -129,7 +124,6 @@ printf '%s\n' 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client"' 
 printf '%s\n' 'LOG_FILE="${LOG_DIR}/capswriter-agx-client.log"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'mkdir -p "$LOG_DIR"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi' >> "$LAUNCHER_PATH"
-printf '%s\n' 'export SPEECH_TRANSCRIPTION_HEADLESS=1' >> "$LAUNCHER_PATH"
 printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_FILE" 2>&1' >> "$LAUNCHER_PATH"
 chmod 0755 "$LAUNCHER_PATH"
 
