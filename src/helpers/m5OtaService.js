@@ -1,7 +1,11 @@
 const fs = require("fs");
 const path = require("path");
 
-const OTA_BOARDS = new Set(["sticks3", "stickc_plus"]);
+const OTA_BOARDS = new Set([
+  "sticks3",
+  "stickc_plus",
+  "stickc_plus_minijoy_bt",
+]);
 
 function defaultOtaDir() {
   const repoRoot = path.resolve(__dirname, "../..");
