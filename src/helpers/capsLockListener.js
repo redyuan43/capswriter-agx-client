@@ -28,6 +28,16 @@ function normalizeDictationKeyName(value) {
 function createHoldKeyConfig(value, fallbackValue = DEFAULT_DICTATION_HOLD_KEY) {
   const normalized = normalizeDictationKeyName(value || fallbackValue);
 
+  if (['caps as right shift', 'caps to right shift', 'caps right shift'].includes(normalized)) {
+    return {
+      normalizedName: 'caps as right shift',
+      displayName: 'Caps as Right Shift',
+      uiohookName: 'CapsLock',
+      evdevCode: KEY_CAPSLOCK,
+      restoresCapsLock: false
+    };
+  }
+
   if (['caps', 'capslock', 'caps lock'].includes(normalized)) {
     return {
       normalizedName: 'caps lock',
