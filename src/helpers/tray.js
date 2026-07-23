@@ -1,4 +1,4 @@
-const { Tray, Menu, nativeImage } = require("electron");
+const { app, dialog, Tray, Menu, nativeImage } = require("electron");
 const fs = require("fs");
 const path = require("path");
 
@@ -140,7 +140,13 @@ class TrayManager {
       {
         label: "关于",
         click: () => {
-          // TODO: 显示关于对话框
+          dialog.showMessageBox({
+            type: "info",
+            title: "关于 CapsWriter",
+            message: "CapsWriter AGX Client",
+            detail: `版本 ${app.getVersion()}`,
+            buttons: ["确定"]
+          });
         }
       },
       { type: "separator" },

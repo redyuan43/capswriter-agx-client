@@ -2504,7 +2504,7 @@ export default function FloatingBallApp() {
     };
   }, [normalizeReleaseGraceMs, normalizeTtsSpeed, syncTtsEnabledState]);
 
-  const startRecordingWithCheck = useCallback((mode = "dictation") => {
+  const startRecordingWithCheck = useCallback(async (mode = "dictation") => {
     if (pendingStopTimerRef.current) {
       clearTimeout(pendingStopTimerRef.current);
       pendingStopTimerRef.current = null;
@@ -2564,11 +2564,21 @@ export default function FloatingBallApp() {
     setMessage(recordingModeRef.current === "codex" ? "窝窝头语音" : "");
     setColdStartLoading(false);
     stopInitialLoadingTimer();
-    transitionStatus("recording");
-    startRecording({
+    await transitionStatus("recording");
+    const result = await startRecording({
       intentMode: "none",
       hotword: sessionHotwordsRef.current.join("\n"),
     });
+    if (result?.started !== false) {
+      return;
+    }
+    if (result.reason === "processing_previous") {
+      await transitionStatus("processing");
+      setMessage("正在完成上一句");
+      return;
+    }
+    await transitionStatus("idle");
+    setMessage("");
   }, [abortActiveTtsRequests, logRuntime, modelStatus, setAnimatedRealtimeTarget, startInitialLoadingTimer, startRecording, stopCurrentTtsPlayback, stopInitialLoadingTimer, transitionStatus]);
 
   const stopRecordingWithCheck = useCallback(() => {

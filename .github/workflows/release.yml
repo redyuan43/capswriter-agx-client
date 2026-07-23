@@ -66,9 +66,12 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.run_id }}
 
+      - name: Prepare Linux desktop icon
+        run: cp assets/tray-icon.png release-assets/capswriter-agx-client.png
+
       - name: Generate checksums
         working-directory: release-assets
-        run: sha256sum CapsWriter-GUI-*.AppImage > SHA256SUMS.txt
+        run: sha256sum CapsWriter-GUI-*.AppImage capswriter-agx-client.png > SHA256SUMS.txt
 
       - name: Prepare Linux installer
         env:
@@ -111,6 +114,7 @@ jobs:
         run: |
           gh release create "${RELEASE_TAG}"
           release-assets/CapsWriter-GUI-*.AppImage
+          release-assets/capswriter-agx-client.png
           release-assets/SHA256SUMS.txt
           release-assets/install-capswriter-agx-client.sh
           --title "CapsWriter AGX Client ${RELEASE_TAG#v}"

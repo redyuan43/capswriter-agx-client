@@ -8,6 +8,9 @@ INSTALL_DIR="${HOME}/.local/opt/capswriter-agx-client"
 BIN_DIR="${HOME}/.local/bin"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 AUTOSTART_DIR="${HOME}/.config/autostart"
+ICONS_DIR="${HOME}/.local/share/icons/hicolor/64x64/apps"
+ICON_NAME="capswriter-agx-client.png"
+ICON_ID="capswriter-agx-client"
 AUTO_START=1
 LAUNCH_NOW=1
 
@@ -52,11 +55,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$RELEASE_TAG" = "@RELEASE_TAG@" ]; then
-  echo "This installer must be downloaded from a GitHub Release." >&2
-  exit 1
-fi
-
 case "$(uname -m)" in
   x86_64|amd64)
     ARCH="x86_64"
@@ -91,6 +89,7 @@ echo "Downloading ${ASSET} from ${REPOSITORY}@${RELEASE_TAG}..."
 gh release download "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --pattern "$ASSET" \
+  --pattern "$ICON_NAME" \
   --pattern "SHA256SUMS.txt" \
   --dir "$TEMP_DIR"
 
@@ -106,7 +105,19 @@ if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
   exit 1
 fi
 
-echo "Checksum verified."
+EXPECTED_ICON_SHA256="$(awk -v asset="$ICON_NAME" '$2 == asset { print $1 }' "$TEMP_DIR/SHA256SUMS.txt")"
+if [ -z "$EXPECTED_ICON_SHA256" ]; then
+  echo "Checksum for ${ICON_NAME} was not found in SHA256SUMS.txt." >&2
+  exit 1
+fi
+
+ACTUAL_ICON_SHA256="$(sha256sum "$TEMP_DIR/$ICON_NAME" | awk '{ print $1 }')"
+if [ "$ACTUAL_ICON_SHA256" != "$EXPECTED_ICON_SHA256" ]; then
+  echo "Checksum verification failed for ${ICON_NAME}." >&2
+  exit 1
+fi
+
+echo "Checksums verified."
 
 # Replace a previous AppImage instance before its on-disk payload is updated.
 mapfile -t RUNNING_PIDS < <(pgrep -u "$(id -u)" -f 'CapsWriter-GUI.*\.AppImage' || true)
@@ -116,10 +127,11 @@ if [ "${#RUNNING_PIDS[@]}" -gt 0 ]; then
   sleep 2
 fi
 
-mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$APPLICATIONS_DIR" "$AUTOSTART_DIR"
+mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$APPLICATIONS_DIR" "$AUTOSTART_DIR" "$ICONS_DIR"
 APPIMAGE_PATH="${INSTALL_DIR}/CapsWriter-GUI.AppImage"
 install -m 0755 "$TEMP_DIR/$ASSET" "${APPIMAGE_PATH}.new"
 mv -f "${APPIMAGE_PATH}.new" "$APPIMAGE_PATH"
+install -m 0644 "$TEMP_DIR/$ICON_NAME" "${ICONS_DIR}/${ICON_NAME}"
 
 LAUNCHER_PATH="${BIN_DIR}/capswriter-agx-client"
 printf '%s\n' '#!/usr/bin/env bash' > "$LAUNCHER_PATH"
@@ -129,7 +141,6 @@ printf '%s\n' 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client"' 
 printf '%s\n' 'LOG_FILE="${LOG_DIR}/capswriter-agx-client.log"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'mkdir -p "$LOG_DIR"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi' >> "$LAUNCHER_PATH"
-printf '%s\n' 'export SPEECH_TRANSCRIPTION_HEADLESS=1' >> "$LAUNCHER_PATH"
 printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_FILE" 2>&1' >> "$LAUNCHER_PATH"
 chmod 0755 "$LAUNCHER_PATH"
 
@@ -140,6 +151,7 @@ Type=Application
 Name=CapsWriter AGX Client
 Comment=Speech transcription client
 Exec=${LAUNCHER_PATH}
+Icon=${ICON_ID}
 Terminal=false
 Categories=AudioVideo;
 StartupNotify=false
@@ -153,6 +165,7 @@ Type=Application
 Name=CapsWriter AGX Client
 Comment=Start CapsWriter AGX Client on desktop login
 Exec=${LAUNCHER_PATH}
+Icon=${ICON_ID}
 Terminal=false
 Categories=AudioVideo;
 StartupNotify=false
@@ -163,6 +176,9 @@ fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 fi
 
 if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* || "${XDG_CURRENT_DESKTOP:-}" == *ubuntu* ]]; then

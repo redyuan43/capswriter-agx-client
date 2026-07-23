@@ -37,7 +37,7 @@ The installer automatically:
 - installs the client at `~/.local/opt/capswriter-agx-client/`;
 - writes a launcher at `~/.local/bin/capswriter-agx-client`;
 - creates a menu entry and a GNOME/XDG autostart entry;
-- starts the client without opening its control panel.
+- starts the client in the current graphical desktop session.
 
 After a system reboot, CapsWriter starts again when the user logs into the
 graphical desktop. A GUI application cannot run before a user graphical session
@@ -45,8 +45,9 @@ exists.
 
 ## Tray Icon
 
-The installer starts CapsWriter in background mode. Its green `S` icon appears
-in the desktop status area and is the entry point for the control menu.
+The installer registers the green `S` icon for the application menu and
+autostart entry. Its tray icon appears in the desktop status area and is the
+entry point for the control menu.
 
 GNOME requires an AppIndicator extension to display Electron tray icons. Ubuntu
 normally enables `ubuntu-appindicators@ubuntu.com`; on other GNOME systems,

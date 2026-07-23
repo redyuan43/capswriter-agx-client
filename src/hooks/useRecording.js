@@ -456,6 +456,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
   const captureDiagnosticsRef = useRef(null);
   const isRecordingRef = useRef(false);
   const isStartingRef = useRef(false);
+  const isFinalizingRef = useRef(false);
   const pendingStartRef = useRef(null);
   const realtimeSessionRef = useRef(null);
   const realtimeStartPromiseRef = useRef(null);
@@ -652,6 +653,10 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
   }, [logRecordingDebug, releaseMicrophoneStream]);
 
   const startRecording = useCallback(async (options = {}) => {
+    if (isFinalizingRef.current) {
+      logRecordingDebug('info', 'Ignore recording start while previous transcription is finalizing');
+      return { started: false, reason: 'processing_previous' };
+    }
     if (isStartingRef.current || isRecordingRef.current) {
       logRecordingDebug('warn', 'Ignore duplicate recording start request', {
         isStarting: isStartingRef.current,
@@ -1185,34 +1190,46 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     if (wavRecorderRef.current && isRecordingRef.current) {
       isRecordingRef.current = false;
       setIsRecording(false);
+      isFinalizingRef.current = true;
       setIsProcessing(true);
       (async () => {
-        const stopAt = Date.now();
-        const recorder = wavRecorderRef.current;
-        wavRecorderRef.current = null;
-        const { audioBlob, stats } = await recorder.stop();
-        const realtimeSession = realtimeSessionRef.current;
-        const realtimeStartPromise = realtimeStartPromiseRef.current;
-        const realtimeStartError = realtimeStartErrorRef.current;
-        const finalTimeoutMs = computeRealtimeASRFinalTimeoutMs(
-          stats?.durationMs || (recordStartAtRef.current ? stopAt - recordStartAtRef.current : 0)
-        );
-        realtimeSessionRef.current = null;
-        realtimeStartPromiseRef.current = null;
-        realtimeStartErrorRef.current = null;
-        let realtimePayload = null;
-        let realtimeFailed = false;
-        let realtimeFailedError = null;
-        if (realtimeStartPromise) {
-          await realtimeStartPromise.catch(() => null);
-        }
-        if (realtimeSession) {
+        try {
+          const stopAt = Date.now();
+          const recorder = wavRecorderRef.current;
+          wavRecorderRef.current = null;
+          const realtimeSession = realtimeSessionRef.current;
+          const realtimeStartPromise = realtimeStartPromiseRef.current;
+          const realtimeStartError = realtimeStartErrorRef.current;
+          const finalTimeoutMs = computeRealtimeASRFinalTimeoutMs(
+            recordStartAtRef.current ? stopAt - recordStartAtRef.current : 0
+          );
+          const recorderStopPromise = recorder.stop();
+          const realtimeFinalPromise = (async () => {
+            if (realtimeStartPromise) {
+              await realtimeStartPromise.catch(() => null);
+            }
+            if (!realtimeSession) {
+              if (realtimeStartPromise) {
+                throw realtimeStartErrorRef.current
+                  || realtimeStartError
+                  || new Error('Realtime ASR was started but no active session found');
+              }
+              return null;
+            }
+            return realtimeSession.finish({ timeoutMs: finalTimeoutMs });
+          })();
+          realtimeFinalPromise.catch(() => {});
+
+          const { audioBlob, stats } = await recorderStopPromise;
+          let realtimePayload = null;
+          let realtimeFailed = false;
+          let realtimeFailedError = null;
           try {
-            realtimePayload = await realtimeSession.finish({ timeoutMs: finalTimeoutMs });
+            realtimePayload = await realtimeFinalPromise;
             if (realtimePayload?.success === false) {
               const reason = realtimePayload?.error || realtimePayload?.message || 'success=false';
               const fallbackPayload = buildRealtimePartialFallbackPayload(
-                realtimeSession.getLatestTextPayload?.(),
+                realtimeSession?.getLatestTextPayload?.(),
                 reason,
                 recordingHotwordRef.current
               );
@@ -1233,7 +1250,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             }
           } catch (error) {
             const fallbackPayload = buildRealtimePartialFallbackPayload(
-              realtimeSession.getLatestTextPayload?.(),
+              realtimeSession?.getLatestTextPayload?.(),
               error?.message || String(error),
               recordingHotwordRef.current
             );
@@ -1252,44 +1269,51 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
                 finalTimeoutMs,
               });
             }
-            realtimeSession.cancel();
+            realtimeSession?.cancel();
+          } finally {
+            if (realtimeSessionRef.current === realtimeSession) {
+              realtimeSessionRef.current = null;
+            }
+            if (realtimeStartPromiseRef.current === realtimeStartPromise) {
+              realtimeStartPromiseRef.current = null;
+            }
+            realtimeStartErrorRef.current = null;
           }
-        } else if (realtimeStartPromise) {
-          realtimeFailed = true;
-          realtimeFailedError = realtimeStartError || new Error('Realtime ASR was started but no active session found');
-        }
 
-        if (streamRef.current) {
-          releaseMicrophoneStream(streamRef.current, 'recording_stopped');
-          streamRef.current = null;
-        }
+          if (streamRef.current) {
+            releaseMicrophoneStream(streamRef.current, 'recording_stopped');
+            streamRef.current = null;
+          }
 
-        const localAudioStats = {
-          ...stats,
-        };
+          const localAudioStats = {
+            ...stats,
+          };
 
-        logRecordingDebug('info', 'Recording stopped and WAV finalized', {
-          sessionId: recordingSessionRef.current,
-          holdMs: recordStartAtRef.current ? (stopAt - recordStartAtRef.current) : null,
-          wavSize: audioBlob.size,
-          blobType: audioBlob.type || 'unknown',
-          wavDurationMs: localAudioStats?.durationMs,
-          chunkCount: localAudioStats?.chunkCount,
-          dataEventCount: localAudioStats?.dataEventCount,
-          totalSamples: localAudioStats?.totalSamples,
-          bufferSize: localAudioStats?.bufferSize,
-          peakAbs: localAudioStats?.peakAbs,
-          rms: localAudioStats?.rms,
-          activeRatio: localAudioStats?.activeRatio,
-          ...captureDiagnosticsRef.current,
-        });
-
-        if (realtimeFailed) {
-          logRecordingDebug('warn', 'Realtime ASR failed before final text, falling back to upload transcription', {
-            error: realtimeFailedError?.message || String(realtimeFailedError || ''),
+          logRecordingDebug('info', 'Recording stopped and WAV finalized', {
+            sessionId: recordingSessionRef.current,
+            holdMs: recordStartAtRef.current ? (stopAt - recordStartAtRef.current) : null,
+            wavSize: audioBlob.size,
+            blobType: audioBlob.type || 'unknown',
+            wavDurationMs: localAudioStats?.durationMs,
+            chunkCount: localAudioStats?.chunkCount,
+            dataEventCount: localAudioStats?.dataEventCount,
+            totalSamples: localAudioStats?.totalSamples,
+            bufferSize: localAudioStats?.bufferSize,
+            peakAbs: localAudioStats?.peakAbs,
+            rms: localAudioStats?.rms,
+            activeRatio: localAudioStats?.activeRatio,
+            ...captureDiagnosticsRef.current,
           });
+
+          if (realtimeFailed) {
+            logRecordingDebug('warn', 'Realtime ASR failed before final text, falling back to upload transcription', {
+              error: realtimeFailedError?.message || String(realtimeFailedError || ''),
+            });
+          }
+          await processAudio(audioBlob, localAudioStats, realtimePayload, { realtimeFailed });
+        } finally {
+          isFinalizingRef.current = false;
         }
-        processAudio(audioBlob, localAudioStats, realtimePayload, { realtimeFailed });
       })().catch((err) => {
         setError(`音频处理失败：${err.message}`);
         setIsProcessing(false);
