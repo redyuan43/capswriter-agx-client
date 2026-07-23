@@ -21,16 +21,14 @@ jobs:
         with:
           ref: ${{ inputs.release_tag != '' && inputs.release_tag || github.sha }}
 
-      - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
+          cache: npm
 
-      - run: pnpm install --frozen-lockfile
+      - run: npm install --no-audit --no-fund
 
-      - run: pnpm run build:win:agx-client
+      - run: npm run build:win:agx-client
 
       - uses: actions/upload-artifact@v4
         with:
