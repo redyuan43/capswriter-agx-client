@@ -430,9 +430,8 @@ function learnHotwordsOverWebSocket(terms, options = {}) {
   }), 10000, 'Hotword learning timeout (10000ms)');
 }
 
-export class RealtimeASRSession {
-  constructor(mediaStream, options = {}) {
-    this.mediaStream = mediaStream;
+export class PCMRealtimeSession {
+  constructor(options = {}) {
     this.url = options.url || REALTIME_ASR_URL;
     this.language = options.language || '';
     this.hotword = options.hotword || '';
@@ -445,25 +444,25 @@ export class RealtimeASRSession {
       : 0.78;
     this.onEvent = options.onEvent || null;
     this.onClientEvent = options.onClientEvent || null;
-    this.targetSampleRate = 16000;
-    this.prerollMs = normalizePositiveNumber(options.prerollMs, REALTIME_ASR_PREROLL_MS);
-    this.maxPrerollBytes = Math.round(this.targetSampleRate * 2 * (this.prerollMs / 1000));
-    this.prerollChunks = [];
-    this.prerollBytes = 0;
+    this.targetSampleRate = Number(options.sampleRate || 16000);
+    this.maxPendingBytes = Number.isFinite(Number(options.maxPendingBytes))
+      ? Math.max(0, Number(options.maxPendingBytes))
+      : Infinity;
+    this.bufferFlushedEventType = options.bufferFlushedEventType || 'realtime_pcm_buffer_flushed';
+    this.watchdogEventType = options.watchdogEventType || 'realtime_pcm_watchdog_stalled';
+    this.pendingChunks = [];
+    this.pendingBytes = 0;
     this.websocket = null;
-    this.audioContext = null;
-    this.sourceNode = null;
-    this.processorNode = null;
     this.started = false;
     this.stopped = false;
     this.finalPayload = null;
     this.latestTextPayload = null;
     this.sentAudioBytes = 0;
     this.lastPcmSentAt = 0;
-    this.audioPumpStartedAt = 0;
-    this.audioPumpStalled = false;
-    this.audioPumpStallInfo = null;
-    this.audioPumpWatchdogTimer = null;
+    this.pcmStartedAt = 0;
+    this.pcmStalled = false;
+    this.pcmStallInfo = null;
+    this.pcmWatchdogTimer = null;
     this.finalResolve = null;
     this.finalReject = null;
     this.finalPromise = new Promise((resolve, reject) => {
@@ -482,13 +481,13 @@ export class RealtimeASRSession {
     }
 
     try {
-      await this.startAudioPump();
       await withClientTimeout(this.openWebSocket(), REALTIME_ASR_CONNECT_TIMEOUT_MS, `Realtime ASR connect timeout (${REALTIME_ASR_CONNECT_TIMEOUT_MS}ms)`);
       if (this.stopped) {
-        throw new Error('Realtime ASR session was cancelled before audio pump started');
+        throw new Error('Realtime ASR session was cancelled before ready');
       }
       this.started = true;
-      this.startAudioPumpWatchdog();
+      this.flushPendingChunks();
+      this.startPcmWatchdog();
     } catch (error) {
       this.cancel();
       throw error;
@@ -514,7 +513,6 @@ export class RealtimeASRSession {
           client_intents: this.intentMode === 'client_intent' ? this.clientIntents : [],
           client_intent_confidence_threshold: this.clientIntentConfidenceThreshold,
         }));
-        this.flushPreroll();
       };
 
       ws.onerror = () => {
@@ -579,18 +577,6 @@ export class RealtimeASRSession {
         }
       };
     });
-  }
-
-  enqueuePreroll(buffer) {
-    if (!buffer?.byteLength || this.maxPrerollBytes <= 0) {
-      return;
-    }
-    this.prerollChunks.push(buffer);
-    this.prerollBytes += buffer.byteLength;
-    while (this.prerollBytes > this.maxPrerollBytes && this.prerollChunks.length > 0) {
-      const dropped = this.prerollChunks.shift();
-      this.prerollBytes -= dropped?.byteLength || 0;
-    }
   }
 
   emitClientEvent(payload) {
@@ -599,305 +585,16 @@ export class RealtimeASRSession {
     }
   }
 
-  flushPreroll() {
-    if (this.websocket?.readyState !== WebSocket.OPEN || this.prerollChunks.length === 0) {
+  queuePCM(buffer) {
+    if (!buffer?.byteLength || this.maxPendingBytes <= 0) {
       return;
     }
-    const chunks = this.prerollChunks;
-    const bytes = this.prerollBytes;
-    this.prerollChunks = [];
-    this.prerollBytes = 0;
-    for (const chunk of chunks) {
-      if (this.websocket?.readyState !== WebSocket.OPEN) {
-        this.enqueuePreroll(chunk);
-        return;
-      }
-      this.websocket.send(chunk);
-      this.recordPcmSent(chunk.byteLength);
+    this.pendingChunks.push(buffer);
+    this.pendingBytes += buffer.byteLength;
+    while (this.pendingBytes > this.maxPendingBytes && this.pendingChunks.length > 0) {
+      const dropped = this.pendingChunks.shift();
+      this.pendingBytes -= dropped?.byteLength || 0;
     }
-    this.emitClientEvent({
-      type: 'preroll_flushed',
-      chunks: chunks.length,
-      bytes,
-      durationMs: Math.round((bytes / 2 / this.targetSampleRate) * 1000),
-    });
-  }
-
-  async startAudioPump() {
-    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextCtor) {
-      throw new Error('AudioContext unavailable');
-    }
-
-    this.audioContext = new AudioContextCtor();
-    await this.audioContext.resume().catch(() => {});
-    this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
-    this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
-    this.processorNode.onaudioprocess = (event) => {
-      if (this.stopped) {
-        return;
-      }
-      const input = event.inputBuffer.getChannelData(0);
-      const pcm16 = float32ToInt16LE(resampleFloat32(input, this.audioContext.sampleRate, this.targetSampleRate));
-      if (pcm16.byteLength > 0) {
-        if (this.websocket?.readyState === WebSocket.OPEN) {
-          this.flushPreroll();
-          this.websocket.send(pcm16);
-          this.recordPcmSent(pcm16.byteLength);
-        } else {
-          this.enqueuePreroll(pcm16);
-        }
-      }
-    };
-    this.sourceNode.connect(this.processorNode);
-    this.processorNode.connect(this.audioContext.destination);
-  }
-
-  stopAudioPump() {
-    this.stopped = true;
-    this.stopAudioPumpWatchdog();
-    if (this.processorNode) {
-      this.processorNode.onaudioprocess = null;
-      this.processorNode.disconnect();
-      this.processorNode = null;
-    }
-    if (this.sourceNode) {
-      this.sourceNode.disconnect();
-      this.sourceNode = null;
-    }
-    if (this.audioContext) {
-      this.audioContext.close().catch(() => {});
-      this.audioContext = null;
-    }
-    this.prerollChunks = [];
-    this.prerollBytes = 0;
-  }
-
-  getLatestTextPayload() {
-    if (!this.latestTextPayload) {
-      return null;
-    }
-    return { ...this.latestTextPayload };
-  }
-
-  hasSentAudio() {
-    return this.sentAudioBytes > 0;
-  }
-
-  isAudioPumpStalled() {
-    return this.audioPumpStalled;
-  }
-
-  recordPcmSent(byteLength) {
-    if (!byteLength) {
-      return;
-    }
-    this.sentAudioBytes += byteLength;
-    this.lastPcmSentAt = Date.now();
-  }
-
-  startAudioPumpWatchdog() {
-    const timeoutMs = normalizePositiveNumber(REALTIME_ASR_PCM_STALL_TIMEOUT_MS, 3500);
-    this.audioPumpStartedAt = Date.now();
-    const check = () => {
-      if (this.stopped || this.audioPumpStalled) {
-        return;
-      }
-      const lastActivityAt = this.lastPcmSentAt || this.audioPumpStartedAt;
-      const silentForMs = Date.now() - lastActivityAt;
-      if (silentForMs >= timeoutMs) {
-        this.audioPumpStalled = true;
-        this.audioPumpStallInfo = {
-          timeoutMs,
-          silentForMs,
-          sentAudioBytes: this.sentAudioBytes,
-        };
-        this.emitClientEvent({
-          type: 'realtime_pcm_watchdog_stalled',
-          ...this.audioPumpStallInfo,
-        });
-        this.cancel();
-        return;
-      }
-      this.audioPumpWatchdogTimer = window.setTimeout(
-        check,
-        Math.min(REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS, timeoutMs)
-      );
-    };
-    this.audioPumpWatchdogTimer = window.setTimeout(
-      check,
-      Math.min(REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS, timeoutMs)
-    );
-  }
-
-  stopAudioPumpWatchdog() {
-    if (this.audioPumpWatchdogTimer !== null) {
-      window.clearTimeout(this.audioPumpWatchdogTimer);
-      this.audioPumpWatchdogTimer = null;
-    }
-  }
-
-  async finish(options = {}) {
-    this.stopAudioPump();
-    if (!this.started || !this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
-      throw new Error('Realtime ASR session is not open');
-    }
-    const timeoutMs = normalizePositiveNumber(
-      options.timeoutMs,
-      normalizePositiveNumber(REALTIME_ASR_FINAL_TIMEOUT_MS, 15000)
-    );
-    this.websocket.send(JSON.stringify({ type: 'finish' }));
-    const payload = await withClientTimeout(
-      this.finalPromise,
-      timeoutMs,
-      `Realtime ASR final timeout (${timeoutMs}ms)`
-    );
-    this.websocket.close();
-    return payload;
-  }
-
-  cancel() {
-    this.stopAudioPump();
-    if (!this.websocket) {
-      return;
-    }
-    if (this.websocket.readyState === WebSocket.OPEN) {
-      this.websocket.send(JSON.stringify({ type: 'cancel' }));
-      this.websocket.close();
-    } else if (this.websocket.readyState === WebSocket.CONNECTING) {
-      this.websocket.close();
-    }
-  }
-}
-
-export class ExternalPCMRealtimeSession {
-  constructor(options = {}) {
-    this.url = options.url || REALTIME_ASR_URL;
-    this.language = options.language || '';
-    this.hotword = options.hotword || '';
-    this.optimizeMode = options.optimizeMode || 'none';
-    this.translateTarget = options.translateTarget || 'zh';
-    this.intentMode = options.intentMode || 'none';
-    this.clientIntents = Array.isArray(options.clientIntents) ? options.clientIntents : [];
-    this.clientIntentConfidenceThreshold = Number.isFinite(Number(options.clientIntentConfidenceThreshold))
-      ? Number(options.clientIntentConfidenceThreshold)
-      : 0.78;
-    this.onEvent = options.onEvent || null;
-    this.onClientEvent = options.onClientEvent || null;
-    this.targetSampleRate = Number(options.sampleRate || 16000);
-    this.websocket = null;
-    this.started = false;
-    this.stopped = false;
-    this.finalPayload = null;
-    this.latestTextPayload = null;
-    this.pendingChunks = [];
-    this.sentAudioBytes = 0;
-    this.lastPcmSentAt = 0;
-    this.pcmStartedAt = 0;
-    this.pcmStalled = false;
-    this.pcmStallInfo = null;
-    this.pcmWatchdogTimer = null;
-    this.finalPromise = new Promise((resolve, reject) => {
-      this.finalResolve = resolve;
-      this.finalReject = reject;
-    });
-    this.finalPromise.catch(() => {});
-  }
-
-  async start() {
-    if (!this.url) {
-      throw new Error('Realtime ASR URL is not configured');
-    }
-    if (typeof WebSocket === 'undefined') {
-      throw new Error('当前浏览器不支持 WebSocket');
-    }
-    await withClientTimeout(this.openWebSocket(), REALTIME_ASR_CONNECT_TIMEOUT_MS, `Realtime ASR connect timeout (${REALTIME_ASR_CONNECT_TIMEOUT_MS}ms)`);
-    this.started = true;
-    this.flushPendingChunks();
-    this.startPcmWatchdog();
-  }
-
-  openWebSocket() {
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.url);
-      this.websocket = ws;
-      let ready = false;
-      ws.binaryType = 'arraybuffer';
-
-      ws.onopen = () => {
-        ws.send(JSON.stringify({
-          type: 'start',
-          sample_rate: this.targetSampleRate,
-          language: this.language,
-          hotword: this.hotword,
-          optimize_mode: this.optimizeMode,
-          translate_target: this.translateTarget,
-          intent_mode: this.intentMode,
-          client_intents: this.intentMode === 'client_intent' ? this.clientIntents : [],
-          client_intent_confidence_threshold: this.clientIntentConfidenceThreshold,
-        }));
-      };
-
-      ws.onerror = () => {
-        const error = new Error('Realtime ASR websocket error');
-        if (!ready) {
-          reject(error);
-        } else if (!this.finalPayload) {
-          this.finalReject(error);
-        }
-      };
-
-      ws.onclose = () => {
-        if (!ready) {
-          reject(new Error('Realtime ASR websocket closed before ready'));
-        } else if (!this.finalPayload && !this.stopped) {
-          this.finalReject(new Error('Realtime ASR websocket closed before final'));
-        }
-      };
-
-      ws.onmessage = (event) => {
-        let payload = null;
-        try {
-          payload = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (typeof this.onEvent === 'function') {
-          this.onEvent(payload);
-        }
-        const type = (payload?.type || '').toLowerCase();
-        if (type === 'partial' || type === 'final') {
-          this.latestTextPayload = payload;
-        }
-        if (type === 'ready') {
-          ready = true;
-          resolve(payload);
-          return;
-        }
-        if (type === 'final') {
-          this.finalPayload = payload;
-          this.finalResolve(payload);
-          return;
-        }
-        if (type === 'closed') {
-          if (!this.finalPayload) {
-            this.finalReject(new Error(payload?.error || payload?.message || 'Realtime ASR closed before final'));
-          }
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.close();
-          }
-          return;
-        }
-        if (type === 'error') {
-          const error = new Error(payload?.error || payload?.message || 'Realtime ASR returned an error event');
-          if (!ready) {
-            reject(error);
-          } else {
-            this.finalReject(error);
-          }
-        }
-      };
-    });
   }
 
   sendPCM(chunk) {
@@ -912,19 +609,35 @@ export class ExternalPCMRealtimeSession {
       this.recordPcmSent(buffer.byteLength);
       return;
     }
-    this.pendingChunks.push(buffer);
+    this.queuePCM(buffer);
   }
 
   flushPendingChunks() {
-    if (this.websocket?.readyState !== WebSocket.OPEN) {
+    if (this.websocket?.readyState !== WebSocket.OPEN || this.pendingChunks.length === 0) {
       return;
     }
     const chunks = this.pendingChunks;
+    const bytes = this.pendingBytes;
     this.pendingChunks = [];
+    this.pendingBytes = 0;
     for (const chunk of chunks) {
+      if (this.websocket?.readyState !== WebSocket.OPEN) {
+        this.queuePCM(chunk);
+        return;
+      }
       this.websocket.send(chunk);
       this.recordPcmSent(chunk.byteLength);
     }
+    this.emitClientEvent({
+      type: this.bufferFlushedEventType,
+      chunks: chunks.length,
+      bytes,
+      durationMs: Math.round((bytes / 2 / this.targetSampleRate) * 1000),
+    });
+  }
+
+  stopInput() {
+    // Subclasses own their recording source and release it here.
   }
 
   getLatestTextPayload() {
@@ -934,22 +647,20 @@ export class ExternalPCMRealtimeSession {
     return { ...this.latestTextPayload };
   }
 
-  emitClientEvent(payload) {
-    if (typeof this.onClientEvent === 'function') {
-      this.onClientEvent(payload);
-    }
-  }
-
-  isPcmStalled() {
-    return this.pcmStalled;
-  }
-
   recordPcmSent(byteLength) {
     if (!byteLength) {
       return;
     }
     this.sentAudioBytes += byteLength;
     this.lastPcmSentAt = Date.now();
+  }
+
+  isPcmStalled() {
+    return this.pcmStalled;
+  }
+
+  isAudioPumpStalled() {
+    return this.isPcmStalled();
   }
 
   startPcmWatchdog() {
@@ -969,7 +680,7 @@ export class ExternalPCMRealtimeSession {
           sentAudioBytes: this.sentAudioBytes,
         };
         this.emitClientEvent({
-          type: 'external_pcm_watchdog_stalled',
+          type: this.watchdogEventType,
           ...this.pcmStallInfo,
         });
         this.cancel();
@@ -994,6 +705,7 @@ export class ExternalPCMRealtimeSession {
   }
 
   async finish(options = {}) {
+    this.stopInput();
     this.stopped = true;
     this.stopPcmWatchdog();
     if (!this.started || !this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
@@ -1016,8 +728,10 @@ export class ExternalPCMRealtimeSession {
 
   cancel() {
     this.stopped = true;
+    this.stopInput();
     this.stopPcmWatchdog();
     this.pendingChunks = [];
+    this.pendingBytes = 0;
     if (!this.websocket) {
       return;
     }
@@ -1027,6 +741,82 @@ export class ExternalPCMRealtimeSession {
     } else if (this.websocket.readyState === WebSocket.CONNECTING) {
       this.websocket.close();
     }
+  }
+}
+
+export class RealtimeASRSession extends PCMRealtimeSession {
+  constructor(mediaStream, options = {}) {
+    const targetSampleRate = 16000;
+    const prerollMs = normalizePositiveNumber(options.prerollMs, REALTIME_ASR_PREROLL_MS);
+    super({
+      ...options,
+      sampleRate: targetSampleRate,
+      maxPendingBytes: Math.round(targetSampleRate * 2 * (prerollMs / 1000)),
+      bufferFlushedEventType: 'preroll_flushed',
+      watchdogEventType: 'realtime_pcm_watchdog_stalled',
+    });
+    this.mediaStream = mediaStream;
+    this.audioContext = null;
+    this.sourceNode = null;
+    this.processorNode = null;
+  }
+
+  async start() {
+    try {
+      await this.startAudioPump();
+      await super.start();
+    } catch (error) {
+      this.cancel();
+      throw error;
+    }
+  }
+
+  async startAudioPump() {
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+      throw new Error('AudioContext unavailable');
+    }
+
+    this.audioContext = new AudioContextCtor();
+    await this.audioContext.resume().catch(() => {});
+    this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
+    this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+    this.processorNode.onaudioprocess = (event) => {
+      if (this.stopped) {
+        return;
+      }
+      const input = event.inputBuffer.getChannelData(0);
+      const pcm16 = float32ToInt16LE(resampleFloat32(input, this.audioContext.sampleRate, this.targetSampleRate));
+      this.sendPCM(pcm16);
+    };
+    this.sourceNode.connect(this.processorNode);
+    this.processorNode.connect(this.audioContext.destination);
+  }
+
+  stopInput() {
+    if (this.processorNode) {
+      this.processorNode.onaudioprocess = null;
+      this.processorNode.disconnect();
+      this.processorNode = null;
+    }
+    if (this.sourceNode) {
+      this.sourceNode.disconnect();
+      this.sourceNode = null;
+    }
+    if (this.audioContext) {
+      this.audioContext.close().catch(() => {});
+      this.audioContext = null;
+    }
+  }
+}
+
+export class ExternalPCMRealtimeSession extends PCMRealtimeSession {
+  constructor(options = {}) {
+    super({
+      ...options,
+      bufferFlushedEventType: 'external_pcm_buffer_flushed',
+      watchdogEventType: 'external_pcm_watchdog_stalled',
+    });
   }
 }
 
