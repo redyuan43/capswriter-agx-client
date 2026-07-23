@@ -456,6 +456,7 @@ export class RealtimeASRSession {
     this.stopped = false;
     this.finalPayload = null;
     this.latestTextPayload = null;
+    this.sentAudioBytes = 0;
     this.finalResolve = null;
     this.finalReject = null;
     this.finalPromise = new Promise((resolve, reject) => {
@@ -604,6 +605,7 @@ export class RealtimeASRSession {
         return;
       }
       this.websocket.send(chunk);
+      this.sentAudioBytes += chunk.byteLength;
     }
     this.emitClientEvent({
       type: 'preroll_flushed',
@@ -633,6 +635,7 @@ export class RealtimeASRSession {
         if (this.websocket?.readyState === WebSocket.OPEN) {
           this.flushPreroll();
           this.websocket.send(pcm16);
+          this.sentAudioBytes += pcm16.byteLength;
         } else {
           this.enqueuePreroll(pcm16);
         }
@@ -666,6 +669,10 @@ export class RealtimeASRSession {
       return null;
     }
     return { ...this.latestTextPayload };
+  }
+
+  hasSentAudio() {
+    return this.sentAudioBytes > 0;
   }
 
   async finish(options = {}) {

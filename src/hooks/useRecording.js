@@ -6,7 +6,6 @@ import {
   isRealtimeASRConfigured,
   translateText,
   transcribeAudio as backendTranscribe,
-  transcribeAudioStream,
 } from '../services/backendAPI.js';
 import { isKnownSilentASRArtifactWithHotwords } from '../helpers/silentAsrArtifacts.js';
 
@@ -879,7 +878,6 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       let transcriptionResult = null;
       const currentMode = translateMode === 'translate' ? 'translate' : 'transcribe';
       const currentTarget = translateTarget || 'zh';
-      const useUploadFallbackOnly = Boolean(options.realtimeFailed);
       const clientIntentPayload = recordingClientIntentRef.current || {
         intentMode: 'none',
         clientIntents: [],
@@ -912,32 +910,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       ).trim();
 
       try {
-        const streamDonePayload = realtimePayload || (
-          useUploadFallbackOnly
-            ? await uploadTranscribe()
-            : await transcribeAudioStream(audioBlob, {
-              useVad: true,
-              usePunc: true,
-              hotword,
-              optimizeMode: currentMode === 'translate' ? 'translate' : 'none',
-              translateTarget: currentTarget,
-              intentMode: clientIntentPayload.intentMode,
-              clientIntents: clientIntentPayload.clientIntents,
-              clientIntentConfidenceThreshold: clientIntentPayload.clientIntentConfidenceThreshold,
-              onEvent: (event) => {
-                const stage = (event?.stage || '').toLowerCase();
-                if (stage === 'start' || stage === 'asr_started') {
-                  emitProgress({ stage: 'recognizing', message: event?.message || '识别中...' });
-                } else if (stage === 'asr_complete') {
-                  emitProgress({
-                    stage: 'preview_ready',
-                    message: '识别完成',
-                    text: event?.text || event?.asr_text || '',
-                  });
-                }
-              },
-            })
-        );
+        const streamDonePayload = realtimePayload || await uploadTranscribe();
 
         transcriptionResult = {
           success: streamDonePayload?.success !== false,
@@ -1038,17 +1011,8 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           }
         }
       } catch (streamErr) {
-        if (useUploadFallbackOnly) {
-          console.warn('Upload transcription failed after realtime fallback:', streamErr);
-          throw streamErr;
-        }
-        console.warn('Streaming transcription failed, fallback to normal API:', streamErr);
-        emitProgress({ stage: 'recognizing', message: '识别中...' });
-        if (currentMode === 'translate') {
-          emitProgress({ stage: 'mode_warning', message: '翻译链路异常，已回退为识别文本' });
-        }
-
-        transcriptionResult = await uploadTranscribe();
+        console.warn('Upload transcription failed:', streamErr);
+        throw streamErr;
       }
 
       const ok = transcriptionResult && transcriptionResult.success !== false;
@@ -1200,7 +1164,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           const realtimeSession = realtimeSessionRef.current;
           const realtimeStartPromise = realtimeStartPromiseRef.current;
           const realtimeStartError = realtimeStartErrorRef.current;
-          const finalTimeoutMs = computeRealtimeASRFinalTimeoutMs(
+          const computedFinalTimeoutMs = computeRealtimeASRFinalTimeoutMs(
             recordStartAtRef.current ? stopAt - recordStartAtRef.current : 0
           );
           const recorderStopPromise = recorder.stop();
@@ -1216,6 +1180,14 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
               }
               return null;
             }
+            if (!realtimeSession.hasSentAudio?.()) {
+              realtimeSession.cancel();
+              throw new Error('Realtime ASR sent no PCM audio; using upload fallback');
+            }
+            const hasPartialText = Boolean(realtimeSession.getLatestTextPayload?.());
+            const finalTimeoutMs = hasPartialText
+              ? computedFinalTimeoutMs
+              : Math.min(computedFinalTimeoutMs, 5000);
             return realtimeSession.finish({ timeoutMs: finalTimeoutMs });
           })();
           realtimeFinalPromise.catch(() => {});
