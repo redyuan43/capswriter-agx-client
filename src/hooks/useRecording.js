@@ -17,6 +17,7 @@ const MEDIA_RECORDER_TIMESLICE_MS = 250;
 const MEDIA_RECORDER_STOP_DRAIN_MS = 120;
 const RECORDING_START_TIMEOUT_MS = 2500;
 const MICROPHONE_PREWARM_TIMEOUT_MS = 2500;
+const REALTIME_STOP_CONNECT_GRACE_MS = 3500;
 
 const BASE_AUDIO_CAPTURE_PROFILES = [
   {
@@ -805,6 +806,22 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             const text = event?.text || event?.partial_text || event?.asr_text || '';
             const displayText = isKnownSilentASRArtifactWithHotwords(recordingHotwordRef.current, text) ? '' : text;
             const voiceCommandApplied = event?.voice_command_applied === true;
+            const diagnostics = captureDiagnosticsRef.current;
+            const shouldLogEvent = type !== 'partial'
+              || diagnostics?.lastRealtimeTextLength !== displayText.length;
+            if (type === 'partial' && diagnostics) {
+              diagnostics.lastRealtimeTextLength = displayText.length;
+            }
+            if (shouldLogEvent && ['ready', 'partial', 'final', 'error', 'closed'].includes(type)) {
+              logRecordingDebug(type === 'error' ? 'warn' : 'info', 'Realtime ASR event', {
+                sessionId: recordingSessionRef.current,
+                type,
+                textLength: displayText.length,
+                requestId: event?.request_id || null,
+                success: event?.success !== false,
+                error: event?.error || event?.message || null,
+              });
+            }
             if (type === 'loading' && event?.cold_start && window.onTranscriptionProgress) {
               window.onTranscriptionProgress({
                 stage: 'cold_start_loading',
@@ -1219,10 +1236,15 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           const computedFinalTimeoutMs = computeRealtimeASRFinalTimeoutMs(
             recordStartAtRef.current ? stopAt - recordStartAtRef.current : 0
           );
+          let realtimeFinalTimeoutMs = Math.min(computedFinalTimeoutMs, 5000);
           const recorderStopPromise = recorder.stop();
           const realtimeFinalPromise = (async () => {
             if (realtimeStartPromise) {
-              await realtimeStartPromise.catch(() => null);
+              await withTimeout(
+                realtimeStartPromise,
+                REALTIME_STOP_CONNECT_GRACE_MS,
+                `Realtime ASR was not ready within ${REALTIME_STOP_CONNECT_GRACE_MS}ms after stop`
+              );
             }
             if (!realtimeSession) {
               if (realtimeStartPromise) {
@@ -1240,10 +1262,10 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
               throw new Error('Realtime ASR PCM watchdog stalled; using upload fallback');
             }
             const hasPartialText = Boolean(realtimeSession.getLatestTextPayload?.());
-            const finalTimeoutMs = hasPartialText
+            realtimeFinalTimeoutMs = hasPartialText
               ? computedFinalTimeoutMs
               : Math.min(computedFinalTimeoutMs, 5000);
-            return realtimeSession.finish({ timeoutMs: finalTimeoutMs });
+            return realtimeSession.finish({ timeoutMs: realtimeFinalTimeoutMs });
           })();
           realtimeFinalPromise.catch(() => {});
 
@@ -1285,7 +1307,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
               realtimePayload = fallbackPayload;
               logRecordingDebug('warn', 'Realtime ASR final failed, using latest partial text', {
                 error: error?.message || String(error),
-                finalTimeoutMs,
+                finalTimeoutMs: realtimeFinalTimeoutMs,
                 fallbackTextLength: fallbackPayload.text?.length || 0,
               });
             } else {
@@ -1293,7 +1315,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
               realtimeFailedError = error || new Error('Realtime ASR final failed');
               logRecordingDebug('warn', 'Realtime ASR final failed, will use upload fallback', {
                 error: error?.message || String(error),
-                finalTimeoutMs,
+                finalTimeoutMs: realtimeFinalTimeoutMs,
               });
             }
             realtimeSession?.cancel();
@@ -1342,6 +1364,10 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           isFinalizingRef.current = false;
         }
       })().catch((err) => {
+        logRecordingDebug('error', 'Recording finalization failed', {
+          error: err?.message || String(err),
+          sessionId: recordingSessionRef.current,
+        });
         setError(`音频处理失败：${err.message}`);
         setIsProcessing(false);
       });

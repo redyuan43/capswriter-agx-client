@@ -20,6 +20,13 @@ import {
   learnHotwords,
 } from "../../services/backendAPI.js";
 import { isExactSilentASRArtifactText } from "../../helpers/silentAsrArtifacts.js";
+import {
+  buildLatestPartialASRFallback,
+  extractASRText,
+  isUsableASRPayload,
+  settleASRCandidate,
+  waitForFirstUsableASRResult,
+} from "../../helpers/asrResultPolicy.mjs";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
 const SETTING_VOICE_TRANSLATE_TARGET = "voice_translate_target";
@@ -388,14 +395,7 @@ function computePCMStats(chunks, sampleRate = 16000) {
 }
 
 function normalizeASRPayload(payload, wavBlob) {
-  const text = String(
-    payload?.final_text ||
-    payload?.translated_text ||
-    payload?.optimized_text ||
-    payload?.asr_text ||
-    payload?.text ||
-    ""
-  ).trim();
+  const text = extractASRText(payload);
   return {
     success: payload?.success !== false,
     text,
@@ -2033,6 +2033,8 @@ export default function FloatingBallApp() {
       realtimeStartPromise: null,
       realtimeFailed: false,
       realtimeError: null,
+      lastRealtimeTextLength: -1,
+      latestRealtimePartial: null,
       cancelled: false,
       cancelReported: false,
     };
@@ -2072,6 +2074,24 @@ export default function FloatingBallApp() {
         onEvent: (event) => {
           const type = (event?.type || "").toLowerCase();
           const text = event?.text || event?.partial_text || event?.asr_text || "";
+          const activeSession = externalRecordingRef.current;
+          const shouldLogEvent = type !== "partial" || activeSession?.lastRealtimeTextLength !== text.length;
+          if (type === "partial" && activeSession) {
+            activeSession.lastRealtimeTextLength = text.length;
+            if (text || event?.voice_command_applied === true) {
+              activeSession.latestRealtimePartial = event;
+            }
+          }
+          if (shouldLogEvent && ["ready", "partial", "final", "error", "closed"].includes(type)) {
+            logRuntime(type === "error" ? "warn" : "info", "External M5 realtime event", {
+              sessionId,
+              type,
+              textLength: text.length,
+              requestId: event?.request_id || null,
+              success: event?.success !== false,
+              error: event?.error || event?.message || null,
+            });
+          }
           if (type === "ready") {
             handleTranscriptionProgress({
               stage: "realtime_ready",
@@ -2217,6 +2237,29 @@ export default function FloatingBallApp() {
       let finalPayload = null;
       let realtimeError = null;
       let usedUploadFallback = false;
+      let uploadAttempted = false;
+      let resultSource = "";
+      const realtimeSession = externalRealtimeSessionRef.current;
+      const logCandidateResult = (result) => {
+        logRuntime(result?.error ? "warn" : "info", "External M5 ASR candidate settled", {
+          sessionId,
+          source: result?.source || "unknown",
+          usable: result?.usable === true,
+          success: result?.payload?.success !== false,
+          textLength: extractASRText(result?.payload).length,
+          voiceCommandApplied: result?.payload?.voice_command_applied === true,
+          requestId: result?.payload?.request_id || null,
+          error: result?.error?.message || (result?.error ? String(result.error) : null),
+        });
+      };
+      const startUploadCandidate = () => {
+        uploadAttempted = true;
+        return settleASRCandidate("upload", backendTranscribe(wavBlob, {
+          useVad: true,
+          usePunc: true,
+          hotword: sessionHotwordsRef.current.join("\n"),
+        }));
+      };
 
       if (session.realtimeStartPromise) {
         await session.realtimeStartPromise.catch(() => null);
@@ -2224,73 +2267,66 @@ export default function FloatingBallApp() {
       if (session.cancelled) {
         return;
       }
-      if (externalRealtimeSessionRef.current) {
-        if (externalRealtimeSessionRef.current.isPcmStalled?.()) {
+      if (realtimeSession) {
+        if (realtimeSession.isPcmStalled?.()) {
           realtimeError = new Error("External M5 realtime PCM watchdog stalled");
         } else {
-          const realtimeSession = externalRealtimeSessionRef.current;
           const finishStartedAt = performance.now();
-          const realtimeResultPromise = realtimeSession.finish({
-            timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
-          }).then(
-            (payload) => ({ source: "realtime", payload }),
-            (error) => ({ source: "realtime", error })
+          const realtimeResultPromise = settleASRCandidate(
+            "realtime",
+            realtimeSession.finish({
+              timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
+            })
           );
           const hedgeDelay = new Promise((resolve) => {
             window.setTimeout(() => resolve({ source: "hedge_delay" }), M5_REALTIME_FINAL_HEDGE_DELAY_MS);
           });
-          let result = await Promise.race([realtimeResultPromise, hedgeDelay]);
+          const initialResult = await Promise.race([realtimeResultPromise, hedgeDelay]);
+          let winner = null;
+          let settledResults = [];
 
-          if (result.source === "hedge_delay") {
+          if (initialResult.source === "hedge_delay") {
             logRuntime("warn", "External M5 realtime final delayed; racing batch upload fallback", {
               sessionId,
               audioDurationMs: stats.durationMs,
               hedgeDelayMs: M5_REALTIME_FINAL_HEDGE_DELAY_MS,
             });
-            const uploadResultPromise = backendTranscribe(wavBlob, {
-              useVad: true,
-              usePunc: true,
-              hotword: sessionHotwordsRef.current.join("\n"),
-            }).then(
-              (payload) => ({ source: "upload", payload }),
-              (error) => ({ source: "upload", error })
+            const outcome = await waitForFirstUsableASRResult(
+              [realtimeResultPromise, startUploadCandidate()],
+              { onSettled: logCandidateResult }
             );
-            result = await Promise.race([realtimeResultPromise, uploadResultPromise]);
-            if (result.source === "realtime" && result.error) {
-              result = await uploadResultPromise;
-            } else if (result.source === "upload" && result.error) {
-              result = await realtimeResultPromise;
-            }
-            if (result.source === "upload" && !result.error) {
-              usedUploadFallback = true;
-              if (externalRealtimeSessionRef.current === realtimeSession) {
-                realtimeSession.cancel();
+            winner = outcome.winner;
+            settledResults = outcome.settled;
+          } else {
+            logCandidateResult(initialResult);
+            settledResults = [initialResult];
+            if (initialResult.usable) {
+              winner = initialResult;
+            } else {
+              const uploadResult = await startUploadCandidate();
+              logCandidateResult(uploadResult);
+              settledResults.push(uploadResult);
+              if (uploadResult.usable) {
+                winner = uploadResult;
               }
             }
           }
 
-          if (result.error) {
-            realtimeError = result.error;
-            const latest = realtimeSession.getLatestTextPayload?.();
-            if (latest?.text || latest?.partial_text || latest?.asr_text) {
-              finalPayload = {
-                ...latest,
-                type: "final",
-                success: true,
-                final_text: latest.text || latest.partial_text || latest.asr_text || "",
-                realtime_final_fallback: true,
-                realtime_final_error: result.error?.message || String(result.error),
-              };
-            } else {
+          if (winner) {
+            finalPayload = winner.payload;
+            resultSource = winner.source === "upload" ? "upload_fallback" : "realtime_final";
+            usedUploadFallback = winner.source === "upload";
+            if (winner.source === "upload" && externalRealtimeSessionRef.current === realtimeSession) {
               realtimeSession.cancel();
             }
-          } else {
-            finalPayload = result.payload;
             logRuntime("info", "External M5 realtime final settled", {
               sessionId,
-              source: result.source,
+              source: winner.source,
               elapsedMs: Math.round(performance.now() - finishStartedAt),
             });
+          } else {
+            realtimeError = settledResults.find((result) => result.source === "realtime")?.error
+              || new Error("Realtime and upload returned no usable ASR result");
           }
         }
       }
@@ -2298,20 +2334,44 @@ export default function FloatingBallApp() {
         return;
       }
 
-      if (!finalPayload || !String(finalPayload.final_text || finalPayload.text || finalPayload.asr_text || "").trim()) {
+      if (!isUsableASRPayload(finalPayload)) {
+        const latest = isUsableASRPayload(session.latestRealtimePartial)
+          ? session.latestRealtimePartial
+          : realtimeSession?.getLatestTextPayload?.();
+        const partialFallback = buildLatestPartialASRFallback(
+          latest,
+          realtimeError?.message || "Realtime final returned no usable text"
+        );
+        if (partialFallback) {
+          finalPayload = partialFallback;
+          resultSource = "latest_partial_fallback";
+          realtimeSession?.cancel();
+          logRuntime("warn", "External M5 realtime final unavailable; using latest partial text", {
+            sessionId,
+            textLength: extractASRText(finalPayload).length,
+            requestId: finalPayload?.request_id || null,
+            error: realtimeError?.message || null,
+          });
+        }
+      }
+      if (!isUsableASRPayload(finalPayload) && !uploadAttempted) {
         if (realtimeError) {
           logRuntime("warn", "External M5 realtime final failed, using upload fallback", {
+            sessionId,
             error: realtimeError?.message || String(realtimeError),
           });
         }
-        finalPayload = await backendTranscribe(wavBlob, {
-          useVad: true,
-          usePunc: true,
-          hotword: sessionHotwordsRef.current.join("\n"),
-        });
-        usedUploadFallback = true;
+        const uploadResult = await startUploadCandidate();
+        logCandidateResult(uploadResult);
+        if (uploadResult.usable) {
+          finalPayload = uploadResult.payload;
+          resultSource = "upload_fallback";
+          usedUploadFallback = true;
+        } else if (uploadResult.error && !realtimeError) {
+          realtimeError = uploadResult.error;
+        }
       }
-      if (usedUploadFallback) {
+      if (usedUploadFallback || resultSource === "latest_partial_fallback") {
         const asrText = String(finalPayload?.asr_text || finalPayload?.text || "").trim();
         if (translateMode === "translate" && asrText) {
           const translated = await translateText(asrText, translateTarget || "zh", {
@@ -2341,16 +2401,27 @@ export default function FloatingBallApp() {
 
       const transcriptionResult = normalizeASRPayload(finalPayload, wavBlob);
       transcriptionResult.audio_stats = transcriptionResult.audio_stats || stats;
+      const hasUsableResult = isUsableASRPayload(transcriptionResult);
+      logRuntime(hasUsableResult ? "info" : "warn", "External M5 ASR result selected", {
+        sessionId,
+        source: resultSource || "none",
+        usable: hasUsableResult,
+        textLength: extractASRText(transcriptionResult).length,
+        voiceCommandApplied: transcriptionResult.voice_command_applied === true,
+        requestId: transcriptionResult.request_id || null,
+        error: hasUsableResult ? null : (realtimeError?.message || "No usable ASR result"),
+      });
       await handleRecordingComplete(transcriptionResult);
       if (session.cancelled) {
         return;
       }
       reportExternalRecordingResult({
         session_id: sessionId,
-        success: transcriptionResult.success !== false && Boolean(transcriptionResult.text || transcriptionResult.asr_text),
-        status: transcriptionResult.text || transcriptionResult.asr_text ? "pasted" : "transcription_failed",
+        success: hasUsableResult,
+        status: hasUsableResult ? "pasted" : "transcription_failed",
         text: transcriptionResult.text || transcriptionResult.asr_text || "",
         message: "External M5 recording handled by CapsWriter",
+        error: hasUsableResult ? undefined : (realtimeError?.message || "No usable ASR result"),
       });
       logRuntime("info", "External M5 recording completed", {
         sessionId,

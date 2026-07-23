@@ -655,6 +655,10 @@ export class PCMRealtimeSession {
     this.lastPcmSentAt = Date.now();
   }
 
+  hasSentAudio() {
+    return this.sentAudioBytes > 0;
+  }
+
   isPcmStalled() {
     return this.pcmStalled;
   }
