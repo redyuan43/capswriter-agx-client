@@ -784,6 +784,8 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           onClientEvent: (event) => {
             if (event?.type === 'preroll_flushed') {
               logRecordingDebug('info', 'Realtime ASR preroll flushed', event);
+            } else if (event?.type === 'realtime_pcm_watchdog_stalled') {
+              logRecordingDebug('warn', 'Realtime ASR PCM watchdog stalled; upload fallback will run on stop', event);
             }
           },
         });
@@ -1183,6 +1185,9 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             if (!realtimeSession.hasSentAudio?.()) {
               realtimeSession.cancel();
               throw new Error('Realtime ASR sent no PCM audio; using upload fallback');
+            }
+            if (realtimeSession.isAudioPumpStalled?.()) {
+              throw new Error('Realtime ASR PCM watchdog stalled; using upload fallback');
             }
             const hasPartialText = Boolean(realtimeSession.getLatestTextPayload?.());
             const finalTimeoutMs = hasPartialText

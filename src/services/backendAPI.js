@@ -19,6 +19,8 @@ const REALTIME_ASR_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR
 const REALTIME_ASR_FINAL_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MS || 15000);
 const REALTIME_ASR_FINAL_TIMEOUT_MAX_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MAX_MS || 120000);
 const REALTIME_ASR_FINAL_TIMEOUT_AUDIO_RATIO = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_AUDIO_RATIO || 1.5);
+const REALTIME_ASR_PCM_STALL_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_PCM_STALL_TIMEOUT_MS || 3500);
+const REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS = 500;
 const REALTIME_ASR_PREROLL_MS = Number(import.meta.env.VITE_REALTIME_ASR_PREROLL_MS || 5000);
 const SERVER_LLM_MODEL = import.meta.env.VITE_SERVER_LLM_MODEL || 'caps-voice-edit-qwen3-4b';
 const TTS_SPEAKER_DISPLAY_NAMES = {
@@ -457,6 +459,11 @@ export class RealtimeASRSession {
     this.finalPayload = null;
     this.latestTextPayload = null;
     this.sentAudioBytes = 0;
+    this.lastPcmSentAt = 0;
+    this.audioPumpStartedAt = 0;
+    this.audioPumpStalled = false;
+    this.audioPumpStallInfo = null;
+    this.audioPumpWatchdogTimer = null;
     this.finalResolve = null;
     this.finalReject = null;
     this.finalPromise = new Promise((resolve, reject) => {
@@ -481,6 +488,7 @@ export class RealtimeASRSession {
         throw new Error('Realtime ASR session was cancelled before audio pump started');
       }
       this.started = true;
+      this.startAudioPumpWatchdog();
     } catch (error) {
       this.cancel();
       throw error;
@@ -605,7 +613,7 @@ export class RealtimeASRSession {
         return;
       }
       this.websocket.send(chunk);
-      this.sentAudioBytes += chunk.byteLength;
+      this.recordPcmSent(chunk.byteLength);
     }
     this.emitClientEvent({
       type: 'preroll_flushed',
@@ -635,7 +643,7 @@ export class RealtimeASRSession {
         if (this.websocket?.readyState === WebSocket.OPEN) {
           this.flushPreroll();
           this.websocket.send(pcm16);
-          this.sentAudioBytes += pcm16.byteLength;
+          this.recordPcmSent(pcm16.byteLength);
         } else {
           this.enqueuePreroll(pcm16);
         }
@@ -647,6 +655,7 @@ export class RealtimeASRSession {
 
   stopAudioPump() {
     this.stopped = true;
+    this.stopAudioPumpWatchdog();
     if (this.processorNode) {
       this.processorNode.onaudioprocess = null;
       this.processorNode.disconnect();
@@ -673,6 +682,59 @@ export class RealtimeASRSession {
 
   hasSentAudio() {
     return this.sentAudioBytes > 0;
+  }
+
+  isAudioPumpStalled() {
+    return this.audioPumpStalled;
+  }
+
+  recordPcmSent(byteLength) {
+    if (!byteLength) {
+      return;
+    }
+    this.sentAudioBytes += byteLength;
+    this.lastPcmSentAt = Date.now();
+  }
+
+  startAudioPumpWatchdog() {
+    const timeoutMs = normalizePositiveNumber(REALTIME_ASR_PCM_STALL_TIMEOUT_MS, 3500);
+    this.audioPumpStartedAt = Date.now();
+    const check = () => {
+      if (this.stopped || this.audioPumpStalled) {
+        return;
+      }
+      const lastActivityAt = this.lastPcmSentAt || this.audioPumpStartedAt;
+      const silentForMs = Date.now() - lastActivityAt;
+      if (silentForMs >= timeoutMs) {
+        this.audioPumpStalled = true;
+        this.audioPumpStallInfo = {
+          timeoutMs,
+          silentForMs,
+          sentAudioBytes: this.sentAudioBytes,
+        };
+        this.emitClientEvent({
+          type: 'realtime_pcm_watchdog_stalled',
+          ...this.audioPumpStallInfo,
+        });
+        this.cancel();
+        return;
+      }
+      this.audioPumpWatchdogTimer = window.setTimeout(
+        check,
+        Math.min(REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS, timeoutMs)
+      );
+    };
+    this.audioPumpWatchdogTimer = window.setTimeout(
+      check,
+      Math.min(REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS, timeoutMs)
+    );
+  }
+
+  stopAudioPumpWatchdog() {
+    if (this.audioPumpWatchdogTimer !== null) {
+      window.clearTimeout(this.audioPumpWatchdogTimer);
+      this.audioPumpWatchdogTimer = null;
+    }
   }
 
   async finish(options = {}) {
