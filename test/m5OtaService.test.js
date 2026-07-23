@@ -43,3 +43,36 @@ test("OTA service rejects unknown boards and missing images", () => {
   assert.equal(service.binary("../../stickc_plus"), null);
   assert.equal(service.binary("sticks3"), null);
 });
+
+test("OTA service keeps MiniJoy firmware independent from StickC Plus", (t) => {
+  const otaDir = fs.mkdtempSync(path.join(os.tmpdir(), "m5-ota-minijoy-"));
+  t.after(() => fs.rmSync(otaDir, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(otaDir, "stickc_plus_minijoy_bt.json"),
+    JSON.stringify({
+      version: "0.1.6",
+      file_name: "stickc_plus_minijoy_bt.bin",
+    })
+  );
+  fs.writeFileSync(
+    path.join(otaDir, "stickc_plus_minijoy_bt.bin"),
+    Buffer.from([4, 5, 6, 7])
+  );
+
+  const service = new M5OtaService({ otaDir });
+  assert.deepEqual(service.manifest("stickc_plus_minijoy_bt"), {
+    version: "0.1.6",
+    file_name: "stickc_plus_minijoy_bt.bin",
+    available: true,
+    board: "stickc_plus_minijoy_bt",
+    url: "/ota/bin?board=stickc_plus_minijoy_bt",
+  });
+  assert.deepEqual(service.binary("stickc_plus_minijoy_bt"), {
+    binaryPath: path.join(otaDir, "stickc_plus_minijoy_bt.bin"),
+    size: 4,
+  });
+  assert.deepEqual(service.manifest("stickc_plus"), {
+    available: false,
+    board: "stickc_plus",
+  });
+});

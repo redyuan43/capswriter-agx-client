@@ -35,14 +35,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: npm
+          node-version: 20
+          cache: pnpm
 
-      - run: npm ci
+      - name: Install Linux native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 pkg-config libx11-dev libxrandr-dev libxtst-dev libxt-dev
 
-      - run: npm run build:linux:agx-client
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build:linux:agx-client
+
+      - run: pnpm run verify:appimage:native
 
       - uses: actions/upload-artifact@v4
         with:
@@ -112,11 +123,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          gh release create "${RELEASE_TAG}"
-          release-assets/CapsWriter-GUI-*.AppImage
-          release-assets/capswriter-agx-client.png
-          release-assets/SHA256SUMS.txt
-          release-assets/install-capswriter-agx-client.sh
-          --title "CapsWriter AGX Client ${RELEASE_TAG#v}"
-          --notes "$(cat release-assets/linux-install-notes.md)"
+          gh release create "${RELEASE_TAG}" \
+          release-assets/CapsWriter-GUI-*.AppImage \
+          release-assets/capswriter-agx-client.png \
+          release-assets/SHA256SUMS.txt \
+          release-assets/install-capswriter-agx-client.sh \
+          --title "CapsWriter AGX Client ${RELEASE_TAG#v}" \
+          --notes "$(cat release-assets/linux-install-notes.md)" \
           --generate-notes
