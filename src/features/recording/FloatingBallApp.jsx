@@ -35,6 +35,10 @@ const DEFAULT_CAPS_MIN_HOLD_MS = 150;
 const DICTATION_CONTROL_STATUSES = ["recording", "processing", "preview_ready", "pasting", "optimizing"];
 const CODEX_FLOATING_PREVIEW_MAX_CHARS = 420;
 const CODEX_COMPLETION_CHIME_COOLDOWN_MS = 1200;
+const M5_REALTIME_FINAL_HEDGE_DELAY_MS_RAW = Number(import.meta.env.VITE_M5_REALTIME_FINAL_HEDGE_DELAY_MS || 5000);
+const M5_REALTIME_FINAL_HEDGE_DELAY_MS = Number.isFinite(M5_REALTIME_FINAL_HEDGE_DELAY_MS_RAW)
+  ? Math.max(1000, M5_REALTIME_FINAL_HEDGE_DELAY_MS_RAW)
+  : 5000;
 
 function normalizeExternalRecordingMode(value) {
   const normalized = String(value || "dictation").trim().toLowerCase().replace(/-/g, "_");
@@ -2184,6 +2188,7 @@ export default function FloatingBallApp() {
       }
       let finalPayload = null;
       let realtimeError = null;
+      let usedUploadFallback = false;
 
       if (session.realtimeStartPromise) {
         await session.realtimeStartPromise.catch(() => null);
@@ -2195,13 +2200,50 @@ export default function FloatingBallApp() {
         if (externalRealtimeSessionRef.current.isPcmStalled?.()) {
           realtimeError = new Error("External M5 realtime PCM watchdog stalled");
         } else {
-          try {
-            finalPayload = await externalRealtimeSessionRef.current.finish({
-              timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
+          const realtimeSession = externalRealtimeSessionRef.current;
+          const finishStartedAt = performance.now();
+          const realtimeResultPromise = realtimeSession.finish({
+            timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
+          }).then(
+            (payload) => ({ source: "realtime", payload }),
+            (error) => ({ source: "realtime", error })
+          );
+          const hedgeDelay = new Promise((resolve) => {
+            window.setTimeout(() => resolve({ source: "hedge_delay" }), M5_REALTIME_FINAL_HEDGE_DELAY_MS);
+          });
+          let result = await Promise.race([realtimeResultPromise, hedgeDelay]);
+
+          if (result.source === "hedge_delay") {
+            logRuntime("warn", "External M5 realtime final delayed; racing batch upload fallback", {
+              sessionId,
+              audioDurationMs: stats.durationMs,
+              hedgeDelayMs: M5_REALTIME_FINAL_HEDGE_DELAY_MS,
             });
-          } catch (error) {
-            realtimeError = error;
-            const latest = externalRealtimeSessionRef.current.getLatestTextPayload?.();
+            const uploadResultPromise = backendTranscribe(wavBlob, {
+              useVad: true,
+              usePunc: true,
+              hotword: sessionHotwordsRef.current.join("\n"),
+            }).then(
+              (payload) => ({ source: "upload", payload }),
+              (error) => ({ source: "upload", error })
+            );
+            result = await Promise.race([realtimeResultPromise, uploadResultPromise]);
+            if (result.source === "realtime" && result.error) {
+              result = await uploadResultPromise;
+            } else if (result.source === "upload" && result.error) {
+              result = await realtimeResultPromise;
+            }
+            if (result.source === "upload" && !result.error) {
+              usedUploadFallback = true;
+              if (externalRealtimeSessionRef.current === realtimeSession) {
+                realtimeSession.cancel();
+              }
+            }
+          }
+
+          if (result.error) {
+            realtimeError = result.error;
+            const latest = realtimeSession.getLatestTextPayload?.();
             if (latest?.text || latest?.partial_text || latest?.asr_text) {
               finalPayload = {
                 ...latest,
@@ -2209,11 +2251,18 @@ export default function FloatingBallApp() {
                 success: true,
                 final_text: latest.text || latest.partial_text || latest.asr_text || "",
                 realtime_final_fallback: true,
-                realtime_final_error: error?.message || String(error),
+                realtime_final_error: result.error?.message || String(result.error),
               };
             } else {
-              externalRealtimeSessionRef.current.cancel();
+              realtimeSession.cancel();
             }
+          } else {
+            finalPayload = result.payload;
+            logRuntime("info", "External M5 realtime final settled", {
+              sessionId,
+              source: result.source,
+              elapsedMs: Math.round(performance.now() - finishStartedAt),
+            });
           }
         }
       }
@@ -2232,6 +2281,9 @@ export default function FloatingBallApp() {
           usePunc: true,
           hotword: sessionHotwordsRef.current.join("\n"),
         });
+        usedUploadFallback = true;
+      }
+      if (usedUploadFallback) {
         const asrText = String(finalPayload?.asr_text || finalPayload?.text || "").trim();
         if (translateMode === "translate" && asrText) {
           const translated = await translateText(asrText, translateTarget || "zh", {
