@@ -470,6 +470,7 @@ export default function FloatingBallApp() {
   const sessionHotwordsRef = useRef([]);
   const statusRef = useRef("idle");
   const outputControlRef = useRef({ generation: 0, interrupted: false, reason: "" });
+  const pendingDictationConfirmRef = useRef(false);
   const stopRequestSeqRef = useRef(0);
   const suppressClipboardUntilRef = useRef(0);
   const displayedRealtimeTextRef = useRef("");
@@ -898,6 +899,7 @@ export default function FloatingBallApp() {
   }, []);
 
   const cancelCurrentOutput = useCallback((reason = "escape") => {
+    pendingDictationConfirmRef.current = false;
     finishOutputControl();
     outputControlRef.current.reason = "cancel";
     stopTypewriterAnimation();
@@ -921,6 +923,22 @@ export default function FloatingBallApp() {
   ]);
 
   const confirmCurrentOutput = useCallback(async () => {
+    const currentStatus = statusRef.current;
+    if (
+      isRecordingRef.current ||
+      isRecordingProcessing ||
+      currentStatus === "recording" ||
+      currentStatus === "processing"
+    ) {
+      pendingDictationConfirmRef.current = true;
+      logRuntime("info", "Dictation confirm queued until recording finalizes", {
+        status: currentStatus,
+        isRecording: isRecordingRef.current,
+        isProcessing: isRecordingProcessing,
+      });
+      return;
+    }
+
     const outputGeneration = outputControlRef.current.generation;
     if (!isCurrentOutputGeneration(outputGeneration, {
       allowInterruptedConfirm: true,
@@ -995,6 +1013,7 @@ export default function FloatingBallApp() {
     stopTypewriterAnimation,
     transitionStatus,
     cancelRecording,
+    isRecordingProcessing,
   ]);
 
   const makeTraceId = useCallback(() => {
@@ -1765,6 +1784,8 @@ export default function FloatingBallApp() {
   }, [clearCodexUpdateHideTimer, hideFloatingBall, logRuntime, resetUI, setAnimatedRealtimeTarget, transitionStatus]);
 
   const handleRecordingComplete = useCallback(async (transcriptionResult) => {
+    const queuedConfirm = pendingDictationConfirmRef.current;
+    pendingDictationConfirmRef.current = false;
     if (recordingModeRef.current === "codex") {
       await handleCodexRecordingComplete(transcriptionResult);
       return;
@@ -1797,6 +1818,12 @@ export default function FloatingBallApp() {
       const recognizedText = (transcriptionResult.text || '').trim();
       const postprocessMode = (transcriptionResult.postprocess_mode || 'none').toLowerCase();
       const fastMode = fastInputModeRef.current;
+      if (queuedConfirm) {
+        logRuntime("info", "Queued dictation confirm consumed by recording completion", {
+          textLength: recognizedText.length,
+          fastInputMode: fastMode,
+        });
+      }
       if (!fastMode) {
         setAnimatedRealtimeTarget(recognizedText, { immediate: true });
       }
@@ -2016,6 +2043,7 @@ export default function FloatingBallApp() {
       interrupted: false,
       reason: "",
     };
+    pendingDictationConfirmRef.current = false;
     setAnimatedRealtimeTarget("", { immediate: true });
     setMessage("");
     setColdStartLoading(false);

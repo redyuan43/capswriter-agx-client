@@ -449,7 +449,9 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     stream: null,
     metadata: null,
     promise: null,
+    generation: 0,
   });
+  const streamGenerationRef = useRef(new WeakMap());
   const recordingSessionRef = useRef(0);
   const recordStartAtRef = useRef(0);
   const captureDiagnosticsRef = useRef(null);
@@ -529,6 +531,26 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     stream.getTracks().forEach((track) => track.stop());
   }, []);
 
+  const invalidateWarmMicrophoneStream = useCallback((reason) => {
+    const warmState = warmMicrophoneRef.current;
+    const previousStream = warmState.stream;
+    const hadPendingPrewarm = Boolean(warmState.promise);
+    warmState.generation += 1;
+    warmState.stream = null;
+    warmState.metadata = null;
+    warmState.promise = null;
+    if (previousStream) {
+      streamGenerationRef.current.delete(previousStream);
+      stopMediaStream(previousStream);
+    }
+    logRecordingDebug('info', 'Microphone warm stream invalidated', {
+      reason,
+      hadWarmStream: Boolean(previousStream),
+      hadPendingPrewarm,
+      generation: warmState.generation,
+    });
+  }, [logRecordingDebug, stopMediaStream]);
+
   const prewarmMicrophoneStream = useCallback(() => {
     const warmState = warmMicrophoneRef.current;
     if (hasLiveAudioTrack(warmState.stream) || warmState.promise) {
@@ -538,13 +560,24 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       return null;
     }
 
-    warmState.promise = withTimeout(
+    const generation = warmState.generation;
+    const prewarmPromise = withTimeout(
       requestMicrophoneStream(),
       MICROPHONE_PREWARM_TIMEOUT_MS,
       `麦克风预热超时（>${MICROPHONE_PREWARM_TIMEOUT_MS}ms）`
     )
       .then((result) => {
+        if (generation !== warmState.generation) {
+          streamGenerationRef.current.delete(result.stream);
+          stopMediaStream(result.stream);
+          logRecordingDebug('info', 'Discard stale microphone prewarm result', {
+            requestedGeneration: generation,
+            currentGeneration: warmState.generation,
+          });
+          return null;
+        }
         warmState.stream = result.stream;
+        streamGenerationRef.current.set(result.stream, generation);
         warmState.metadata = {
           profile: result.profile,
           availableInputs: result.availableInputs,
@@ -564,13 +597,16 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           error: error?.message || String(error),
         });
         return null;
-      })
-      .finally(() => {
-        warmState.promise = null;
       });
 
-    return warmState.promise;
-  }, [logRecordingDebug]);
+    warmState.promise = prewarmPromise;
+    prewarmPromise.finally(() => {
+      if (warmState.promise === prewarmPromise) {
+        warmState.promise = null;
+      }
+    });
+    return prewarmPromise;
+  }, [logRecordingDebug, stopMediaStream]);
 
   const acquireMicrophoneStream = useCallback(async () => {
     const warmState = warmMicrophoneRef.current;
@@ -582,6 +618,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       const metadata = warmState.metadata || {};
       warmState.stream = null;
       warmState.metadata = null;
+      streamGenerationRef.current.set(stream, warmState.generation);
       return {
         stream,
         profile: metadata.profile || 'prewarmed',
@@ -592,6 +629,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     }
 
     const result = await requestMicrophoneStream();
+    streamGenerationRef.current.set(result.stream, warmState.generation);
     return {
       ...result,
       fromWarmStream: false,
@@ -603,6 +641,17 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       return;
     }
     const warmState = warmMicrophoneRef.current;
+    const streamGeneration = streamGenerationRef.current.get(stream);
+    if (streamGeneration !== warmState.generation) {
+      streamGenerationRef.current.delete(stream);
+      stopMediaStream(stream);
+      logRecordingDebug('info', 'Microphone stream not kept warm after device change', {
+        reason,
+        streamGeneration: Number.isInteger(streamGeneration) ? streamGeneration : null,
+        currentGeneration: warmState.generation,
+      });
+      return;
+    }
     if (!warmState.stream && hasLiveAudioTrack(stream)) {
       const diagnostics = captureDiagnosticsRef.current || {};
       warmState.stream = stream;
@@ -621,6 +670,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       logRecordingDebug('info', 'Microphone stream kept warm', { reason });
       return;
     }
+    streamGenerationRef.current.delete(stream);
     stopMediaStream(stream);
   }, [logRecordingDebug, stopMediaStream]);
 
@@ -1329,6 +1379,27 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     prewarmMicrophoneStream();
     return undefined;
   }, [modelStatus.isReady, prewarmMicrophoneStream]);
+
+  useEffect(() => {
+    if (!navigator.mediaDevices?.addEventListener) {
+      return undefined;
+    }
+    const handleDeviceChange = () => {
+      invalidateWarmMicrophoneStream('media_devices_changed');
+      if (!modelStatus.isReady || isRecordingRef.current || isStartingRef.current || isFinalizingRef.current) {
+        return;
+      }
+      window.setTimeout(() => {
+        if (!isRecordingRef.current && !isStartingRef.current && !isFinalizingRef.current) {
+          prewarmMicrophoneStream();
+        }
+      }, 250);
+    };
+    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
+    return () => {
+      navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
+    };
+  }, [invalidateWarmMicrophoneStream, modelStatus.isReady, prewarmMicrophoneStream]);
 
   useEffect(() => () => {
     const warmState = warmMicrophoneRef.current;
