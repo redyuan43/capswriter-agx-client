@@ -11,7 +11,7 @@ import {
   planTtsChunks,
   speakText,
   translateText,
-  transcribeAudioStream,
+  transcribeAudio as backendTranscribe,
   loadTtsModel,
   unloadTtsModel,
   loadService,
@@ -2055,6 +2055,11 @@ export default function FloatingBallApp() {
             });
           }
         },
+        onClientEvent: (event) => {
+          if (event?.type === "external_pcm_watchdog_stalled") {
+            logRuntime("warn", "External M5 realtime PCM watchdog stalled; upload fallback will run on stop", event);
+          }
+        },
       });
       externalRealtimeSessionRef.current = realtimeSession;
       externalRecordingRef.current.realtimeStartPromise = realtimeSession.start().catch((error) => {
@@ -2187,24 +2192,28 @@ export default function FloatingBallApp() {
         return;
       }
       if (externalRealtimeSessionRef.current) {
-        try {
-          finalPayload = await externalRealtimeSessionRef.current.finish({
-            timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
-          });
-        } catch (error) {
-          realtimeError = error;
-          const latest = externalRealtimeSessionRef.current.getLatestTextPayload?.();
-          if (latest?.text || latest?.partial_text || latest?.asr_text) {
-            finalPayload = {
-              ...latest,
-              type: "final",
-              success: true,
-              final_text: latest.text || latest.partial_text || latest.asr_text || "",
-              realtime_final_fallback: true,
-              realtime_final_error: error?.message || String(error),
-            };
-          } else {
-            externalRealtimeSessionRef.current.cancel();
+        if (externalRealtimeSessionRef.current.isPcmStalled?.()) {
+          realtimeError = new Error("External M5 realtime PCM watchdog stalled");
+        } else {
+          try {
+            finalPayload = await externalRealtimeSessionRef.current.finish({
+              timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
+            });
+          } catch (error) {
+            realtimeError = error;
+            const latest = externalRealtimeSessionRef.current.getLatestTextPayload?.();
+            if (latest?.text || latest?.partial_text || latest?.asr_text) {
+              finalPayload = {
+                ...latest,
+                type: "final",
+                success: true,
+                final_text: latest.text || latest.partial_text || latest.asr_text || "",
+                realtime_final_fallback: true,
+                realtime_final_error: error?.message || String(error),
+              };
+            } else {
+              externalRealtimeSessionRef.current.cancel();
+            }
           }
         }
       }
@@ -2218,25 +2227,33 @@ export default function FloatingBallApp() {
             error: realtimeError?.message || String(realtimeError),
           });
         }
-        finalPayload = await transcribeAudioStream(wavBlob, {
+        finalPayload = await backendTranscribe(wavBlob, {
           useVad: true,
           usePunc: true,
           hotword: sessionHotwordsRef.current.join("\n"),
-          optimizeMode: translateMode === "translate" ? "translate" : "none",
-          translateTarget: translateTarget || "zh",
-          onEvent: (event) => {
-            const stage = (event?.stage || "").toLowerCase();
-            if (stage === "start" || stage === "asr_started") {
-              handleTranscriptionProgress({ stage: "recognizing", message: event?.message || "识别中..." });
-            } else if (stage === "asr_complete") {
-              handleTranscriptionProgress({
-                stage: "preview_ready",
-                message: "识别完成",
-                text: event?.text || event?.asr_text || "",
-              });
-            }
-          },
         });
+        const asrText = String(finalPayload?.asr_text || finalPayload?.text || "").trim();
+        if (translateMode === "translate" && asrText) {
+          const translated = await translateText(asrText, translateTarget || "zh", {
+            traceId: `external-m5-${sessionId}`,
+          });
+          const translatedText = String(translated?.translated_text || "").trim();
+          if (translatedText) {
+            finalPayload = {
+              ...finalPayload,
+              text: translatedText,
+              translated_text: translatedText,
+              postprocess_mode: "translate",
+              translation_success: true,
+            };
+          } else {
+            finalPayload = {
+              ...finalPayload,
+              translation_success: false,
+              translation_error: "translation returned empty text",
+            };
+          }
+        }
       }
       if (session.cancelled) {
         return;

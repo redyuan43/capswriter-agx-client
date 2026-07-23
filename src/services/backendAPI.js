@@ -783,6 +783,7 @@ export class ExternalPCMRealtimeSession {
       ? Number(options.clientIntentConfidenceThreshold)
       : 0.78;
     this.onEvent = options.onEvent || null;
+    this.onClientEvent = options.onClientEvent || null;
     this.targetSampleRate = Number(options.sampleRate || 16000);
     this.websocket = null;
     this.started = false;
@@ -790,6 +791,12 @@ export class ExternalPCMRealtimeSession {
     this.finalPayload = null;
     this.latestTextPayload = null;
     this.pendingChunks = [];
+    this.sentAudioBytes = 0;
+    this.lastPcmSentAt = 0;
+    this.pcmStartedAt = 0;
+    this.pcmStalled = false;
+    this.pcmStallInfo = null;
+    this.pcmWatchdogTimer = null;
     this.finalPromise = new Promise((resolve, reject) => {
       this.finalResolve = resolve;
       this.finalReject = reject;
@@ -807,6 +814,7 @@ export class ExternalPCMRealtimeSession {
     await withClientTimeout(this.openWebSocket(), REALTIME_ASR_CONNECT_TIMEOUT_MS, `Realtime ASR connect timeout (${REALTIME_ASR_CONNECT_TIMEOUT_MS}ms)`);
     this.started = true;
     this.flushPendingChunks();
+    this.startPcmWatchdog();
   }
 
   openWebSocket() {
@@ -901,6 +909,7 @@ export class ExternalPCMRealtimeSession {
       : chunk.buffer.slice(chunk.byteOffset || 0, (chunk.byteOffset || 0) + chunk.byteLength);
     if (this.websocket?.readyState === WebSocket.OPEN && this.started) {
       this.websocket.send(buffer);
+      this.recordPcmSent(buffer.byteLength);
       return;
     }
     this.pendingChunks.push(buffer);
@@ -914,6 +923,7 @@ export class ExternalPCMRealtimeSession {
     this.pendingChunks = [];
     for (const chunk of chunks) {
       this.websocket.send(chunk);
+      this.recordPcmSent(chunk.byteLength);
     }
   }
 
@@ -924,8 +934,68 @@ export class ExternalPCMRealtimeSession {
     return { ...this.latestTextPayload };
   }
 
+  emitClientEvent(payload) {
+    if (typeof this.onClientEvent === 'function') {
+      this.onClientEvent(payload);
+    }
+  }
+
+  isPcmStalled() {
+    return this.pcmStalled;
+  }
+
+  recordPcmSent(byteLength) {
+    if (!byteLength) {
+      return;
+    }
+    this.sentAudioBytes += byteLength;
+    this.lastPcmSentAt = Date.now();
+  }
+
+  startPcmWatchdog() {
+    const timeoutMs = normalizePositiveNumber(REALTIME_ASR_PCM_STALL_TIMEOUT_MS, 3500);
+    this.pcmStartedAt = Date.now();
+    const check = () => {
+      if (this.stopped || this.pcmStalled) {
+        return;
+      }
+      const lastActivityAt = this.lastPcmSentAt || this.pcmStartedAt;
+      const silentForMs = Date.now() - lastActivityAt;
+      if (silentForMs >= timeoutMs) {
+        this.pcmStalled = true;
+        this.pcmStallInfo = {
+          timeoutMs,
+          silentForMs,
+          sentAudioBytes: this.sentAudioBytes,
+        };
+        this.emitClientEvent({
+          type: 'external_pcm_watchdog_stalled',
+          ...this.pcmStallInfo,
+        });
+        this.cancel();
+        return;
+      }
+      this.pcmWatchdogTimer = window.setTimeout(
+        check,
+        Math.min(REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS, timeoutMs)
+      );
+    };
+    this.pcmWatchdogTimer = window.setTimeout(
+      check,
+      Math.min(REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS, timeoutMs)
+    );
+  }
+
+  stopPcmWatchdog() {
+    if (this.pcmWatchdogTimer !== null) {
+      window.clearTimeout(this.pcmWatchdogTimer);
+      this.pcmWatchdogTimer = null;
+    }
+  }
+
   async finish(options = {}) {
     this.stopped = true;
+    this.stopPcmWatchdog();
     if (!this.started || !this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
       throw new Error('Realtime ASR session is not open');
     }
@@ -946,6 +1016,7 @@ export class ExternalPCMRealtimeSession {
 
   cancel() {
     this.stopped = true;
+    this.stopPcmWatchdog();
     this.pendingChunks = [];
     if (!this.websocket) {
       return;
