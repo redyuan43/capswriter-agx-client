@@ -7,8 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Existing workflow run whose artifacts should be published
-        required: true
+        description: Existing workflow run whose artifacts should be published; leave empty to rebuild
+        required: false
+        default: ""
         type: string
       release_tag:
         description: Existing Git tag that the release should use
@@ -22,7 +23,7 @@ permissions:
 jobs:
   build:
     name: Build Linux ${{ matrix.arch }}
-    if: github.event_name == 'push'
+    if: ${{ github.event_name == 'push' || inputs.source_run_id == '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +35,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - uses: pnpm/action-setup@v4
 
@@ -62,10 +65,12 @@ jobs:
   publish:
     name: Publish GitHub release
     needs: build
-    if: ${{ success() && (github.event_name == 'push' || inputs.source_run_id != '') }}
+    if: ${{ always() && ((github.event_name == 'push' && needs.build.result == 'success') || (github.event_name == 'workflow_dispatch' && (inputs.source_run_id != '' || needs.build.result == 'success'))) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -121,11 +126,20 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          gh release create "${RELEASE_TAG}" \
-          release-assets/CapsWriter-GUI-*.AppImage \
-          release-assets/capswriter-agx-client.png \
-          release-assets/SHA256SUMS.txt \
-          release-assets/install-capswriter-agx-client.sh \
-          --title "CapsWriter AGX Client ${RELEASE_TAG#v}" \
-          --notes "$(cat release-assets/linux-install-notes.md)" \
-          --generate-notes
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              release-assets/CapsWriter-GUI-*.AppImage \
+              release-assets/capswriter-agx-client.png \
+              release-assets/SHA256SUMS.txt \
+              release-assets/install-capswriter-agx-client.sh \
+              --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              release-assets/CapsWriter-GUI-*.AppImage \
+              release-assets/capswriter-agx-client.png \
+              release-assets/SHA256SUMS.txt \
+              release-assets/install-capswriter-agx-client.sh \
+              --title "CapsWriter AGX Client ${RELEASE_TAG#v}" \
+              --notes "$(cat release-assets/linux-install-notes.md)" \
+              --generate-notes
+          fi

@@ -18,15 +18,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag != '' && inputs.release_tag || github.sha }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          cache: pnpm
 
-      - run: npm ci
+      - uses: pnpm/action-setup@v4
 
-      - run: npm run build:win:agx-client
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build:win:agx-client
 
       - uses: actions/upload-artifact@v4
         with:
