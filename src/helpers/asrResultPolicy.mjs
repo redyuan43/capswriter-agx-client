@@ -34,6 +34,26 @@ export function isUsableASRPayload(payload) {
   return Boolean(extractASRText(payload) || payload.voice_command_applied === true);
 }
 
+export function createRealtimeProtocolError(payload, fallbackMessage) {
+  const error = new Error(
+    payload?.error ||
+    payload?.message ||
+    fallbackMessage
+  );
+  error.realtimeReason = String(payload?.reason || "");
+  error.realtimeFallback = String(payload?.fallback || "");
+  error.realtimePayload = payload || null;
+  return error;
+}
+
+export function shouldForceRealtimeUploadFallback(value) {
+  return (
+    value?.fallback === "upload" ||
+    value?.realtimeFallback === "upload" ||
+    value?.realtimePayload?.fallback === "upload"
+  );
+}
+
 export function settleASRCandidate(source, promise) {
   return Promise.resolve(promise).then(
     (payload) => ({

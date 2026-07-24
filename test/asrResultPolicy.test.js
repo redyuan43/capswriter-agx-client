@@ -30,6 +30,33 @@ test("latest partial fallback is promoted to a successful final payload", async 
   assert.equal(buildLatestPartialASRFallback({ success: true, partial_text: "" }), null);
 });
 
+test("server upload fallback survives websocket error conversion", async () => {
+  const {
+    createRealtimeProtocolError,
+    shouldForceRealtimeUploadFallback,
+  } = await policyPromise;
+  const payload = {
+    type: "error",
+    error: "realtime ASR audio stopped without finish or cancel",
+    reason: "audio_idle_without_finish",
+    fallback: "upload",
+  };
+
+  const error = createRealtimeProtocolError(payload, "fallback error");
+
+  assert.equal(error.message, payload.error);
+  assert.equal(error.realtimeReason, payload.reason);
+  assert.equal(error.realtimeFallback, "upload");
+  assert.equal(shouldForceRealtimeUploadFallback(error), true);
+});
+
+test("ordinary realtime errors may still use latest partial text", async () => {
+  const { shouldForceRealtimeUploadFallback } = await policyPromise;
+
+  assert.equal(shouldForceRealtimeUploadFallback(new Error("network error")), false);
+  assert.equal(shouldForceRealtimeUploadFallback({ fallback: "partial" }), false);
+});
+
 test("first usable result ignores an empty upload and keeps waiting for realtime", async () => {
   const { settleASRCandidate, waitForFirstUsableASRResult } = await policyPromise;
   let resolveRealtime;

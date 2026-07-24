@@ -6,6 +6,7 @@
 
 import axios from 'axios';
 import backendConfig from '../config/backend.js';
+import { createRealtimeProtocolError } from '../helpers/asrResultPolicy.mjs';
 
 const TTS_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_REQUEST_TIMEOUT_MS || 120000);
 const TRANSLATE_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TRANSLATE_REQUEST_TIMEOUT_MS || 20000);
@@ -560,7 +561,10 @@ export class PCMRealtimeSession {
         }
         if (type === 'closed') {
           if (!this.finalPayload) {
-            this.finalReject(new Error(payload?.error || payload?.message || 'Realtime ASR closed before final'));
+            this.finalReject(createRealtimeProtocolError(
+              payload,
+              'Realtime ASR closed before final'
+            ));
           }
           if (ws.readyState === WebSocket.OPEN) {
             ws.close();
@@ -568,7 +572,10 @@ export class PCMRealtimeSession {
           return;
         }
         if (type === 'error') {
-          const error = new Error(payload?.error || payload?.message || 'Realtime ASR returned an error event');
+          const error = createRealtimeProtocolError(
+            payload,
+            'Realtime ASR returned an error event'
+          );
           if (!ready) {
             reject(error);
           } else {

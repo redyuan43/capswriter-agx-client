@@ -7,6 +7,7 @@ import {
   translateText,
   transcribeAudio as backendTranscribe,
 } from '../services/backendAPI.js';
+import { shouldForceRealtimeUploadFallback } from '../helpers/asrResultPolicy.mjs';
 import { isKnownSilentASRArtifactWithHotwords } from '../helpers/silentAsrArtifacts.js';
 
 const ACTIVE_SAMPLE_THRESHOLD = 0.0025;
@@ -1277,11 +1278,14 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             realtimePayload = await realtimeFinalPromise;
             if (realtimePayload?.success === false) {
               const reason = realtimePayload?.error || realtimePayload?.message || 'success=false';
-              const fallbackPayload = buildRealtimePartialFallbackPayload(
-                realtimeSession?.getLatestTextPayload?.(),
-                reason,
-                recordingHotwordRef.current
-              );
+              const forceUploadFallback = shouldForceRealtimeUploadFallback(realtimePayload);
+              const fallbackPayload = forceUploadFallback
+                ? null
+                : buildRealtimePartialFallbackPayload(
+                    realtimeSession?.getLatestTextPayload?.(),
+                    reason,
+                    recordingHotwordRef.current
+                  );
               if (fallbackPayload) {
                 realtimePayload = fallbackPayload;
                 logRecordingDebug('warn', 'Realtime ASR returned failure, using latest partial text', {
@@ -1293,16 +1297,20 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
                 realtimeFailedError = new Error(reason);
                 logRecordingDebug('warn', 'Realtime ASR returned failure, will use upload fallback', {
                   error: reason,
+                  forceUploadFallback,
                 });
                 realtimePayload = null;
               }
             }
           } catch (error) {
-            const fallbackPayload = buildRealtimePartialFallbackPayload(
-              realtimeSession?.getLatestTextPayload?.(),
-              error?.message || String(error),
-              recordingHotwordRef.current
-            );
+            const forceUploadFallback = shouldForceRealtimeUploadFallback(error);
+            const fallbackPayload = forceUploadFallback
+              ? null
+              : buildRealtimePartialFallbackPayload(
+                  realtimeSession?.getLatestTextPayload?.(),
+                  error?.message || String(error),
+                  recordingHotwordRef.current
+                );
             if (fallbackPayload) {
               realtimePayload = fallbackPayload;
               logRecordingDebug('warn', 'Realtime ASR final failed, using latest partial text', {
@@ -1316,6 +1324,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
               logRecordingDebug('warn', 'Realtime ASR final failed, will use upload fallback', {
                 error: error?.message || String(error),
                 finalTimeoutMs: realtimeFinalTimeoutMs,
+                forceUploadFallback,
               });
             }
             realtimeSession?.cancel();
