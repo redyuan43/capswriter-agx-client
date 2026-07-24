@@ -7,6 +7,10 @@ import {
   translateText,
   transcribeAudio as backendTranscribe,
 } from '../services/backendAPI.js';
+import {
+  buildSystemDefaultAudioCaptureProfiles,
+  stopMediaStreamTracks,
+} from '../helpers/audioCapturePolicy.mjs';
 import { shouldForceRealtimeUploadFallback } from '../helpers/asrResultPolicy.mjs';
 import { isKnownSilentASRArtifactWithHotwords } from '../helpers/silentAsrArtifacts.js';
 
@@ -17,28 +21,7 @@ const MIN_ACTIVE_RATIO = 0.003;
 const MEDIA_RECORDER_TIMESLICE_MS = 250;
 const MEDIA_RECORDER_STOP_DRAIN_MS = 120;
 const RECORDING_START_TIMEOUT_MS = 2500;
-const MICROPHONE_PREWARM_TIMEOUT_MS = 2500;
 const REALTIME_STOP_CONNECT_GRACE_MS = 3500;
-
-const BASE_AUDIO_CAPTURE_PROFILES = [
-  {
-    name: 'browser_default',
-    constraints: {
-      audio: true,
-    },
-  },
-  {
-    name: 'raw_preferred',
-    constraints: {
-      audio: {
-        channelCount: { ideal: 1 },
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    },
-  },
-];
 
 function roundMetric(value, digits = 6) {
   return Number.isFinite(value) ? Number(value.toFixed(digits)) : 0;
@@ -179,57 +162,9 @@ async function listAudioInputDevices() {
     }));
 }
 
-function selectPreferredAudioInput(devices) {
-  const actualInputs = devices.filter((device) => !['default', 'communications'].includes(device.deviceId));
-  if (!actualInputs.length) {
-    return null;
-  }
-
-  const ranked = actualInputs.slice().sort((a, b) => {
-    const aLabel = (a.label || '').toLowerCase();
-    const bLabel = (b.label || '').toLowerCase();
-    const aMonitor = aLabel.includes('monitor');
-    const bMonitor = bLabel.includes('monitor');
-    if (aMonitor !== bMonitor) {
-      return aMonitor ? 1 : -1;
-    }
-    return aLabel.localeCompare(bLabel);
-  });
-
-  return ranked[0];
-}
-
-function buildAudioCaptureProfiles(preferredInput) {
-  const explicitProfiles = [];
-  if (preferredInput?.deviceId) {
-    explicitProfiles.push({
-      name: 'explicit_device_default',
-      constraints: {
-        audio: {
-          deviceId: { exact: preferredInput.deviceId },
-        },
-      },
-    });
-    explicitProfiles.push({
-      name: 'explicit_device_raw',
-      constraints: {
-        audio: {
-          deviceId: { exact: preferredInput.deviceId },
-          channelCount: { ideal: 1 },
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      },
-    });
-  }
-  return [...BASE_AUDIO_CAPTURE_PROFILES, ...explicitProfiles];
-}
-
 async function requestMicrophoneStream() {
   const availableInputs = await listAudioInputDevices();
-  const preferredInput = selectPreferredAudioInput(availableInputs);
-  const profiles = buildAudioCaptureProfiles(preferredInput);
+  const profiles = buildSystemDefaultAudioCaptureProfiles();
   const failures = [];
 
   for (const profile of profiles) {
@@ -239,7 +174,6 @@ async function requestMicrophoneStream() {
         stream,
         profile: profile.name,
         availableInputs,
-        preferredInput,
       };
     } catch (error) {
       failures.push({
@@ -299,10 +233,6 @@ function buildRealtimePartialFallbackPayload(payload, reason, hotword = '') {
     realtime_final_fallback: true,
     realtime_final_error: reason,
   };
-}
-
-function hasLiveAudioTrack(stream) {
-  return Boolean(stream?.getAudioTracks?.().some((track) => track.readyState === 'live'));
 }
 
 function getPreferredMediaRecorderMimeType() {
@@ -447,13 +377,6 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
 
   const wavRecorderRef = useRef(null);
   const streamRef = useRef(null);
-  const warmMicrophoneRef = useRef({
-    stream: null,
-    metadata: null,
-    promise: null,
-    generation: 0,
-  });
-  const streamGenerationRef = useRef(new WeakMap());
   const recordingSessionRef = useRef(0);
   const recordStartAtRef = useRef(0);
   const captureDiagnosticsRef = useRef(null);
@@ -527,153 +450,19 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
   }, [logRecordingDebug]);
 
   const stopMediaStream = useCallback((stream) => {
-    if (!stream) {
-      return;
-    }
-    stream.getTracks().forEach((track) => track.stop());
+    stopMediaStreamTracks(stream);
   }, []);
 
-  const invalidateWarmMicrophoneStream = useCallback((reason) => {
-    const warmState = warmMicrophoneRef.current;
-    const previousStream = warmState.stream;
-    const hadPendingPrewarm = Boolean(warmState.promise);
-    warmState.generation += 1;
-    warmState.stream = null;
-    warmState.metadata = null;
-    warmState.promise = null;
-    if (previousStream) {
-      streamGenerationRef.current.delete(previousStream);
-      stopMediaStream(previousStream);
-    }
-    logRecordingDebug('info', 'Microphone warm stream invalidated', {
-      reason,
-      hadWarmStream: Boolean(previousStream),
-      hadPendingPrewarm,
-      generation: warmState.generation,
-    });
-  }, [logRecordingDebug, stopMediaStream]);
-
-  const prewarmMicrophoneStream = useCallback(() => {
-    const warmState = warmMicrophoneRef.current;
-    if (hasLiveAudioTrack(warmState.stream) || warmState.promise) {
-      return warmState.promise;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      return null;
-    }
-
-    const generation = warmState.generation;
-    const prewarmPromise = withTimeout(
-      requestMicrophoneStream(),
-      MICROPHONE_PREWARM_TIMEOUT_MS,
-      `麦克风预热超时（>${MICROPHONE_PREWARM_TIMEOUT_MS}ms）`
-    )
-      .then((result) => {
-        if (generation !== warmState.generation) {
-          streamGenerationRef.current.delete(result.stream);
-          stopMediaStream(result.stream);
-          logRecordingDebug('info', 'Discard stale microphone prewarm result', {
-            requestedGeneration: generation,
-            currentGeneration: warmState.generation,
-          });
-          return null;
-        }
-        warmState.stream = result.stream;
-        streamGenerationRef.current.set(result.stream, generation);
-        warmState.metadata = {
-          profile: result.profile,
-          availableInputs: result.availableInputs,
-          preferredInput: result.preferredInput,
-          prewarmed: true,
-        };
-        logRecordingDebug('info', 'Microphone stream prewarmed', {
-          captureProfile: result.profile,
-          preferredInputLabel: result.preferredInput?.label || null,
-        });
-        return result;
-      })
-      .catch((error) => {
-        warmState.stream = null;
-        warmState.metadata = null;
-        logRecordingDebug('warn', 'Microphone prewarm failed, will use cold start on demand', {
-          error: error?.message || String(error),
-        });
-        return null;
-      });
-
-    warmState.promise = prewarmPromise;
-    prewarmPromise.finally(() => {
-      if (warmState.promise === prewarmPromise) {
-        warmState.promise = null;
-      }
-    });
-    return prewarmPromise;
-  }, [logRecordingDebug, stopMediaStream]);
-
   const acquireMicrophoneStream = useCallback(async () => {
-    const warmState = warmMicrophoneRef.current;
-    if (warmState.promise) {
-      await warmState.promise.catch(() => null);
-    }
-    if (hasLiveAudioTrack(warmState.stream)) {
-      const stream = warmState.stream;
-      const metadata = warmState.metadata || {};
-      warmState.stream = null;
-      warmState.metadata = null;
-      streamGenerationRef.current.set(stream, warmState.generation);
-      return {
-        stream,
-        profile: metadata.profile || 'prewarmed',
-        availableInputs: metadata.availableInputs || [],
-        preferredInput: metadata.preferredInput || null,
-        fromWarmStream: true,
-      };
-    }
-
-    const result = await requestMicrophoneStream();
-    streamGenerationRef.current.set(result.stream, warmState.generation);
-    return {
-      ...result,
-      fromWarmStream: false,
-    };
+    return requestMicrophoneStream();
   }, []);
 
   const releaseMicrophoneStream = useCallback((stream, reason) => {
     if (!stream) {
       return;
     }
-    const warmState = warmMicrophoneRef.current;
-    const streamGeneration = streamGenerationRef.current.get(stream);
-    if (streamGeneration !== warmState.generation) {
-      streamGenerationRef.current.delete(stream);
-      stopMediaStream(stream);
-      logRecordingDebug('info', 'Microphone stream not kept warm after device change', {
-        reason,
-        streamGeneration: Number.isInteger(streamGeneration) ? streamGeneration : null,
-        currentGeneration: warmState.generation,
-      });
-      return;
-    }
-    if (!warmState.stream && hasLiveAudioTrack(stream)) {
-      const diagnostics = captureDiagnosticsRef.current || {};
-      warmState.stream = stream;
-      warmState.metadata = {
-        profile: diagnostics.captureProfile || 'prewarmed',
-        availableInputs: diagnostics.availableAudioInputs || [],
-        preferredInput: diagnostics.preferredInputDeviceId || diagnostics.preferredInputLabel
-          ? {
-            deviceId: diagnostics.preferredInputDeviceId || '',
-            label: diagnostics.preferredInputLabel || '',
-            groupId: '',
-          }
-          : null,
-        prewarmed: true,
-      };
-      logRecordingDebug('info', 'Microphone stream kept warm', { reason });
-      return;
-    }
-    streamGenerationRef.current.delete(stream);
     stopMediaStream(stream);
+    logRecordingDebug('info', 'Microphone stream released', { reason });
   }, [logRecordingDebug, stopMediaStream]);
 
   const abortPendingStart = useCallback((reason) => {
@@ -754,7 +543,8 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
         timeoutMs: RECORDING_START_TIMEOUT_MS,
       });
 
-      const { stream, profile, availableInputs, preferredInput, fromWarmStream } = await withTimeout(
+      const microphoneRequestStartedAt = performance.now();
+      const { stream, profile, availableInputs } = await withTimeout(
         acquireMicrophoneStream(),
         RECORDING_START_TIMEOUT_MS,
         `麦克风启动超时（>${RECORDING_START_TIMEOUT_MS}ms）`
@@ -767,8 +557,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
 
       logRecordingDebug('info', 'Request microphone stream resolved', {
         captureProfile: profile,
-        preferredInputLabel: preferredInput?.label || null,
-        fromWarmStream,
+        elapsedMs: Math.round(performance.now() - microphoneRequestStartedAt),
       });
 
       const [track] = stream.getAudioTracks();
@@ -778,11 +567,8 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
 
       captureDiagnosticsRef.current = {
         captureProfile: profile,
-        fromWarmStream,
-        preferredInputDeviceId: preferredInput?.deviceId || null,
-        preferredInputLabel: preferredInput?.label || null,
         availableAudioInputs: availableInputs,
-        recorderMimeType: mimeType || 'browser-default',
+        recorderMimeType: mimeType || 'system-default',
         trackLabel: track?.label || 'unknown',
         trackMutedAtStart: Boolean(track?.muted),
         trackReadyState: track?.readyState || 'unknown',
@@ -922,11 +708,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       emitProgress({ stage: 'uploading_or_starting', message: '处理中...' });
 
       if (!audioBlob || audioBlob.size === 0) {
-        const captureProfile = captureDiagnosticsRef.current?.captureProfile || 'unknown';
-        const explicitDeviceProfile = captureProfile.startsWith('explicit_device_');
-        const message = explicitDeviceProfile
-          ? '录音为空，当前直连麦克风模式没有产出音频。请优先把目标麦克风设为系统默认输入后重试。'
-          : '录音为空，未检测到可用麦克风输入，请检查输入设备和权限。';
+        const message = '录音为空，系统默认麦克风没有产出音频，请检查输入设备和权限。';
         logRecordingDebug('warn', 'Skip ASR for empty recording', {
           message,
           localAudioStats,
@@ -1227,6 +1009,13 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       isFinalizingRef.current = true;
       setIsProcessing(true);
       (async () => {
+        const releaseActiveMicrophone = (reason) => {
+          if (!streamRef.current) {
+            return;
+          }
+          releaseMicrophoneStream(streamRef.current, reason);
+          streamRef.current = null;
+        };
         try {
           const stopAt = Date.now();
           const recorder = wavRecorderRef.current;
@@ -1271,6 +1060,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           realtimeFinalPromise.catch(() => {});
 
           const { audioBlob, stats } = await recorderStopPromise;
+          releaseActiveMicrophone('recording_stopped');
           let realtimePayload = null;
           let realtimeFailed = false;
           let realtimeFailedError = null;
@@ -1338,11 +1128,6 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             realtimeStartErrorRef.current = null;
           }
 
-          if (streamRef.current) {
-            releaseMicrophoneStream(streamRef.current, 'recording_stopped');
-            streamRef.current = null;
-          }
-
           const localAudioStats = {
             ...stats,
           };
@@ -1370,6 +1155,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           }
           await processAudio(audioBlob, localAudioStats, realtimePayload, { realtimeFailed });
         } finally {
+          releaseActiveMicrophone('recording_finalization_cleanup');
           isFinalizingRef.current = false;
         }
       })().catch((err) => {
@@ -1407,41 +1193,9 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     setError(null);
   }, [abortPendingStart, releaseMicrophoneStream]);
 
-  useEffect(() => {
-    if (!modelStatus.isReady || isRecordingRef.current || isStartingRef.current) {
-      return undefined;
-    }
-    prewarmMicrophoneStream();
-    return undefined;
-  }, [modelStatus.isReady, prewarmMicrophoneStream]);
-
-  useEffect(() => {
-    if (!navigator.mediaDevices?.addEventListener) {
-      return undefined;
-    }
-    const handleDeviceChange = () => {
-      invalidateWarmMicrophoneStream('media_devices_changed');
-      if (!modelStatus.isReady || isRecordingRef.current || isStartingRef.current || isFinalizingRef.current) {
-        return;
-      }
-      window.setTimeout(() => {
-        if (!isRecordingRef.current && !isStartingRef.current && !isFinalizingRef.current) {
-          prewarmMicrophoneStream();
-        }
-      }, 250);
-    };
-    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
-    return () => {
-      navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
-    };
-  }, [invalidateWarmMicrophoneStream, modelStatus.isReady, prewarmMicrophoneStream]);
-
   useEffect(() => () => {
-    const warmState = warmMicrophoneRef.current;
-    stopMediaStream(warmState.stream);
-    warmState.stream = null;
-    warmState.metadata = null;
-    warmState.promise = null;
+    stopMediaStream(streamRef.current);
+    streamRef.current = null;
   }, [stopMediaStream]);
 
   const checkPermissions = useCallback(async () => {
