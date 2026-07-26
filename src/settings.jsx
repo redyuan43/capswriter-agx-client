@@ -37,6 +37,7 @@ const SettingsPage = () => {
   const [capsMinHoldMs, setCapsMinHoldMs] = useState(DEFAULT_CAPS_MIN_HOLD_MS);
   const [savingVoiceSettings, setSavingVoiceSettings] = useState(false);
   const [activeTab, setActiveTab] = useState('settings');
+  const [appVersion, setAppVersion] = useState('');
 
   const showAlert = (alert) => {
     toast(alert.title, {
@@ -155,6 +156,12 @@ const SettingsPage = () => {
   useEffect(() => {
     loadVoiceSettings();
   }, [loadVoiceSettings]);
+
+  useEffect(() => {
+    window.electronAPI?.getAppVersion?.()
+      .then((version) => setAppVersion(String(version || '').trim()))
+      .catch(() => setAppVersion(''));
+  }, []);
 
   const handleActivateFloatingBall = async () => {
     if (window.electronAPI) {
@@ -742,6 +749,11 @@ const SettingsPage = () => {
             <p className="text-xs text-gray-500">
               按住 Right Shift 键开始录音，松开结束录音
             </p>
+            {appVersion && (
+              <p className="mt-2 text-xs text-gray-400">
+                CapsWriter AGX Client v{appVersion}
+              </p>
+            )}
           </div>
         </div>
       </div>

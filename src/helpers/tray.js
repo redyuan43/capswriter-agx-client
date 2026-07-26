@@ -143,8 +143,7 @@ class TrayManager {
           dialog.showMessageBox({
             type: "info",
             title: "关于 CapsWriter",
-            message: "CapsWriter AGX Client",
-            detail: `版本 ${app.getVersion()}`,
+            message: `CapsWriter AGX Client\n版本 ${app.getVersion()}`,
             buttons: ["确定"]
           });
         }

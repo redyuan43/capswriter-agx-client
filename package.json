@@ -1,6 +1,6 @@
 {
   "name": "speech-transcription",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "语音转写-基于HTTP后端和可配置AI模型的中文语音转文字应用",
   "main": "main.js",
   "private": true,
