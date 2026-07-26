@@ -2,7 +2,10 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const CapsLockListener = require('../src/helpers/capsLockListener');
-const { describeLinuxInputDevice } = CapsLockListener;
+const {
+  describeLinuxInputDevice,
+  discoverNamedLinuxInputDevicePaths,
+} = CapsLockListener;
 
 test('treats Caps as a non-locking Right Shift hold key when configured', () => {
   const previous = process.env.CAPS_DICTATION_HOLD_KEY;
@@ -39,6 +42,25 @@ H: Handlers=sysrq kbd event6
   assert.equal(
     describeLinuxInputDevice(devices, '/dev/input/event6').trigger_id,
     'keyboard'
+  );
+});
+
+test('discovers MiniJoy mouse event nodes by device name', () => {
+  const devices = `I: Bus=0005 Vendor=0000 Product=0000 Version=0000
+N: Name="VibeStick MiniJoy Keyboard"
+H: Handlers=sysrq kbd event17
+
+I: Bus=0005 Vendor=0000 Product=0000 Version=0000
+N: Name="VibeStick MiniJoy Mouse"
+H: Handlers=mouse2 event18
+`;
+
+  assert.deepEqual(
+    discoverNamedLinuxInputDevicePaths(devices, [
+      'VibeStick MiniJoy Keyboard',
+      'VibeStick MiniJoy Mouse',
+    ]),
+    ['/dev/input/event17', '/dev/input/event18']
   );
 });
 

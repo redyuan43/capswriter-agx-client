@@ -12,6 +12,7 @@ const INPUT_EVENT_SIZE = process.arch === 'x64' || process.arch === 'arm64' ? 24
 const CAPS_RESTORE_EVENT_IGNORE_MS = 250;
 const CAPS_RESTORE_VERIFY_DELAY_MS = 120;
 const CAPS_DOUBLE_PRESS_CANCEL_MS = 350;
+const LINUX_INPUT_REFRESH_INTERVAL_MS = 2000;
 const DEFAULT_DICTATION_HOLD_KEY = 'right shift';
 const DEFAULT_CODEX_HOLD_KEY = 'caps lock';
 const EXTRA_KEYBOARD_DEVICE_NAMES = [
@@ -91,6 +92,31 @@ function describeLinuxInputDevice(text, devicePath) {
   return { trigger_id: 'keyboard', device_path: devicePath, device_name: '', backend: 'evdev' };
 }
 
+function discoverNamedLinuxInputDevicePaths(text, names) {
+  const wantedNames = new Set((names || []).map((name) => String(name).toLowerCase()));
+  if (!wantedNames.size) {
+    return [];
+  }
+
+  const devicePaths = [];
+  for (const block of String(text || '').split(/\n\n+/)) {
+    const nameMatch = block.match(/^N:\s+Name="([^"]+)"$/m);
+    if (!nameMatch || !wantedNames.has(nameMatch[1].toLowerCase())) {
+      continue;
+    }
+    const handlersMatch = block.match(/^H:\s+Handlers=(.+)$/m);
+    if (!handlersMatch) {
+      continue;
+    }
+    for (const handler of handlersMatch[1].trim().split(/\s+/)) {
+      if (handler.startsWith('event')) {
+        devicePaths.push(path.join('/dev/input', handler));
+      }
+    }
+  }
+  return devicePaths;
+}
+
 class CapsLockListener {
   constructor(logger = null) {
     this.logger = logger;
@@ -116,6 +142,7 @@ class CapsLockListener {
     this._uiohook = null;
     this._uiohookKey = null;
     this._inputStreams = [];
+    this._inputRefreshTimer = null;
     this._inputBuffers = new Map();
     this._inputDeviceInfo = new Map();
     this._ignoreCapsEventsUntil = 0;
@@ -185,6 +212,10 @@ class CapsLockListener {
     if (this._capsLockRestoreVerifyTimer) {
       clearTimeout(this._capsLockRestoreVerifyTimer);
       this._capsLockRestoreVerifyTimer = null;
+    }
+    if (this._inputRefreshTimer) {
+      clearInterval(this._inputRefreshTimer);
+      this._inputRefreshTimer = null;
     }
     this._recordingTriggered = false;
     this.isCapsLockPressed = false;
@@ -343,69 +374,88 @@ class CapsLockListener {
   _startLinuxEvdevBackend() {
     const devicePaths = this._discoverLinuxKeyboardDevicePaths();
     if (!devicePaths.length) {
-      this._logWarn('Wayland input listener 未找到可用键盘设备 (/dev/input/*-event-kbd)');
+      this._logWarn('Wayland input listener 未找到可用输入设备');
       return false;
     }
 
     let openedCount = 0;
-    let sawPermissionError = false;
-
     for (const devicePath of devicePaths) {
-      try {
-        const fd = fs.openSync(devicePath, 'r');
-        const stream = fs.createReadStream(devicePath, {
-          fd,
-          autoClose: true,
-          flags: 'r',
-          highWaterMark: INPUT_EVENT_SIZE * 32
-        });
-
-        this._inputBuffers.set(devicePath, Buffer.alloc(0));
-        this._inputDeviceInfo.set(devicePath, this._describeLinuxInputDevice(devicePath));
-
-        stream.on('data', (chunk) => {
-          this._onInputEventData(devicePath, chunk);
-        });
-
-        stream.on('error', (error) => {
-          if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
-            sawPermissionError = true;
-            this._logWarn(
-              `Wayland input listener 无法读取 ${devicePath} (${error.code})，请将用户加入 input 组或配置 udev 规则`
-            );
-          } else {
-            this._logWarn(`Wayland input listener 设备读取失败 ${devicePath}:`, error?.message || error);
-          }
-        });
-
-        stream.on('close', () => {
-          this._inputBuffers.delete(devicePath);
-          this._inputDeviceInfo.delete(devicePath);
-        });
-
-        this._inputStreams.push(stream);
-        openedCount += 1;
-      } catch (error) {
-        if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
-          sawPermissionError = true;
-          this._logWarn(
-            `Wayland input listener 无法打开 ${devicePath} (${error.code})，请将用户加入 input 组或配置 udev 规则`
-          );
-        } else {
-          this._logWarn(`Wayland input listener 无法打开 ${devicePath}:`, error?.message || error);
-        }
-      }
+      openedCount += this._openLinuxInputDevice(devicePath) ? 1 : 0;
     }
 
     if (!openedCount) {
-      if (sawPermissionError) {
-        this._logWarn('Wayland input listener 初始化失败：缺少 /dev/input 读取权限');
-      }
       return false;
     }
 
-    this._logInfo(`Wayland input listener 已连接 ${openedCount} 个键盘设备`, devicePaths);
+    this._inputRefreshTimer = setInterval(() => {
+      this._refreshLinuxInputDevices();
+    }, LINUX_INPUT_REFRESH_INTERVAL_MS);
+    this._inputRefreshTimer.unref?.();
+
+    this._logInfo(`Wayland input listener 已连接 ${openedCount} 个输入设备`, devicePaths);
     return true;
+  }
+
+  _openLinuxInputDevice(devicePath) {
+    if (this._inputDeviceInfo.has(devicePath)) {
+      return false;
+    }
+
+    try {
+      const fd = fs.openSync(devicePath, 'r');
+      const stream = fs.createReadStream(devicePath, {
+        fd,
+        autoClose: true,
+        flags: 'r',
+        highWaterMark: INPUT_EVENT_SIZE * 32
+      });
+      const deviceInfo = this._describeLinuxInputDevice(devicePath);
+
+      this._inputBuffers.set(devicePath, Buffer.alloc(0));
+      this._inputDeviceInfo.set(devicePath, deviceInfo);
+
+      stream.on('data', (chunk) => {
+        this._onInputEventData(devicePath, chunk);
+      });
+      stream.on('error', (error) => {
+        if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
+          this._logWarn(
+            `Wayland input listener 无法读取 ${devicePath} (${error.code})，请将用户加入 input 组或配置 udev 规则`
+          );
+        } else {
+          this._logWarn(`Wayland input listener 设备读取失败 ${devicePath}:`, error?.message || error);
+        }
+      });
+      stream.on('close', () => {
+        this._inputBuffers.delete(devicePath);
+        this._inputDeviceInfo.delete(devicePath);
+        this._inputStreams = this._inputStreams.filter((item) => item !== stream);
+      });
+
+      this._inputStreams.push(stream);
+      return true;
+    } catch (error) {
+      if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        this._logWarn(
+          `Wayland input listener 无法打开 ${devicePath} (${error.code})，请将用户加入 input 组或配置 udev 规则`
+        );
+      } else {
+        this._logWarn(`Wayland input listener 无法打开 ${devicePath}:`, error?.message || error);
+      }
+      return false;
+    }
+  }
+
+  _refreshLinuxInputDevices() {
+    const added = [];
+    for (const devicePath of this._discoverLinuxKeyboardDevicePaths()) {
+      if (this._openLinuxInputDevice(devicePath)) {
+        added.push(devicePath);
+      }
+    }
+    if (added.length) {
+      this._logInfo('Wayland input listener 已连接新输入设备', added);
+    }
   }
 
   _discoverLinuxKeyboardDevicePaths() {
@@ -465,11 +515,6 @@ class CapsLockListener {
   }
 
   _discoverLinuxKeyboardDevicePathsByName(names) {
-    const wantedNames = new Set((names || []).map((name) => String(name).toLowerCase()));
-    if (!wantedNames.size) {
-      return [];
-    }
-
     let text = '';
     try {
       text = fs.readFileSync('/proc/bus/input/devices', 'utf8');
@@ -477,26 +522,7 @@ class CapsLockListener {
       return [];
     }
 
-    const devicePaths = [];
-    for (const block of text.split(/\n\n+/)) {
-      const nameMatch = block.match(/^N:\s+Name="([^"]+)"$/m);
-      if (!nameMatch || !wantedNames.has(nameMatch[1].toLowerCase())) {
-        continue;
-      }
-
-      const handlersMatch = block.match(/^H:\s+Handlers=(.+)$/m);
-      if (!handlersMatch) {
-        continue;
-      }
-
-      for (const handler of handlersMatch[1].trim().split(/\s+/)) {
-        if (handler.startsWith('event')) {
-          devicePaths.push(path.join('/dev/input', handler));
-        }
-      }
-    }
-
-    return devicePaths;
+    return discoverNamedLinuxInputDevicePaths(text, names);
   }
 
   _describeLinuxInputDevice(devicePath) {
@@ -846,3 +872,4 @@ class CapsLockListener {
 
 module.exports = CapsLockListener;
 module.exports.describeLinuxInputDevice = describeLinuxInputDevice;
+module.exports.discoverNamedLinuxInputDevicePaths = discoverNamedLinuxInputDevicePaths;
