@@ -11,7 +11,6 @@ import {
   planTtsChunks,
   speakText,
   translateText,
-  transcribeAudio as backendTranscribe,
   loadTtsModel,
   unloadTtsModel,
   loadService,
@@ -21,11 +20,8 @@ import {
 } from "../../services/backendAPI.js";
 import { isExactSilentASRArtifactText } from "../../helpers/silentAsrArtifacts.js";
 import {
-  buildLatestPartialASRFallback,
   extractASRText,
   isUsableASRPayload,
-  settleASRCandidate,
-  waitForFirstUsableASRResult,
 } from "../../helpers/asrResultPolicy.mjs";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -42,11 +38,6 @@ const DEFAULT_CAPS_MIN_HOLD_MS = 150;
 const DICTATION_CONTROL_STATUSES = ["recording", "processing", "preview_ready", "pasting", "optimizing"];
 const CODEX_FLOATING_PREVIEW_MAX_CHARS = 420;
 const CODEX_COMPLETION_CHIME_COOLDOWN_MS = 1200;
-const M5_REALTIME_FINAL_HEDGE_DELAY_MS_RAW = Number(import.meta.env.VITE_M5_REALTIME_FINAL_HEDGE_DELAY_MS || 5000);
-const M5_REALTIME_FINAL_HEDGE_DELAY_MS = Number.isFinite(M5_REALTIME_FINAL_HEDGE_DELAY_MS_RAW)
-  ? Math.max(1000, M5_REALTIME_FINAL_HEDGE_DELAY_MS_RAW)
-  : 5000;
-
 function normalizeExternalRecordingMode(value) {
   const normalized = String(value || "dictation").trim().toLowerCase().replace(/-/g, "_");
   if (["cyber_fortune", "fortune", "fort"].includes(normalized)) return "cyber_fortune";
@@ -2109,7 +2100,7 @@ export default function FloatingBallApp() {
         },
         onClientEvent: (event) => {
           if (event?.type === "external_pcm_watchdog_stalled") {
-            logRuntime("warn", "External M5 realtime PCM watchdog stalled; upload fallback will run on stop", event);
+            logRuntime("warn", "External M5 realtime PCM watchdog stalled; recording will fail on stop", event);
           }
         },
       });
@@ -2117,7 +2108,7 @@ export default function FloatingBallApp() {
       externalRecordingRef.current.realtimeStartPromise = realtimeSession.start().catch((error) => {
         externalRecordingRef.current.realtimeFailed = true;
         externalRecordingRef.current.realtimeError = error;
-        logRuntime("warn", "External M5 realtime ASR unavailable, will use upload fallback", {
+        logRuntime("warn", "External M5 realtime ASR unavailable; recording will fail on stop", {
           error: error?.message || String(error),
         });
         if (externalRealtimeSessionRef.current === realtimeSession) {
@@ -2235,31 +2226,8 @@ export default function FloatingBallApp() {
         return;
       }
       let finalPayload = null;
-      let realtimeError = null;
-      let usedUploadFallback = false;
-      let uploadAttempted = false;
+      let realtimeError = session.realtimeError || null;
       let resultSource = "";
-      const realtimeSession = externalRealtimeSessionRef.current;
-      const logCandidateResult = (result) => {
-        logRuntime(result?.error ? "warn" : "info", "External M5 ASR candidate settled", {
-          sessionId,
-          source: result?.source || "unknown",
-          usable: result?.usable === true,
-          success: result?.payload?.success !== false,
-          textLength: extractASRText(result?.payload).length,
-          voiceCommandApplied: result?.payload?.voice_command_applied === true,
-          requestId: result?.payload?.request_id || null,
-          error: result?.error?.message || (result?.error ? String(result.error) : null),
-        });
-      };
-      const startUploadCandidate = () => {
-        uploadAttempted = true;
-        return settleASRCandidate("upload", backendTranscribe(wavBlob, {
-          useVad: true,
-          usePunc: true,
-          hotword: sessionHotwordsRef.current.join("\n"),
-        }));
-      };
 
       if (session.realtimeStartPromise) {
         await session.realtimeStartPromise.catch(() => null);
@@ -2267,133 +2235,47 @@ export default function FloatingBallApp() {
       if (session.cancelled) {
         return;
       }
+      const realtimeSession = externalRealtimeSessionRef.current;
       if (realtimeSession) {
         if (realtimeSession.isPcmStalled?.()) {
-          realtimeError = new Error("External M5 realtime PCM watchdog stalled");
+          realtimeError = new Error("实时语音识别失败：发送到 18011 的 PCM 音频流已停滞");
         } else {
           const finishStartedAt = performance.now();
-          const realtimeResultPromise = settleASRCandidate(
-            "realtime",
-            realtimeSession.finish({
+          try {
+            finalPayload = await realtimeSession.finish({
               timeoutMs: computeRealtimeASRFinalTimeoutMs(stats.durationMs),
-            })
-          );
-          const hedgeDelay = new Promise((resolve) => {
-            window.setTimeout(() => resolve({ source: "hedge_delay" }), M5_REALTIME_FINAL_HEDGE_DELAY_MS);
-          });
-          const initialResult = await Promise.race([realtimeResultPromise, hedgeDelay]);
-          let winner = null;
-          let settledResults = [];
-
-          if (initialResult.source === "hedge_delay") {
-            logRuntime("warn", "External M5 realtime final delayed; racing batch upload fallback", {
-              sessionId,
-              audioDurationMs: stats.durationMs,
-              hedgeDelayMs: M5_REALTIME_FINAL_HEDGE_DELAY_MS,
             });
-            const outcome = await waitForFirstUsableASRResult(
-              [realtimeResultPromise, startUploadCandidate()],
-              { onSettled: logCandidateResult }
-            );
-            winner = outcome.winner;
-            settledResults = outcome.settled;
-          } else {
-            logCandidateResult(initialResult);
-            settledResults = [initialResult];
-            if (initialResult.usable) {
-              winner = initialResult;
+            if (isUsableASRPayload(finalPayload)) {
+              resultSource = "realtime_final";
+              logRuntime("info", "External M5 realtime final settled", {
+                sessionId,
+                source: resultSource,
+                elapsedMs: Math.round(performance.now() - finishStartedAt),
+              });
             } else {
-              const uploadResult = await startUploadCandidate();
-              logCandidateResult(uploadResult);
-              settledResults.push(uploadResult);
-              if (uploadResult.usable) {
-                winner = uploadResult;
-              }
+              realtimeError = new Error(
+                finalPayload?.error
+                  || finalPayload?.message
+                  || "实时语音识别失败：18011 返回了不可用的最终结果"
+              );
             }
-          }
-
-          if (winner) {
-            finalPayload = winner.payload;
-            resultSource = winner.source === "upload" ? "upload_fallback" : "realtime_final";
-            usedUploadFallback = winner.source === "upload";
-            if (winner.source === "upload" && externalRealtimeSessionRef.current === realtimeSession) {
-              realtimeSession.cancel();
-            }
-            logRuntime("info", "External M5 realtime final settled", {
+          } catch (error) {
+            realtimeError = error;
+            logRuntime("warn", "External M5 realtime final failed", {
               sessionId,
-              source: winner.source,
-              elapsedMs: Math.round(performance.now() - finishStartedAt),
+              error: error?.message || String(error),
             });
-          } else {
-            realtimeError = settledResults.find((result) => result.source === "realtime")?.error
-              || new Error("Realtime and upload returned no usable ASR result");
           }
         }
+      } else if (!realtimeError) {
+        realtimeError = new Error("实时语音识别失败：没有可用的 18011 会话");
       }
       if (session.cancelled) {
         return;
       }
 
       if (!isUsableASRPayload(finalPayload)) {
-        const latest = isUsableASRPayload(session.latestRealtimePartial)
-          ? session.latestRealtimePartial
-          : realtimeSession?.getLatestTextPayload?.();
-        const partialFallback = buildLatestPartialASRFallback(
-          latest,
-          realtimeError?.message || "Realtime final returned no usable text"
-        );
-        if (partialFallback) {
-          finalPayload = partialFallback;
-          resultSource = "latest_partial_fallback";
-          realtimeSession?.cancel();
-          logRuntime("warn", "External M5 realtime final unavailable; using latest partial text", {
-            sessionId,
-            textLength: extractASRText(finalPayload).length,
-            requestId: finalPayload?.request_id || null,
-            error: realtimeError?.message || null,
-          });
-        }
-      }
-      if (!isUsableASRPayload(finalPayload) && !uploadAttempted) {
-        if (realtimeError) {
-          logRuntime("warn", "External M5 realtime final failed, using upload fallback", {
-            sessionId,
-            error: realtimeError?.message || String(realtimeError),
-          });
-        }
-        const uploadResult = await startUploadCandidate();
-        logCandidateResult(uploadResult);
-        if (uploadResult.usable) {
-          finalPayload = uploadResult.payload;
-          resultSource = "upload_fallback";
-          usedUploadFallback = true;
-        } else if (uploadResult.error && !realtimeError) {
-          realtimeError = uploadResult.error;
-        }
-      }
-      if (usedUploadFallback || resultSource === "latest_partial_fallback") {
-        const asrText = String(finalPayload?.asr_text || finalPayload?.text || "").trim();
-        if (translateMode === "translate" && asrText) {
-          const translated = await translateText(asrText, translateTarget || "zh", {
-            traceId: `external-m5-${sessionId}`,
-          });
-          const translatedText = String(translated?.translated_text || "").trim();
-          if (translatedText) {
-            finalPayload = {
-              ...finalPayload,
-              text: translatedText,
-              translated_text: translatedText,
-              postprocess_mode: "translate",
-              translation_success: true,
-            };
-          } else {
-            finalPayload = {
-              ...finalPayload,
-              translation_success: false,
-              translation_error: "translation returned empty text",
-            };
-          }
-        }
+        throw realtimeError || new Error("实时语音识别失败：18011 未返回可用结果");
       }
       if (session.cancelled) {
         return;

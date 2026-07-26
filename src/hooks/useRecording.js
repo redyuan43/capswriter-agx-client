@@ -5,13 +5,11 @@ import {
   computeRealtimeASRFinalTimeoutMs,
   isRealtimeASRConfigured,
   translateText,
-  transcribeAudio as backendTranscribe,
 } from '../services/backendAPI.js';
 import {
   buildSystemDefaultAudioCaptureProfiles,
   stopMediaStreamTracks,
 } from '../helpers/audioCapturePolicy.mjs';
-import { shouldForceRealtimeUploadFallback } from '../helpers/asrResultPolicy.mjs';
 import { isKnownSilentASRArtifactWithHotwords } from '../helpers/silentAsrArtifacts.js';
 
 const ACTIVE_SAMPLE_THRESHOLD = 0.0025;
@@ -200,39 +198,6 @@ function withTimeout(promise, timeoutMs, timeoutMessage) {
       window.clearTimeout(timeoutId);
     }
   });
-}
-
-function buildRealtimePartialFallbackPayload(payload, reason, hotword = '') {
-  if (!payload) {
-    return null;
-  }
-  const text = (
-    payload.final_text ||
-    payload.translated_text ||
-    payload.optimized_text ||
-    payload.text ||
-    payload.asr_text ||
-    payload.partial_text ||
-    ''
-  );
-  const asrText = payload.asr_text || payload.raw_asr_text || payload.text || text;
-  const voiceCommandApplied = payload.voice_command_applied === true;
-  if (isKnownSilentASRArtifactWithHotwords(hotword, text, asrText, payload.raw_asr_text, payload.partial_text)) {
-    return null;
-  }
-  if (!text.trim() && !voiceCommandApplied) {
-    return null;
-  }
-  return {
-    ...payload,
-    type: 'final',
-    success: true,
-    final_text: text,
-    text,
-    asr_text: asrText,
-    realtime_final_fallback: true,
-    realtime_final_error: reason,
-  };
 }
 
 function getPreferredMediaRecorderMimeType() {
@@ -639,7 +604,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             if (event?.type === 'preroll_flushed') {
               logRecordingDebug('info', 'Realtime ASR preroll flushed', event);
             } else if (event?.type === 'realtime_pcm_watchdog_stalled') {
-              logRecordingDebug('warn', 'Realtime ASR PCM watchdog stalled; upload fallback will run on stop', event);
+              logRecordingDebug('warn', 'Realtime ASR PCM watchdog stalled; recording will fail on stop', event);
             }
           },
         });
@@ -696,7 +661,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     }
   }, [abortPendingStart, acquireMicrophoneStream, logRecordingDebug, modelStatus.isReady, modelStatus.isLoading, modelStatus.error, releaseMicrophoneStream, resolveClientIntentPayload, translateMode, translateTarget]);
 
-  const processAudio = useCallback(async (audioBlob, localAudioStats, realtimePayload = null, options = {}) => {
+  const processAudio = useCallback(async (audioBlob, localAudioStats, realtimePayload = null) => {
     const emitProgress = (payload) => {
       if (window.onTranscriptionProgress) {
         window.onTranscriptionProgress(payload);
@@ -730,39 +695,13 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       let transcriptionResult = null;
       const currentMode = translateMode === 'translate' ? 'translate' : 'transcribe';
       const currentTarget = translateTarget || 'zh';
-      const clientIntentPayload = recordingClientIntentRef.current || {
-        intentMode: 'none',
-        clientIntents: [],
-        clientIntentConfidenceThreshold: 0.78,
-      };
       const hotword = recordingHotwordRef.current || '';
-      const uploadTranscribe = async () => {
-        const result = await backendTranscribe(audioBlob, {
-          useVad: true,
-          usePunc: true,
-          hotword,
-          intentMode: clientIntentPayload.intentMode,
-          clientIntents: clientIntentPayload.clientIntents,
-          clientIntentConfidenceThreshold: clientIntentPayload.clientIntentConfidenceThreshold,
-        });
-        return {
-          ...result,
-          asr_text: result?.asr_text || result?.text || '',
-          raw_asr_text: result?.raw_asr_text || '',
-          audio_stats: result?.audio_stats || null,
-        };
-      };
-      const extractPayloadText = (payload) => String(
-        payload?.final_text ||
-        payload?.translated_text ||
-        payload?.optimized_text ||
-        payload?.asr_text ||
-        payload?.text ||
-        ''
-      ).trim();
 
       try {
-        const streamDonePayload = realtimePayload || await uploadTranscribe();
+        if (!realtimePayload) {
+          throw new Error('实时语音识别失败：未收到 18011 的最终结果');
+        }
+        const streamDonePayload = realtimePayload;
 
         transcriptionResult = {
           success: streamDonePayload?.success !== false,
@@ -798,37 +737,6 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           voice_intent_action_type: streamDonePayload?.voice_intent_action_type || '',
         };
 
-        if (
-          realtimePayload &&
-          transcriptionResult.success !== false &&
-          !transcriptionResult.voice_command_applied &&
-          !extractPayloadText(streamDonePayload)
-        ) {
-          logRecordingDebug('warn', 'Realtime ASR returned empty final text, trying upload fallback', {
-            localAudioStats,
-            realtimeAudioStats: streamDonePayload?.audio_stats || null,
-          });
-          try {
-            const fallbackResult = await uploadTranscribe();
-            if (fallbackResult?.success !== false && extractPayloadText(fallbackResult)) {
-              transcriptionResult = fallbackResult;
-              logRecordingDebug('info', 'Upload fallback recovered text after empty realtime final', {
-                textLength: extractPayloadText(fallbackResult).length,
-                audioStats: fallbackResult?.audio_stats || null,
-              });
-            } else {
-              logRecordingDebug('warn', 'Upload fallback also returned empty text', {
-                success: fallbackResult?.success !== false,
-                audioStats: fallbackResult?.audio_stats || null,
-              });
-            }
-          } catch (fallbackError) {
-            logRecordingDebug('warn', 'Upload fallback failed after empty realtime final', {
-              error: fallbackError?.message || String(fallbackError),
-            });
-          }
-        }
-
         const asrTextForTranslate = (transcriptionResult.asr_text || transcriptionResult.text || '').trim();
         const currentText = (transcriptionResult.text || '').trim();
         const shouldClientTranslate =
@@ -863,7 +771,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           }
         }
       } catch (streamErr) {
-        console.warn('Upload transcription failed:', streamErr);
+        console.warn('Realtime transcription failed:', streamErr);
         throw streamErr;
       }
 
@@ -978,9 +886,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
         mode: currentMode,
         translateTarget: currentTarget,
         hotword,
-        source: realtimePayload
-          ? 'client_realtime'
-          : (options.realtimeFailed ? 'client_upload_fallback' : 'client_stream_upload'),
+        source: 'client_realtime',
         log: logRecordingDebug,
       });
 
@@ -1046,10 +952,10 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             }
             if (!realtimeSession.hasSentAudio?.()) {
               realtimeSession.cancel();
-              throw new Error('Realtime ASR sent no PCM audio; using upload fallback');
+              throw new Error('实时语音识别失败：没有向 18011 发送 PCM 音频');
             }
             if (realtimeSession.isAudioPumpStalled?.()) {
-              throw new Error('Realtime ASR PCM watchdog stalled; using upload fallback');
+              throw new Error('实时语音识别失败：发送到 18011 的 PCM 音频流已停滞');
             }
             const hasPartialText = Boolean(realtimeSession.getLatestTextPayload?.());
             realtimeFinalTimeoutMs = hasPartialText
@@ -1068,55 +974,20 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             realtimePayload = await realtimeFinalPromise;
             if (realtimePayload?.success === false) {
               const reason = realtimePayload?.error || realtimePayload?.message || 'success=false';
-              const forceUploadFallback = shouldForceRealtimeUploadFallback(realtimePayload);
-              const fallbackPayload = forceUploadFallback
-                ? null
-                : buildRealtimePartialFallbackPayload(
-                    realtimeSession?.getLatestTextPayload?.(),
-                    reason,
-                    recordingHotwordRef.current
-                  );
-              if (fallbackPayload) {
-                realtimePayload = fallbackPayload;
-                logRecordingDebug('warn', 'Realtime ASR returned failure, using latest partial text', {
-                  error: reason,
-                  fallbackTextLength: fallbackPayload.text?.length || 0,
-                });
-              } else {
-                realtimeFailed = true;
-                realtimeFailedError = new Error(reason);
-                logRecordingDebug('warn', 'Realtime ASR returned failure, will use upload fallback', {
-                  error: reason,
-                  forceUploadFallback,
-                });
-                realtimePayload = null;
-              }
+              realtimeFailed = true;
+              realtimeFailedError = new Error(reason);
+              realtimePayload = null;
+              logRecordingDebug('warn', 'Realtime ASR returned failure', {
+                error: reason,
+              });
             }
           } catch (error) {
-            const forceUploadFallback = shouldForceRealtimeUploadFallback(error);
-            const fallbackPayload = forceUploadFallback
-              ? null
-              : buildRealtimePartialFallbackPayload(
-                  realtimeSession?.getLatestTextPayload?.(),
-                  error?.message || String(error),
-                  recordingHotwordRef.current
-                );
-            if (fallbackPayload) {
-              realtimePayload = fallbackPayload;
-              logRecordingDebug('warn', 'Realtime ASR final failed, using latest partial text', {
-                error: error?.message || String(error),
-                finalTimeoutMs: realtimeFinalTimeoutMs,
-                fallbackTextLength: fallbackPayload.text?.length || 0,
-              });
-            } else {
-              realtimeFailed = true;
-              realtimeFailedError = error || new Error('Realtime ASR final failed');
-              logRecordingDebug('warn', 'Realtime ASR final failed, will use upload fallback', {
-                error: error?.message || String(error),
-                finalTimeoutMs: realtimeFinalTimeoutMs,
-                forceUploadFallback,
-              });
-            }
+            realtimeFailed = true;
+            realtimeFailedError = error || new Error('Realtime ASR final failed');
+            logRecordingDebug('warn', 'Realtime ASR final failed', {
+              error: error?.message || String(error),
+              finalTimeoutMs: realtimeFinalTimeoutMs,
+            });
             realtimeSession?.cancel();
           } finally {
             if (realtimeSessionRef.current === realtimeSession) {
@@ -1149,11 +1020,12 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           });
 
           if (realtimeFailed) {
-            logRecordingDebug('warn', 'Realtime ASR failed before final text, falling back to upload transcription', {
+            logRecordingDebug('warn', 'Realtime ASR failed before final text', {
               error: realtimeFailedError?.message || String(realtimeFailedError || ''),
             });
+            throw realtimeFailedError || new Error('实时语音识别失败');
           }
-          await processAudio(audioBlob, localAudioStats, realtimePayload, { realtimeFailed });
+          await processAudio(audioBlob, localAudioStats, realtimePayload);
         } finally {
           releaseActiveMicrophone('recording_finalization_cleanup');
           isFinalizingRef.current = false;
