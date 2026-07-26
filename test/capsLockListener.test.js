@@ -41,3 +41,33 @@ H: Handlers=sysrq kbd event6
     'keyboard'
   );
 });
+
+test('routes the MiniJoy mouse middle button to dictation callbacks', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  listener._inputBuffers.set('/dev/input/event18', Buffer.alloc(0));
+  listener._inputDeviceInfo.set('/dev/input/event18', {
+    trigger_id: 'minijoy_bt',
+    device_path: '/dev/input/event18',
+    device_name: 'VibeStick MiniJoy Mouse',
+    backend: 'evdev'
+  });
+  const events = [];
+  listener.setOnCapsLockDown((payload) => events.push(['down', payload.trigger_id]));
+  listener.setOnCapsLockUp((payload) => events.push(['up', payload.trigger_id]));
+
+  const inputEvent = (value) => {
+    const event = Buffer.alloc(24);
+    event.writeUInt16LE(1, 16);
+    event.writeUInt16LE(274, 18);
+    event.writeInt32LE(value, 20);
+    return event;
+  };
+  listener._onInputEventData('/dev/input/event18', inputEvent(1));
+  listener._onInputEventData('/dev/input/event18', inputEvent(0));
+
+  assert.deepEqual(events, [
+    ['down', 'minijoy_bt'],
+    ['up', 'minijoy_bt']
+  ]);
+});

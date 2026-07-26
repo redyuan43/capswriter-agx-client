@@ -7,6 +7,7 @@ const KEY_CAPSLOCK = 58;
 const KEY_RIGHTSHIFT = 54;
 const KEY_ESC = 1;
 const KEY_ENTER = 28;
+const BTN_MIDDLE = 274;
 const INPUT_EVENT_SIZE = process.arch === 'x64' || process.arch === 'arm64' ? 24 : 16;
 const CAPS_RESTORE_EVENT_IGNORE_MS = 250;
 const CAPS_RESTORE_VERIFY_DELAY_MS = 120;
@@ -14,8 +15,17 @@ const CAPS_DOUBLE_PRESS_CANCEL_MS = 350;
 const DEFAULT_DICTATION_HOLD_KEY = 'right shift';
 const DEFAULT_CODEX_HOLD_KEY = 'caps lock';
 const EXTRA_KEYBOARD_DEVICE_NAMES = [
-  'Knob Mapper Virtual Keyboard'
+  'Knob Mapper Virtual Keyboard',
+  'VibeStick MiniJoy Keyboard',
+  'VibeStick MiniJoy Mouse'
 ];
+const MINIJOY_MIDDLE_BUTTON_CONFIG = {
+  normalizedName: 'minijoy middle button',
+  displayName: 'MiniJoy Middle Button',
+  uiohookName: '',
+  evdevCode: BTN_MIDDLE,
+  restoresCapsLock: false
+};
 
 function normalizeDictationKeyName(value) {
   return String(value || '')
@@ -520,12 +530,12 @@ class CapsLockListener {
         continue;
       }
 
-      const holdKey = this._findHoldKeyByEvdevCode(code);
       const source = this._inputDeviceInfo.get(devicePath) || {
         trigger_id: 'keyboard',
         device_path: devicePath,
         backend: 'evdev'
       };
+      const holdKey = this._findHoldKeyByEvdevCode(code, source);
       if (holdKey && value === 1) {
         this._handleHoldKeyDown(holdKey.role, holdKey.config, code, source);
       } else if (holdKey && value === 0) {
@@ -655,7 +665,10 @@ class CapsLockListener {
     this._lastCapsShortPressAt = now;
   }
 
-  _findHoldKeyByEvdevCode(code) {
+  _findHoldKeyByEvdevCode(code, source = {}) {
+    if (source.trigger_id === 'minijoy_bt' && code === BTN_MIDDLE) {
+      return { role: 'dictation', config: MINIJOY_MIDDLE_BUTTON_CONFIG };
+    }
     if (code === this.dictationKeyConfig.evdevCode) {
       return { role: 'dictation', config: this.dictationKeyConfig };
     }
