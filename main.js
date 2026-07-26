@@ -340,6 +340,7 @@ const m5VoiceBridge = new M5VoiceBridge({
   logger,
   windowManager,
   clipboardManager,
+  databaseManager,
   sendToRenderer: safeSendToMainWindow,
 });
 const voiceActionManager = new VoiceActionManager({
@@ -775,13 +776,21 @@ async function startApp() {
 
   // Setup dictation hold-key listener
   logger.info('Setting up dictation hold-key listener...');
-  capsLockListener.setOnCapsLockDown(() => {
+  capsLockListener.setOnCapsLockDown(async (payload = {}) => {
+    const triggerId = payload.trigger_id || 'keyboard';
     logger.info(`${capsLockListener.getDictationKeyDisplayName()} pressed - showing floating ball and starting recording`);
     windowManager.showFloatingBall();
-    safeSendToMainWindow('caps-lock-down');
+    const routed = await m5VoiceBridge.handleHostTriggerDown(
+      triggerId,
+      windowManager.previousActiveWindow || ''
+    );
+    if (!routed.handled) {
+      safeSendToMainWindow('caps-lock-down', payload);
+    }
   });
 
-  capsLockListener.setOnCapsLockUp(() => {
+  capsLockListener.setOnCapsLockUp(async (payload = {}) => {
+    const triggerId = payload.trigger_id || 'keyboard';
     logger.info(`${capsLockListener.getDictationKeyDisplayName()} released - stopping recording, keep floating ball visible for result`);
     
     // Restore the window that was active before the floating recorder appeared.
@@ -790,7 +799,10 @@ async function startApp() {
     }
     
     // 然后发送停止录音事件
-    safeSendToMainWindow('caps-lock-up');
+    const routed = await m5VoiceBridge.handleHostTriggerUp(triggerId);
+    if (!routed.handled) {
+      safeSendToMainWindow('caps-lock-up', payload);
+    }
 
     if (process.platform !== 'linux' && capsLockListener.isCapsLockDictationKey()) {
       setTimeout(() => {

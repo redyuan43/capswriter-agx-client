@@ -21,6 +21,18 @@ class M5VoiceBridgeRouter {
         bridge.sendJson(res, 200, { devices: bridge.listDevices() });
         return;
       }
+      if (path === "/audio/routing") {
+        bridge.sendJson(res, 200, {
+          success: true,
+          routing: bridge.getAudioRoutingState(),
+        });
+        return;
+      }
+      if (path === "/device/commands/poll") {
+        bridge.requireToken(req);
+        await bridge.handleDeviceCommandPoll(req, res, url);
+        return;
+      }
       if (path === "/" || path === "/dashboard") {
         bridge.sendHtml(res, 200, bridge.buildDashboardHtml());
         return;
@@ -63,6 +75,14 @@ class M5VoiceBridgeRouter {
     }
     if (path === "/recording/stop") {
       await bridge.handleRecordingStop(req, res);
+      return;
+    }
+    if (path === "/audio/routing") {
+      await bridge.handleAudioRoutingUpdate(req, res);
+      return;
+    }
+    if (path === "/device/commands/ack") {
+      await bridge.handleDeviceCommandAck(req, res);
       return;
     }
     bridge.sendJson(res, 404, { success: false, error: "not found" });

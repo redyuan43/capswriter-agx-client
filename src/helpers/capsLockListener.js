@@ -61,6 +61,26 @@ function createHoldKeyConfig(value, fallbackValue = DEFAULT_DICTATION_HOLD_KEY) 
   return null;
 }
 
+function describeLinuxInputDevice(text, devicePath) {
+  const eventName = path.basename(devicePath);
+  for (const block of String(text || '').split(/\n\n+/)) {
+    const handlersMatch = block.match(/^H:\s+Handlers=(.+)$/m);
+    if (!handlersMatch || !handlersMatch[1].trim().split(/\s+/).includes(eventName)) {
+      continue;
+    }
+    const name = block.match(/^N:\s+Name="([^"]+)"$/m)?.[1] || '';
+    return {
+      trigger_id: /VibeStick MiniJoy/i.test(name) ? 'minijoy_bt' : 'keyboard',
+      device_path: devicePath,
+      device_name: name,
+      device_phys: block.match(/^P:\s+Phys=(.+)$/m)?.[1]?.trim() || '',
+      device_uniq: block.match(/^U:\s+Uniq=(.+)$/m)?.[1]?.trim() || '',
+      backend: 'evdev'
+    };
+  }
+  return { trigger_id: 'keyboard', device_path: devicePath, device_name: '', backend: 'evdev' };
+}
+
 class CapsLockListener {
   constructor(logger = null) {
     this.logger = logger;
@@ -87,11 +107,13 @@ class CapsLockListener {
     this._uiohookKey = null;
     this._inputStreams = [];
     this._inputBuffers = new Map();
+    this._inputDeviceInfo = new Map();
     this._ignoreCapsEventsUntil = 0;
     this._capsLockRestoreTargetState = null;
     this._capsLockRestoreVerifyTimer = null;
     this._activeHoldRole = null;
     this._activeHoldKeyConfig = null;
+    this._activeHoldSource = null;
     this._lastCapsShortPressAt = 0;
   }
 
@@ -179,6 +201,7 @@ class CapsLockListener {
         }
         this._inputStreams = [];
         this._inputBuffers.clear();
+        this._inputDeviceInfo.clear();
       }
 
       this.isListening = false;
@@ -277,7 +300,10 @@ class CapsLockListener {
     uIOhook.on('keydown', (e) => {
       const holdKey = holdKeyByCode.get(e.keycode);
       if (holdKey) {
-        this._handleHoldKeyDown(holdKey.role, holdKey.config, e.keycode);
+        this._handleHoldKeyDown(holdKey.role, holdKey.config, e.keycode, {
+          trigger_id: 'keyboard',
+          backend: 'uiohook'
+        });
         return;
       }
 
@@ -294,7 +320,10 @@ class CapsLockListener {
     uIOhook.on('keyup', (e) => {
       const holdKey = holdKeyByCode.get(e.keycode);
       if (holdKey) {
-        this._handleHoldKeyUp(holdKey.role, holdKey.config, e.keycode);
+        this._handleHoldKeyUp(holdKey.role, holdKey.config, e.keycode, {
+          trigger_id: 'keyboard',
+          backend: 'uiohook'
+        });
       }
     });
 
@@ -322,6 +351,7 @@ class CapsLockListener {
         });
 
         this._inputBuffers.set(devicePath, Buffer.alloc(0));
+        this._inputDeviceInfo.set(devicePath, this._describeLinuxInputDevice(devicePath));
 
         stream.on('data', (chunk) => {
           this._onInputEventData(devicePath, chunk);
@@ -340,6 +370,7 @@ class CapsLockListener {
 
         stream.on('close', () => {
           this._inputBuffers.delete(devicePath);
+          this._inputDeviceInfo.delete(devicePath);
         });
 
         this._inputStreams.push(stream);
@@ -458,6 +489,16 @@ class CapsLockListener {
     return devicePaths;
   }
 
+  _describeLinuxInputDevice(devicePath) {
+    let text = '';
+    try {
+      text = fs.readFileSync('/proc/bus/input/devices', 'utf8');
+    } catch (_) {
+      return { trigger_id: 'keyboard', device_path: devicePath, device_name: '', backend: 'evdev' };
+    }
+    return describeLinuxInputDevice(text, devicePath);
+  }
+
   _onInputEventData(devicePath, chunk) {
     const prev = this._inputBuffers.get(devicePath) || Buffer.alloc(0);
     let data = prev.length ? Buffer.concat([prev, chunk]) : chunk;
@@ -480,10 +521,15 @@ class CapsLockListener {
       }
 
       const holdKey = this._findHoldKeyByEvdevCode(code);
+      const source = this._inputDeviceInfo.get(devicePath) || {
+        trigger_id: 'keyboard',
+        device_path: devicePath,
+        backend: 'evdev'
+      };
       if (holdKey && value === 1) {
-        this._handleHoldKeyDown(holdKey.role, holdKey.config, code);
+        this._handleHoldKeyDown(holdKey.role, holdKey.config, code, source);
       } else if (holdKey && value === 0) {
-        this._handleHoldKeyUp(holdKey.role, holdKey.config, code);
+        this._handleHoldKeyUp(holdKey.role, holdKey.config, code, source);
       } else if (code === KEY_ESC && value === 1) {
         this._handleDictationCancel(KEY_ESC);
       } else if (this.dictationKeyCaptureEnabled && code === KEY_ENTER && value === 1) {
@@ -495,13 +541,17 @@ class CapsLockListener {
     this._inputBuffers.set(devicePath, data);
   }
 
-  _handleHoldKeyDown(role, keyConfig, keycode) {
+  _handleHoldKeyDown(role, keyConfig, keycode, source = {}) {
     if (this._shouldIgnoreCapsEvent()) return;
     if (this.isCapsLockPressed) return;
 
     this.isCapsLockPressed = true;
     this._activeHoldRole = role;
     this._activeHoldKeyConfig = keyConfig;
+    this._activeHoldSource = {
+      trigger_id: source.trigger_id || 'keyboard',
+      ...source
+    };
     this._recordingTriggered = false;
     this._logInfo(`${keyConfig.displayName} 按下, keycode:`, keycode);
 
@@ -515,7 +565,7 @@ class CapsLockListener {
             this._lastCapsShortPressAt = 0;
             this._captureLinuxCapsLockRestoreTarget();
           }
-          this._emitHoldKeyDown(role);
+          this._emitHoldKeyDown(role, this._activeHoldSource);
         }
       }, this.minHoldMs + 1);
       return;
@@ -526,10 +576,10 @@ class CapsLockListener {
       this._lastCapsShortPressAt = 0;
       this._captureLinuxCapsLockRestoreTarget();
     }
-    this._emitHoldKeyDown(role);
+    this._emitHoldKeyDown(role, this._activeHoldSource);
   }
 
-  _handleHoldKeyUp(role, keyConfig, keycode) {
+  _handleHoldKeyUp(role, keyConfig, keycode, source = {}) {
     if (this._shouldIgnoreCapsEvent()) return;
     if (!this.isCapsLockPressed) return;
     if (this._activeHoldRole !== role || this._activeHoldKeyConfig !== keyConfig) {
@@ -545,6 +595,7 @@ class CapsLockListener {
       this._holdTimer = null;
       this._activeHoldRole = null;
       this._activeHoldKeyConfig = null;
+      this._activeHoldSource = null;
       this._handleShortHoldKeyPress(role, keyConfig, keycode);
       this._logInfo(keyConfig.displayName + ' 短按忽略 (<= ' + this.minHoldMs + 'ms)');
       return;
@@ -554,7 +605,7 @@ class CapsLockListener {
 
     if (this._recordingTriggered) {
       this._recordingTriggered = false;
-      this._emitHoldKeyUp(role);
+      this._emitHoldKeyUp(role, this._activeHoldSource || source);
       if (keyConfig.restoresCapsLock) {
         this._restoreLinuxCapsLockAfterLongPress();
       }
@@ -562,24 +613,25 @@ class CapsLockListener {
     }
     this._activeHoldRole = null;
     this._activeHoldKeyConfig = null;
+    this._activeHoldSource = null;
   }
 
-  _emitHoldKeyDown(role) {
+  _emitHoldKeyDown(role, source = {}) {
     if (role === 'codex') {
-      if (this.onCodexHoldDown) this.onCodexHoldDown();
+      if (this.onCodexHoldDown) this.onCodexHoldDown(source);
       return;
     }
 
-    if (this.onCapsLockDown) this.onCapsLockDown();
+    if (this.onCapsLockDown) this.onCapsLockDown(source);
   }
 
-  _emitHoldKeyUp(role) {
+  _emitHoldKeyUp(role, source = {}) {
     if (role === 'codex') {
-      if (this.onCodexHoldUp) this.onCodexHoldUp();
+      if (this.onCodexHoldUp) this.onCodexHoldUp(source);
       return;
     }
 
-    if (this.onCapsLockUp) this.onCapsLockUp();
+    if (this.onCapsLockUp) this.onCapsLockUp(source);
   }
 
   _handleShortHoldKeyPress(_role, keyConfig, keycode) {
@@ -780,3 +832,4 @@ class CapsLockListener {
 }
 
 module.exports = CapsLockListener;
+module.exports.describeLinuxInputDevice = describeLinuxInputDevice;

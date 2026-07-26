@@ -9,6 +9,10 @@ const M5OtaService = require("./m5OtaService");
 const M5RecordingSessions = require("./m5RecordingSessions");
 const M5VoiceBridgeRouter = require("./m5VoiceBridgeRouter");
 const M5FollowupKeyDispatcher = require("./m5FollowupKeyDispatcher");
+const AudioRoutingManager = require("./audioRoutingManager");
+const M5DeviceCommandBroker = require("./m5DeviceCommandBroker");
+const PipeWireCaptureController = require("./pipeWireCaptureController");
+const PipeWireUnifiedSourceController = require("./pipeWireUnifiedSourceController");
 const { ENTER_FOLLOWUP } = require("./m5FollowupKeyDispatcher");
 
 const DEFAULT_HOST = "0.0.0.0";
@@ -192,7 +196,7 @@ function createPcmWavBuffer(chunks, sampleRate = 16000) {
 }
 
 class M5VoiceBridge {
-  constructor({ logger, windowManager, clipboardManager, sendToRenderer }) {
+  constructor({ logger, windowManager, clipboardManager, databaseManager, sendToRenderer }) {
     this.logger = logger;
     this.windowManager = windowManager;
     this.clipboardManager = clipboardManager;
@@ -207,6 +211,17 @@ class M5VoiceBridge {
     });
     this.deviceRegistry = new M5DeviceRegistry();
     this.devices = this.deviceRegistry.devices;
+    this.commandBroker = new M5DeviceCommandBroker();
+    this.audioRouting = new AudioRoutingManager({
+      databaseManager,
+      logger: this.logger,
+      wifiDeviceProvider: () => this.listDevices(),
+    });
+    this.pipeWireCapture = new PipeWireCaptureController({ logger: this.logger });
+    this.pipeWireUnifiedSource = new PipeWireUnifiedSourceController({
+      logger: this.logger,
+    });
+    this.hostTriggerSessions = new Map();
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
@@ -275,13 +290,14 @@ class M5VoiceBridge {
         error: "M5 voice bridge stopped",
       });
     }
+    this.pipeWireCapture.stopAll();
     this.server.close();
     this.server = null;
   }
 
   async handleRequest(req, res) {
     const url = new URL(req.url || "/", "http://127.0.0.1");
-    this.rememberDevice(req, url.pathname);
+    req.vibeDevice = this.rememberDevice(req, url.pathname);
     await this.router.handle(req, res, url);
   }
 
@@ -302,32 +318,42 @@ class M5VoiceBridge {
     const rows = devices.map((device) => this.deviceRowHtml(device)).join("");
     const bodyRows = rows || '<tr><td colspan="9" class="empty">No M5Stack devices seen yet.</td></tr>';
     const updatedAt = escapeHtml(new Date().toLocaleString());
+    const routingState = JSON.stringify(this.audioRouting.getState()).replace(/</g, "\\u003c");
     return `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="5">
 <title>CapsWriter M5 Bridge</title>
 <style>
-body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #f8fafc; }
-main { max-width: 1120px; margin: 0 auto; padding: 28px 20px; }
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f6f8; color: #17202a; }
+main { max-width: 1180px; margin: 0 auto; padding: 28px 20px; }
 h1 { margin: 0 0 8px; font-size: 28px; font-weight: 700; }
-.meta { color: #94a3b8; margin-bottom: 24px; }
-table { width: 100%; border-collapse: collapse; background: #1e293b; border: 1px solid #334155; }
-th, td { padding: 10px 12px; border-bottom: 1px solid #334155; text-align: left; font-size: 14px; white-space: nowrap; }
-th { color: #cbd5e1; background: #111827; font-weight: 600; }
-.empty { color: #94a3b8; text-align: center; padding: 24px; }
-.muted { color: #94a3b8; }
-.ok { color: #86efac; }
-.warn { color: #fde68a; }
-.bad { color: #fca5a5; }
+.meta { color: #667085; margin-bottom: 24px; }
+h2 { margin: 28px 0 12px; font-size: 18px; }
+table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d0d5dd; }
+th, td { padding: 10px 12px; border-bottom: 1px solid #e4e7ec; text-align: left; font-size: 14px; white-space: nowrap; }
+th { color: #344054; background: #f9fafb; font-weight: 600; }
+.empty, .muted { color: #667085; }
+.empty { text-align: center; padding: 24px; }
+.ok { color: #067647; }
+.warn { color: #b54708; }
+.bad { color: #b42318; }
+.route-grid { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(260px, 2fr); gap: 10px 16px; align-items: center; }
+select { width: 100%; min-height: 38px; border: 1px solid #98a2b3; background: #fff; padding: 6px 9px; }
+button { margin-top: 14px; min-height: 38px; border: 0; background: #175cd3; color: #fff; padding: 8px 15px; cursor: pointer; }
+#save-status { margin-left: 12px; color: #475467; }
+@media (max-width: 720px) { .route-grid { grid-template-columns: 1fr; } main { padding: 20px 12px; overflow-x: auto; } }
 </style>
 </head>
 <body>
 <main>
 <h1>CapsWriter M5 Bridge</h1>
 <div class="meta">${escapeHtml(this.bridgeLabel)} (${escapeHtml(this.bridgeId)}) &middot; Listening on ${escapeHtml(this.host)}:${this.port} &middot; Updated ${updatedAt}</div>
+<h2>音频输入路由</h2>
+<div id="routes" class="route-grid"></div>
+<button id="save-routes" type="button">保存路由</button><span id="save-status"></span>
+<h2>在线设备</h2>
 <table>
 <thead>
 <tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>Wake</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr>
@@ -335,6 +361,46 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
 <tbody>${bodyRows}</tbody>
 </table>
 </main>
+<script>
+const state = ${routingState};
+const routeRoot = document.getElementById("routes");
+const triggerLabel = (id) => id === "keyboard" ? "键盘按键" : id === "minijoy_bt" ? "MiniJoy 蓝牙按键" : "WiFi 设备 " + id.slice(5);
+for (const [triggerId, route] of Object.entries(state.routes)) {
+  const label = document.createElement("label");
+  label.textContent = triggerLabel(triggerId);
+  label.htmlFor = "route-" + triggerId;
+  const select = document.createElement("select");
+  select.id = "route-" + triggerId;
+  select.dataset.triggerId = triggerId;
+  for (const source of state.sources) {
+    const option = document.createElement("option");
+    option.value = source.source_id;
+    option.textContent = source.name + (source.online ? "" : "（离线）");
+    option.selected = source.source_id === route.source_id;
+    select.appendChild(option);
+  }
+  routeRoot.append(label, select);
+}
+document.getElementById("save-routes").addEventListener("click", async () => {
+  const status = document.getElementById("save-status");
+  const routes = {};
+  document.querySelectorAll("select[data-trigger-id]").forEach((select) => {
+    routes[select.dataset.triggerId] = { source_id: select.value };
+  });
+  status.textContent = "保存中...";
+  try {
+    const response = await fetch("/audio/routing", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: 1, routes }),
+    });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    status.textContent = "已保存";
+  } catch (error) {
+    status.textContent = "保存失败：" + error.message;
+  }
+});
+</script>
 </body>
 </html>`;
   }
@@ -691,6 +757,20 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
     const sessionId = String(body.session_id || randomUUID().replace(/-/g, "")).trim();
     const intent = normalizeRecordingIntent(body.intent, body.mode);
     const mode = String(body.mode || intent).trim() || intent;
+    const triggerId = String(
+      body.trigger_id ||
+      (req.vibeDevice?.device_id ? `wifi:${req.vibeDevice.device_id}` : "wifi:unknown")
+    ).trim();
+    const route = this.audioRouting.activateTrigger(triggerId);
+    const requestingSourceId = req.vibeDevice?.device_id
+      ? `wifi:${req.vibeDevice.device_id}`
+      : triggerId;
+    const sourceId = route.source_id || requestingSourceId || triggerId;
+    const captureMode = sourceId === requestingSourceId
+      ? "device_upload"
+      : sourceId.startsWith("wifi:")
+        ? "remote_device"
+        : "host_capture";
     this.windowManager?.showFloatingBall?.();
     const targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
     const session = this.recordingSessions.create({
@@ -699,6 +779,11 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       mode,
       targetWindowId,
     });
+    session.triggerId = triggerId;
+    session.sourceId = sourceId;
+    session.captureMode = captureMode;
+    session.sourceDeviceId = sourceId.startsWith("wifi:") ? sourceId.slice(5) : "";
+    session.seenChunkIds = new Set();
     this.sendToRenderer("external-recording-start", {
       session_id: sessionId,
       source: body.source || "m5stickc_plus",
@@ -710,34 +795,78 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       trigger_mode: mode,
       intent,
     });
+    if (captureMode === "host_capture") {
+      this.pipeWireUnifiedSource.activate(route.source.node_name);
+      this.pipeWireCapture.start(
+        sessionId,
+        sourceId,
+        (chunk) => this.appendRecordingAudio(session, chunk),
+        route.source.node_name
+      );
+    } else if (captureMode === "remote_device") {
+      this.commandBroker.enqueue(session.sourceDeviceId, {
+        type: "recording_start",
+        payload: {
+          session_id: sessionId,
+          trigger_id: triggerId,
+          intent,
+          mode,
+        },
+      });
+    }
     this.logger?.info?.("M5 recording started", {
       sessionId,
       intent,
       mode,
+      triggerId,
+      sourceId,
+      captureMode,
       targetWindowId: session.targetWindowId || null,
     });
     this.sendJson(res, 200, {
       success: true,
-      recording: { status: "recording", session_id: sessionId, intent },
+      recording: {
+        status: "recording",
+        session_id: sessionId,
+        intent,
+        capture_mode: captureMode,
+        source_id: sourceId,
+        audio_format: {
+          codec: "pcm_s16le",
+          sample_rate: 16000,
+          channels: 1,
+        },
+      },
       state: this.buildState(),
     });
   }
 
+  appendRecordingAudio(session, body) {
+    if (!this.recordingSessions.appendAudio(session, body)) {
+      return false;
+    }
+    const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+    this.sendToRenderer("external-recording-chunk", {
+      session_id: session.id,
+      chunk,
+      byte_length: body.length,
+    });
+    return true;
+  }
+
   async handleRecordingAudio(req, res, url) {
     const sessionId = String(url.searchParams.get("session_id") || "").trim();
+    const chunkId = String(url.searchParams.get("chunk_id") || "").trim();
     const session = this.sessions.get(sessionId);
     if (!session || session.done) {
       this.sendJson(res, 404, { success: false, error: "recording session not found" });
       return;
     }
     const body = await readRequestBody(req, MAX_AUDIO_CHUNK_BYTES);
-    if (this.recordingSessions.appendAudio(session, body)) {
-      const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
-      this.sendToRenderer("external-recording-chunk", {
-        session_id: sessionId,
-        chunk,
-        byte_length: body.length,
-      });
+    const duplicate = Boolean(chunkId && session.seenChunkIds?.has(chunkId));
+    if (!duplicate) {
+      if (chunkId) session.seenChunkIds?.add(chunkId);
+      this.appendRecordingAudio(session, body);
     }
     this.sendJson(res, 200, {
       success: true,
@@ -746,6 +875,8 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
         session_id: sessionId,
         bytes: session.bytes,
         chunks: session.chunks,
+        chunk_id: chunkId,
+        duplicate,
       },
     });
   }
@@ -783,6 +914,24 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
         error: "recording session already completed",
       });
       return;
+    }
+    this.pipeWireCapture.stop(sessionId);
+    if (session.captureMode === "remote_device" && session.sourceDeviceId) {
+      const command = this.commandBroker.enqueue(session.sourceDeviceId, {
+        type: "recording_stop",
+        payload: { session_id: sessionId },
+      });
+      const acknowledgement = await this.commandBroker.waitForAcknowledgement(
+        session.sourceDeviceId,
+        command.command_id
+      );
+      if (!acknowledgement || acknowledgement.status !== "completed") {
+        this.logger?.warn?.("Remote audio stop was not acknowledged", {
+          sessionId,
+          deviceId: session.sourceDeviceId,
+          acknowledgement,
+        });
+      }
     }
     session.status = "processing";
     session.intent = normalizeRecordingIntent(body.intent, session.intent);
@@ -822,6 +971,135 @@ th { color: #cbd5e1; background: #111827; font-weight: 600; }
       },
       state: this.buildState(),
     });
+  }
+
+  getAudioRoutingState() {
+    return this.audioRouting.getState();
+  }
+
+  async handleAudioRoutingUpdate(req, res) {
+    const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
+    this.audioRouting.saveRoutes(body);
+    this.sendJson(res, 200, {
+      success: true,
+      routing: this.audioRouting.getState(),
+    });
+  }
+
+  async handleDeviceCommandPoll(req, res, url) {
+    const deviceId = String(
+      req.vibeDevice?.device_id || url.searchParams.get("device_id") || ""
+    ).trim();
+    if (!deviceId) {
+      this.sendJson(res, 400, { success: false, error: "device_id is required" });
+      return;
+    }
+    const cursor = Number(url.searchParams.get("cursor") || 0);
+    const timeoutMs = Number(url.searchParams.get("timeout_ms") || 25000);
+    const command = await this.commandBroker.poll(deviceId, cursor, timeoutMs);
+    this.sendJson(res, 200, {
+      success: true,
+      cursor: command?.cursor || this.commandBroker.latestCursor(deviceId),
+      command,
+    });
+  }
+
+  async handleDeviceCommandAck(req, res) {
+    const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
+    const deviceId = String(req.vibeDevice?.device_id || body.device_id || "").trim();
+    if (!deviceId) {
+      this.sendJson(res, 400, { success: false, error: "device_id is required" });
+      return;
+    }
+    const acknowledgement = this.commandBroker.acknowledge(deviceId, body);
+    this.sendJson(res, 200, { success: true, acknowledgement });
+  }
+
+  async handleHostTriggerDown(triggerId, targetWindowId = "") {
+    const route = this.audioRouting.activateTrigger(triggerId);
+    if (!route.source_id.startsWith("wifi:")) {
+      if (route.available && route.source.node_name) {
+        this.pipeWireUnifiedSource.activate(route.source.node_name);
+      }
+      return { handled: false, route };
+    }
+
+    const sessionId = randomUUID().replace(/-/g, "");
+    const sourceDeviceId = route.source_id.slice(5);
+    const session = this.recordingSessions.create({
+      id: sessionId,
+      intent: "dictation",
+      mode: "dictation",
+      targetWindowId,
+    });
+    Object.assign(session, {
+      triggerId,
+      sourceId: route.source_id,
+      sourceDeviceId,
+      captureMode: "remote_device",
+      seenChunkIds: new Set(),
+    });
+    this.hostTriggerSessions.set(triggerId, sessionId);
+    this.sendToRenderer("external-recording-start", {
+      session_id: sessionId,
+      source: "audio_router",
+      audio_source: route.source_id,
+      sample_rate: 16000,
+      bits_per_sample: 16,
+      channels: 1,
+      mode: "dictation",
+      trigger_mode: "dictation",
+      intent: "dictation",
+    });
+    this.commandBroker.enqueue(sourceDeviceId, {
+      type: "recording_start",
+      payload: {
+        session_id: sessionId,
+        trigger_id: triggerId,
+        intent: "dictation",
+        mode: "dictation",
+      },
+    });
+    return { handled: true, route, session_id: sessionId };
+  }
+
+  async handleHostTriggerUp(triggerId) {
+    const sessionId = this.hostTriggerSessions.get(triggerId);
+    if (!sessionId) {
+      this.audioRouting.clearActiveRoute(triggerId);
+      return { handled: false };
+    }
+    this.hostTriggerSessions.delete(triggerId);
+    const session = this.sessions.get(sessionId);
+    if (!session || session.done) {
+      return { handled: true, session_id: sessionId };
+    }
+    const command = this.commandBroker.enqueue(session.sourceDeviceId, {
+      type: "recording_stop",
+      payload: { session_id: sessionId },
+    });
+    const acknowledgement = await this.commandBroker.waitForAcknowledgement(
+      session.sourceDeviceId,
+      command.command_id
+    );
+    if (!acknowledgement || acknowledgement.status !== "completed") {
+      this.logger?.warn?.("Host-triggered remote audio stop was not acknowledged", {
+        sessionId,
+        deviceId: session.sourceDeviceId,
+        acknowledgement,
+      });
+    }
+    session.status = "processing";
+    this.sendToRenderer("external-recording-stop", {
+      session_id: sessionId,
+      paste: true,
+      mode: session.intent,
+      trigger_mode: session.mode,
+      intent: session.intent,
+      bytes: session.bytes,
+      chunks: session.chunks,
+    });
+    return { handled: true, session_id: sessionId, acknowledgement };
   }
 
   latestSessionId() {

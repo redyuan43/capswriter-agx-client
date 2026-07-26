@@ -37,6 +37,31 @@ function requestJson(port, path, { method = "GET", headers = {}, body } = {}) {
   });
 }
 
+function requestBuffer(port, path, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path,
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": body.length,
+      },
+    }, (res) => {
+      let responseBody = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        responseBody += chunk;
+      });
+      res.on("end", () => resolve({ statusCode: res.statusCode, body: responseBody }));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
 async function startBridge(t, sendToRenderer = () => {}) {
   const commands = [];
   const bridge = new M5VoiceBridge({
@@ -140,6 +165,64 @@ test("HTTP routing preserves method and unknown-path responses", async (t) => {
     success: false,
     error: "not found",
   });
+});
+
+test("M5 audio chunks are idempotent by chunk_id", async (t) => {
+  const { port } = await startBridge(t);
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "wifi-stick-a",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+  };
+  const started = await requestJson(port, "/recording/start", {
+    method: "POST",
+    headers,
+    body: { session_id: "idempotent-audio", intent: "dictation" },
+  });
+  assert.equal(JSON.parse(started.body).recording.capture_mode, "device_upload");
+
+  const first = await requestBuffer(
+    port,
+    "/recording/audio?session_id=idempotent-audio&chunk_id=7",
+    Buffer.from([1, 2, 3, 4]),
+    headers
+  );
+  const duplicate = await requestBuffer(
+    port,
+    "/recording/audio?session_id=idempotent-audio&chunk_id=7",
+    Buffer.from([1, 2, 3, 4]),
+    headers
+  );
+  assert.deepEqual(JSON.parse(first.body).recording, {
+    status: "recording",
+    session_id: "idempotent-audio",
+    bytes: 4,
+    chunks: 1,
+    chunk_id: "7",
+    duplicate: false,
+  });
+  assert.equal(JSON.parse(duplicate.body).recording.duplicate, true);
+  assert.equal(JSON.parse(duplicate.body).recording.bytes, 4);
+});
+
+test("device command poll returns commands for the requesting device", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  bridge.commandBroker.enqueue("wifi-stick-b", {
+    type: "recording_start",
+    payload: { session_id: "remote-session" },
+  });
+  const response = await requestJson(
+    port,
+    "/device/commands/poll?cursor=0&timeout_ms=0",
+    {
+      headers: {
+        "X-Vibe-Stick-Device-Id": "wifi-stick-b",
+        "X-Vibe-Stick-Firmware-Name": "vibestick",
+      },
+    }
+  );
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.command.type, "recording_start");
+  assert.equal(payload.command.payload.session_id, "remote-session");
 });
 
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {
