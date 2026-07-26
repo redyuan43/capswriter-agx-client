@@ -1021,11 +1021,57 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       if (route.available && route.source.node_name) {
         this.pipeWireUnifiedSource.activate(route.source.node_name);
       }
-      return { handled: false, route };
+      if (triggerId !== "minijoy_bt" || !route.available || !route.source.node_name) {
+        return { handled: false, route };
+      }
+
+      const sessionId = randomUUID().replace(/-/g, "");
+      const session = this.createHostRecordingSession({
+        sessionId,
+        triggerId,
+        route,
+        targetWindowId,
+        captureMode: "host_capture",
+      });
+      this.pipeWireCapture.start(
+        sessionId,
+        route.source_id,
+        (chunk) => this.appendRecordingAudio(session, chunk),
+        route.source.node_name
+      );
+      return { handled: true, route, session_id: sessionId };
     }
 
     const sessionId = randomUUID().replace(/-/g, "");
     const sourceDeviceId = route.source_id.slice(5);
+    const session = this.createHostRecordingSession({
+      sessionId,
+      triggerId,
+      route,
+      targetWindowId,
+      captureMode: "remote_device",
+      sourceDeviceId,
+    });
+    this.commandBroker.enqueue(sourceDeviceId, {
+      type: "recording_start",
+      payload: {
+        session_id: sessionId,
+        trigger_id: triggerId,
+        intent: "dictation",
+        mode: "dictation",
+      },
+    });
+    return { handled: true, route, session_id: sessionId };
+  }
+
+  createHostRecordingSession({
+    sessionId,
+    triggerId,
+    route,
+    targetWindowId,
+    captureMode,
+    sourceDeviceId = "",
+  }) {
     const session = this.recordingSessions.create({
       id: sessionId,
       intent: "dictation",
@@ -1036,7 +1082,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       triggerId,
       sourceId: route.source_id,
       sourceDeviceId,
-      captureMode: "remote_device",
+      captureMode,
       seenChunkIds: new Set(),
     });
     this.hostTriggerSessions.set(triggerId, sessionId);
@@ -1051,16 +1097,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       trigger_mode: "dictation",
       intent: "dictation",
     });
-    this.commandBroker.enqueue(sourceDeviceId, {
-      type: "recording_start",
-      payload: {
-        session_id: sessionId,
-        trigger_id: triggerId,
-        intent: "dictation",
-        mode: "dictation",
-      },
-    });
-    return { handled: true, route, session_id: sessionId };
+    return session;
   }
 
   async handleHostTriggerUp(triggerId) {
@@ -1074,20 +1111,25 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     if (!session || session.done) {
       return { handled: true, session_id: sessionId };
     }
-    const command = this.commandBroker.enqueue(session.sourceDeviceId, {
-      type: "recording_stop",
-      payload: { session_id: sessionId },
-    });
-    const acknowledgement = await this.commandBroker.waitForAcknowledgement(
-      session.sourceDeviceId,
-      command.command_id
-    );
-    if (!acknowledgement || acknowledgement.status !== "completed") {
-      this.logger?.warn?.("Host-triggered remote audio stop was not acknowledged", {
-        sessionId,
-        deviceId: session.sourceDeviceId,
-        acknowledgement,
+    let acknowledgement = null;
+    if (session.captureMode === "host_capture") {
+      this.pipeWireCapture.stop(sessionId);
+    } else {
+      const command = this.commandBroker.enqueue(session.sourceDeviceId, {
+        type: "recording_stop",
+        payload: { session_id: sessionId },
       });
+      acknowledgement = await this.commandBroker.waitForAcknowledgement(
+        session.sourceDeviceId,
+        command.command_id
+      );
+      if (!acknowledgement || acknowledgement.status !== "completed") {
+        this.logger?.warn?.("Host-triggered remote audio stop was not acknowledged", {
+          sessionId,
+          deviceId: session.sourceDeviceId,
+          acknowledgement,
+        });
+      }
     }
     session.status = "processing";
     this.sendToRenderer("external-recording-stop", {
@@ -1099,6 +1141,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       bytes: session.bytes,
       chunks: session.chunks,
     });
+    this.audioRouting.clearActiveRoute(triggerId);
     return { handled: true, session_id: sessionId, acknowledgement };
   }
 

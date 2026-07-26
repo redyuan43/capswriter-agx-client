@@ -225,6 +225,48 @@ test("device command poll returns commands for the requesting device", async (t)
   assert.equal(payload.command.payload.session_id, "remote-session");
 });
 
+test("MiniJoy host trigger captures native HFP PCM without browser recording", async (t) => {
+  const rendererEvents = [];
+  const { bridge } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  bridge.audioRouting.activateTrigger = () => ({
+    trigger_id: "minijoy_bt",
+    source_id: "pipewire:bluez_input.C8_85_41_68_39_0A",
+    source: {
+      node_name: "bluez_input.C8_85_41_68_39_0A.0",
+      online: true,
+    },
+    available: true,
+  });
+  bridge.audioRouting.clearActiveRoute = () => {};
+  bridge.pipeWireUnifiedSource.activate = () => {};
+  let emitChunk = null;
+  let stoppedSessionId = "";
+  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk) => {
+    emitChunk = onChunk;
+  };
+  bridge.pipeWireCapture.stop = (sessionId) => {
+    stoppedSessionId = sessionId;
+    return true;
+  };
+
+  const started = await bridge.handleHostTriggerDown("minijoy_bt", "42");
+  emitChunk(Buffer.from([1, 2, 3, 4]));
+  const stopped = await bridge.handleHostTriggerUp("minijoy_bt");
+
+  assert.equal(started.handled, true);
+  assert.equal(stopped.session_id, started.session_id);
+  assert.equal(stoppedSessionId, started.session_id);
+  assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-start",
+    "external-recording-chunk",
+    "external-recording-stop",
+  ]);
+  assert.equal(rendererEvents[2].payload.bytes, 4);
+  assert.equal(rendererEvents[2].payload.chunks, 1);
+});
+
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {
   let resolveStopDispatched;
   const stopDispatched = new Promise((resolve) => {
