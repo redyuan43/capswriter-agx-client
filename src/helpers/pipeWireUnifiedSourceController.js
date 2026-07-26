@@ -71,6 +71,22 @@ class PipeWireUnifiedSourceController {
       unified_source_name: UNIFIED_SOURCE_NAME,
     };
   }
+
+  deactivate() {
+    this.ensureBus();
+    this.unloadExistingLoopbacks();
+    this.command(["set-default-source", UNIFIED_SOURCE_NAME]);
+    const previousSource = this.activeSource;
+    this.activeSource = "";
+    this.logger?.info?.("Unified PipeWire input released", {
+      previousSource,
+      unifiedSource: UNIFIED_SOURCE_NAME,
+    });
+    return {
+      previous_source_node_name: previousSource,
+      unified_source_name: UNIFIED_SOURCE_NAME,
+    };
+  }
 }
 
 module.exports = PipeWireUnifiedSourceController;

@@ -241,6 +241,10 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   });
   bridge.audioRouting.clearActiveRoute = () => {};
   bridge.pipeWireUnifiedSource.activate = () => {};
+  let restoredDefaultSource = false;
+  bridge.restoreUnifiedDefaultSource = () => {
+    restoredDefaultSource = true;
+  };
   let emitChunk = null;
   let stoppedSessionId = "";
   bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk) => {
@@ -258,6 +262,7 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   assert.equal(started.handled, true);
   assert.equal(stopped.session_id, started.session_id);
   assert.equal(stoppedSessionId, started.session_id);
+  assert.equal(restoredDefaultSource, true);
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-start",
     "external-recording-chunk",
@@ -265,6 +270,46 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   ]);
   assert.equal(rendererEvents[2].payload.bytes, 4);
   assert.equal(rendererEvents[2].payload.chunks, 1);
+});
+
+test("keyboard host trigger captures native USB PCM without browser recording", async (t) => {
+  const rendererEvents = [];
+  const { bridge } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  bridge.audioRouting.activateTrigger = () => ({
+    trigger_id: "keyboard",
+    source_id: "pipewire:alsa_input.usb-mi-speakphone",
+    source: {
+      node_name: "alsa_input.usb-mi-speakphone.4",
+      online: true,
+    },
+    available: true,
+  });
+  bridge.audioRouting.clearActiveRoute = () => {};
+  bridge.pipeWireUnifiedSource.activate = () => {};
+  let restoredDefaultSource = false;
+  bridge.restoreUnifiedDefaultSource = () => {
+    restoredDefaultSource = true;
+  };
+  let emitChunk = null;
+  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk) => {
+    emitChunk = onChunk;
+  };
+  bridge.pipeWireCapture.stop = () => true;
+
+  const started = await bridge.handleHostTriggerDown("keyboard", "42");
+  emitChunk(Buffer.from([5, 6, 7, 8]));
+  await bridge.handleHostTriggerUp("keyboard");
+
+  assert.equal(started.handled, true);
+  assert.equal(restoredDefaultSource, true);
+  assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-start",
+    "external-recording-chunk",
+    "external-recording-stop",
+  ]);
+  assert.equal(rendererEvents[2].payload.bytes, 4);
 });
 
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {

@@ -31,3 +31,31 @@ test("unified source controller replaces its loopback and keeps one default sour
     args[0] === "unload-module" && args[1] === "11"
   ));
 });
+
+test("unified source controller releases its active loopback", () => {
+  const calls = [];
+  const controller = new PipeWireUnifiedSourceController({
+    runCommand(_command, args) {
+      calls.push(args);
+      if (args[0] === "-f") {
+        return JSON.stringify([{ name: "capswriter_input_bus" }]);
+      }
+      if (args[0] === "list") {
+        return "42\tmodule-loopback\tsource=bluez_input.test sink=capswriter_input_bus\n";
+      }
+      return "";
+    },
+  });
+  controller.activeSource = "bluez_input.test";
+
+  const result = controller.deactivate();
+
+  assert.deepEqual(result, {
+    previous_source_node_name: "bluez_input.test",
+    unified_source_name: "capswriter_input_bus.monitor",
+  });
+  assert.equal(controller.activeSource, "");
+  assert.ok(calls.some((args) =>
+    args[0] === "unload-module" && args[1] === "42"
+  ));
+});

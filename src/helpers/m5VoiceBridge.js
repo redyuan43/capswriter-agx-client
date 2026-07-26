@@ -854,6 +854,18 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     return true;
   }
 
+  restoreUnifiedDefaultSource() {
+    const sources = this.audioRouting.listSources();
+    const defaultSourceId = this.audioRouting.defaultSourceForTrigger("keyboard", sources);
+    const defaultSource = sources.find((source) => source.source_id === defaultSourceId);
+    if (defaultSource?.node_name) {
+      this.pipeWireUnifiedSource.activate(defaultSource.node_name);
+      return defaultSource;
+    }
+    this.pipeWireUnifiedSource.deactivate();
+    return null;
+  }
+
   async handleRecordingAudio(req, res, url) {
     const sessionId = String(url.searchParams.get("session_id") || "").trim();
     const chunkId = String(url.searchParams.get("chunk_id") || "").trim();
@@ -955,6 +967,8 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       bytes: session.bytes,
       chunks: session.chunks,
     });
+    this.audioRouting.clearActiveRoute(session.triggerId);
+    this.restoreUnifiedDefaultSource();
 
     const result = await this.waitForSessionResult(session);
     this.sendJson(res, 200, {
@@ -1021,7 +1035,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       if (route.available && route.source.node_name) {
         this.pipeWireUnifiedSource.activate(route.source.node_name);
       }
-      if (triggerId !== "minijoy_bt" || !route.available || !route.source.node_name) {
+      if (!route.available || !route.source.node_name) {
         return { handled: false, route };
       }
 
@@ -1142,6 +1156,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       chunks: session.chunks,
     });
     this.audioRouting.clearActiveRoute(triggerId);
+    this.restoreUnifiedDefaultSource();
     return { handled: true, session_id: sessionId, acknowledgement };
   }
 
