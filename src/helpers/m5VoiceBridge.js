@@ -432,8 +432,18 @@ document.getElementById("save-routes").addEventListener("click", async () => {
 </tr>`;
   }
 
-  requireToken(req) {
+  isLoopbackRequest(req) {
+    const remoteAddress = String(req?.socket?.remoteAddress || "").trim().toLowerCase();
+    return remoteAddress === "127.0.0.1" ||
+      remoteAddress === "::1" ||
+      remoteAddress === "::ffff:127.0.0.1";
+  }
+
+  requireToken(req, { allowLoopback = false } = {}) {
     if (!this.token) {
+      return;
+    }
+    if (allowLoopback && this.isLoopbackRequest(req)) {
       return;
     }
     const provided = String(req.headers["x-vibe-stick-token"] || "").trim();

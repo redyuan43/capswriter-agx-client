@@ -226,26 +226,23 @@ bash "$HOME/.cache/capswriter-installer/install-capswriter-agx-client.sh"
 
 ### Linux 输入权限
 
-如果 AGX/Jetson 上的 Right Shift 无响应，使用 evdev 后端：
+Linux 安装器默认会安装 udev `uaccess` 规则，让当前图形登录用户读取键盘事件和 `VibeStick MiniJoy Mouse`。它使普通 Right Shift 与 MiniJoy 蓝牙按键都能被 evdev 正确识别，并会在设备断开重连后自动恢复；不需要把用户加入全局 `input` 组。
+
+安装时需要一次 `sudo` 授权以写入 `/etc/udev/rules.d/70-capswriter-minijoy-input.rules`。如果不使用 MiniJoy，或不希望安装器修改系统输入权限，使用：
+
+```bash
+bash install-capswriter-agx-client.sh --skip-input-permission
+```
+
+如果刚安装规则但已连接的 MiniJoy 尚未生效，重新连接一次 MiniJoy 后重启 CapsWriter。
+
+其他 evdev 按键仍可使用：
 
 ```bash
 export CAPS_LISTENER_BACKEND=evdev
 ```
 
-evdev 后端需要读取 `/dev/input/event*`。把当前用户加入 `input` 组，并给当前会话临时 ACL：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y acl
-sudo usermod -aG input "$USER"
-sudo setfacl -m "u:$USER:r" /dev/input/event*
-```
-
-说明：
-
-- `usermod -aG input` 对后续登录会话生效，建议重新登录或重启桌面会话。
-- `setfacl` 让当前会话立即生效，但设备重建或重启后可能需要重新应用。
-- 如果日志出现 `EACCES`，说明当前用户还没有 `/dev/input/event*` 读取权限。
+如果日志出现 `EACCES`，检查 udev 规则是否已安装，以及当前会话是否由 systemd-logind 管理。
 
 验证日志：
 

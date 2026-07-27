@@ -2,13 +2,20 @@
 set -euo pipefail
 
 case "$(uname -m)" in
-  x86_64) expected_machine='Advanced Micro Devices X86-64' ;;
-  aarch64) expected_machine='AArch64' ;;
+  x86_64)
+    expected_machine='Advanced Micro Devices X86-64'
+    artifact_arch='x86_64'
+    ;;
+  aarch64)
+    expected_machine='AArch64'
+    artifact_arch='arm64'
+    ;;
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-appimage="$(find "dist" -maxdepth 1 -type f -name 'CapsWriter-GUI-*-linux-*.AppImage' -print -quit)"
-test -n "$appimage"
+version="$(node -p "require('./package.json').version")"
+appimage="dist/CapsWriter-GUI-${version}-linux-${artifact_arch}.AppImage"
+test -f "$appimage"
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 

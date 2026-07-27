@@ -144,6 +144,20 @@ test("health requires the configured token and returns bridge identity", async (
     bridge_version: "1.0.0",
     token_required: true,
   });
+
+  const localRoutingUpdate = await requestJson(port, "/audio/routing", {
+    method: "POST",
+    body: { version: 1, routes: { keyboard: { source_id: "pipewire:test" } } },
+  });
+  assert.equal(localRoutingUpdate.statusCode, 200);
+
+  assert.throws(
+    () => bridge.requireToken(
+      { headers: {}, socket: { remoteAddress: "::ffff:192.168.31.41" } },
+      { allowLoopback: true }
+    ),
+    { message: "unauthorized", statusCode: 401 }
+  );
 });
 
 test("HTTP routing preserves method and unknown-path responses", async (t) => {

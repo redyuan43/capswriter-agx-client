@@ -60,7 +60,7 @@ class M5VoiceBridgeRouter {
       return;
     }
 
-    bridge.requireToken(req);
+    bridge.requireToken(req, { allowLoopback: path === "/audio/routing" });
     if (path === "/event" || path === "/quota/refresh") {
       await bridge.handleEvent(req, res);
       return;

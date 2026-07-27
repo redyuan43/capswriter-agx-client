@@ -13,6 +13,9 @@ ICON_NAME="capswriter-agx-client.png"
 ICON_ID="capswriter-agx-client"
 AUTO_START=1
 LAUNCH_NOW=1
+CONFIGURE_INPUT_PERMISSION=1
+MINIJOY_UDEV_RULE_NAME="70-capswriter-minijoy-input.rules"
+MINIJOY_UDEV_RULE_PATH="/etc/udev/rules.d/${MINIJOY_UDEV_RULE_NAME}"
 
 usage() {
   cat <<'EOF'
@@ -25,6 +28,8 @@ Options:
   --install-dir PATH  Install AppImage under PATH.
   --no-autostart      Do not create the desktop-login autostart entry.
   --no-launch         Do not start the client after installation.
+  --skip-input-permission
+                      Do not install the MiniJoy input-device access rule.
   -h, --help          Show this help message.
 EOF
 }
@@ -43,6 +48,10 @@ while [ "$#" -gt 0 ]; do
       LAUNCH_NOW=0
       shift
       ;;
+    --skip-input-permission)
+      CONFIGURE_INPUT_PERMISSION=0
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -54,6 +63,31 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+configure_minijoy_input_permission() {
+  if [ "$CONFIGURE_INPUT_PERMISSION" -ne 1 ]; then
+    return
+  fi
+
+  if ! command -v udevadm >/dev/null 2>&1; then
+    echo "Warning: udevadm is unavailable; MiniJoy trackball input permission was not configured." >&2
+    echo "Re-run this installer on a systemd/udev Linux desktop, or use --skip-input-permission." >&2
+    return
+  fi
+
+  local rule_file="${TEMP_DIR}/${MINIJOY_UDEV_RULE_NAME}"
+  cat > "$rule_file" <<'EOF'
+# Allow the active graphical user to read keyboard events and the MiniJoy mouse event device.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="VibeStick MiniJoy Mouse", TAG+="uaccess"
+EOF
+
+  echo "Configuring MiniJoy trackball input permission..."
+  sudo install -m 0644 "$rule_file" "$MINIJOY_UDEV_RULE_PATH"
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger --subsystem-match=input --sysname-match="event*" --action=change
+  echo "MiniJoy input rule installed. Reconnect MiniJoy once if its current session does not pick up the new ACL."
+}
 
 case "$(uname -m)" in
   x86_64|amd64)
@@ -119,6 +153,8 @@ fi
 
 echo "Checksums verified."
 
+configure_minijoy_input_permission
+
 # Replace a previous AppImage instance before its on-disk payload is updated.
 mapfile -t RUNNING_PIDS < <(pgrep -u "$(id -u)" -f 'CapsWriter-GUI.*\.AppImage' || true)
 if [ "${#RUNNING_PIDS[@]}" -gt 0 ]; then
@@ -141,6 +177,7 @@ printf '%s\n' 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client"' 
 printf '%s\n' 'LOG_FILE="${LOG_DIR}/capswriter-agx-client.log"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'mkdir -p "$LOG_DIR"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi' >> "$LAUNCHER_PATH"
+printf '%s\n' 'export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_FILE" 2>&1' >> "$LAUNCHER_PATH"
 chmod 0755 "$LAUNCHER_PATH"
 

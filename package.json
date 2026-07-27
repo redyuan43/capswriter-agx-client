@@ -1,13 +1,13 @@
 {
   "name": "speech-transcription",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "语音转写-基于HTTP后端和可配置AI模型的中文语音转文字应用",
   "main": "main.js",
   "private": true,
   "scripts": {
     "start": "electron .",
     "dev": "concurrently -k -r \"npm:dev:renderer\" \"npm:dev:main\"",
-    "dev:main": "cross-env NODE_ENV=development ELECTRON_DISABLE_SANDBOX=1 electron . --dev --no-sandbox --disable-setuid-sandbox",
+    "dev:main": "cross-env NODE_ENV=development ELECTRON_DISABLE_SANDBOX=1 CAPS_LISTENER_BACKEND=evdev electron . --dev --no-sandbox --disable-setuid-sandbox",
     "dev:renderer": "cd src && vite",
     "preview": "cd src && vite preview",
     "build": "cd src && vite build && cd .. && electron-builder",
