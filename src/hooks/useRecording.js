@@ -11,6 +11,10 @@ import {
   stopMediaStreamTracks,
 } from '../helpers/audioCapturePolicy.mjs';
 import { isKnownSilentASRArtifactWithHotwords } from '../helpers/silentAsrArtifacts.js';
+import {
+  extractASRText,
+  selectRealtimeFinalTimeoutFallback,
+} from '../helpers/asrResultPolicy.mjs';
 
 const ACTIVE_SAMPLE_THRESHOLD = 0.0025;
 const SILENCE_PEAK_THRESHOLD = 0.0015;
@@ -702,20 +706,16 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           throw new Error('实时语音识别失败：未收到 18011 的最终结果');
         }
         const streamDonePayload = realtimePayload;
+        const recognizedText = extractASRText(streamDonePayload);
 
         transcriptionResult = {
           success: streamDonePayload?.success !== false,
-          text:
-            streamDonePayload?.final_text ||
-            streamDonePayload?.translated_text ||
-            streamDonePayload?.optimized_text ||
-            streamDonePayload?.asr_text ||
-            streamDonePayload?.text ||
-            '',
+          text: recognizedText,
           asr_text:
             streamDonePayload?.asr_text ||
             streamDonePayload?.text ||
-            '',
+            streamDonePayload?.partial_text ||
+            recognizedText,
           raw_asr_text: streamDonePayload?.raw_asr_text || '',
           duration: streamDonePayload?.duration || streamDonePayload?.timing?.audio_duration_s || 0,
           language: streamDonePayload?.language || 'zh-CN',
@@ -982,12 +982,24 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
               });
             }
           } catch (error) {
-            realtimeFailed = true;
-            realtimeFailedError = error || new Error('Realtime ASR final failed');
-            logRecordingDebug('warn', 'Realtime ASR final failed', {
-              error: error?.message || String(error),
-              finalTimeoutMs: realtimeFinalTimeoutMs,
-            });
+            const partialFallback = selectRealtimeFinalTimeoutFallback(
+              error,
+              realtimeSession?.getLatestTextPayload?.()
+            );
+            if (partialFallback) {
+              realtimePayload = partialFallback;
+              logRecordingDebug('warn', 'Realtime ASR final timed out; latest partial selected', {
+                textLength: String(partialFallback.text || partialFallback.partial_text || '').trim().length,
+                finalTimeoutMs: realtimeFinalTimeoutMs,
+              });
+            } else {
+              realtimeFailed = true;
+              realtimeFailedError = error || new Error('Realtime ASR final failed');
+              logRecordingDebug('warn', 'Realtime ASR final failed', {
+                error: error?.message || String(error),
+                finalTimeoutMs: realtimeFinalTimeoutMs,
+              });
+            }
             realtimeSession?.cancel();
           } finally {
             if (realtimeSessionRef.current === realtimeSession) {

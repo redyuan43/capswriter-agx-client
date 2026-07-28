@@ -38,7 +38,9 @@ class PipeWireCaptureController {
     });
     const capture = { child, stopping: false };
     child.on("close", (code, signal) => {
-      this.captures.delete(id);
+      if (this.captures.get(id) === capture) {
+        this.captures.delete(id);
+      }
       if (code && code !== 0) {
         this.logger?.warn?.("PipeWire capture exited", {
           sessionId: id,
@@ -59,7 +61,9 @@ class PipeWireCaptureController {
       }
     });
     child.on("error", (error) => {
-      this.captures.delete(id);
+      if (this.captures.get(id) === capture) {
+        this.captures.delete(id);
+      }
       this.logger?.warn?.("PipeWire capture failed", {
         sessionId: id,
         sourceId,

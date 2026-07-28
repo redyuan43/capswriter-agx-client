@@ -4,7 +4,20 @@ const test = require("node:test");
 const { once } = require("node:events");
 
 const M5VoiceBridge = require("../src/helpers/m5VoiceBridge");
-const { crc32Hex } = M5VoiceBridge;
+const { crc32Hex, withoutNestedBridgeState } = M5VoiceBridge;
+
+test("diagnostic state strips nested bridge snapshots", () => {
+  assert.deepEqual(withoutNestedBridgeState({
+    stage: "ready",
+    bridge: { state: { bluetooth: { last_diagnostic: {} } } },
+    before: { bridge: { available: true }, audio_status: "failed" },
+    after: [{ bridge: { available: true } }, { audio_status: "unknown" }],
+  }), {
+    stage: "ready",
+    before: { audio_status: "failed" },
+    after: [{}, { audio_status: "unknown" }],
+  });
+});
 
 function request(port, headers = {}) {
   return requestJson(port, "/health", { headers });
@@ -172,28 +185,41 @@ test("health requires the configured token and returns bridge identity", async (
   );
 });
 
-test("bridge state separates a live bridge from the MiniJoy PipeWire route", () => {
+test("bridge state requires verified MiniJoy audio instead of a residual PipeWire node", () => {
   const bridge = new M5VoiceBridge({
     logger: { warn() {}, error() {}, info() {} },
     windowManager: {},
     clipboardManager: {},
     sendToRenderer() {},
   });
-  bridge.getAudioRoutingState = () => ({
-    sources: [{
+  const source = {
       source_id: "pipewire:bluez_input.14_08_08_52_F9_62.0",
       name: "VibeStick MiniJoy F9:62",
       online: true,
+      enumerated: true,
+      transport_available: true,
+      audio_health: { status: "unknown" },
       bluetooth: true,
       bluetooth_address: "14080852f962",
-    }],
-  });
-  const state = bridge.buildState();
+  };
+  bridge.getAudioRoutingState = () => ({ sources: [source] });
+  let state = bridge.buildState();
   assert.equal(state.wifi, true);
-  assert.equal(state.ble, true);
-  assert.equal(state.bluetooth.stage, "pipewire");
+  assert.equal(state.ble, false);
+  assert.equal(state.bluetooth.stage, "audio_unverified");
+  assert.equal(state.bluetooth.pipewire_available, true);
   assert.equal(state.bluetooth.target_mac, "14:08:08:52:F9:62");
   assert.equal(state.bluetooth.source.source_id, "pipewire:bluez_input.14_08_08_52_F9_62.0");
+
+  source.audio_health = { status: "healthy", last_success_at: "2026-07-28T10:00:00.000Z" };
+  state = bridge.buildState();
+  assert.equal(state.ble, true);
+  assert.equal(state.bluetooth.stage, "ready");
+
+  source.audio_health = { status: "failed", failure_reason: "first_audio_chunk_timeout" };
+  state = bridge.buildState();
+  assert.equal(state.ble, false);
+  assert.equal(state.bluetooth.stage, "audio_capture_failed");
 });
 
 test("HTTP routing preserves method and unknown-path responses", async (t) => {
@@ -215,6 +241,63 @@ test("HTTP routing preserves method and unknown-path responses", async (t) => {
     success: false,
     error: "not found",
   });
+});
+
+test("loopback dashboard can inspect and repair one Bluetooth MAC", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  const device = {
+    mac: "C8:85:41:68:39:0A",
+    label: "MiniJoy 39:0A",
+    name: "VibeStick MiniJoy",
+    known: true,
+    paired: false,
+    bonded: false,
+    trusted: false,
+    connected: false,
+  };
+  bridge.bluetoothDevices.list = async () => [device];
+  bridge.bluetoothDevices.repair = async (mac, options) => ({
+    success: true,
+    stage: "connected",
+    device: { ...device, mac, connected: true },
+    confirmCleanup: options.confirmCleanup,
+  });
+
+  const listed = await requestJson(port, "/bluetooth/devices");
+  assert.equal(listed.statusCode, 200);
+  assert.deepEqual(JSON.parse(listed.body).devices, [device]);
+
+  const rejectedOrigin = await requestJson(port, "/bluetooth/repair", {
+    method: "POST",
+    headers: { Origin: "http://evil.example" },
+    body: { mac: device.mac },
+  });
+  assert.equal(rejectedOrigin.statusCode, 403);
+
+  const repaired = await requestJson(port, "/bluetooth/repair", {
+    method: "POST",
+    headers: { Origin: `http://127.0.0.1:${port}` },
+    body: { mac: device.mac, confirm_cleanup: true },
+  });
+  assert.equal(repaired.statusCode, 200);
+  assert.equal(JSON.parse(repaired.body).device.mac, device.mac);
+  assert.equal(JSON.parse(repaired.body).confirmCleanup, true);
+});
+
+test("dashboard inline script remains valid after server-side rendering", () => {
+  const bridge = new M5VoiceBridge({
+    logger: { warn() {}, error() {}, info() {} },
+    windowManager: {},
+    clipboardManager: {},
+    sendToRenderer() {},
+  });
+  const html = bridge.buildDashboardHtml();
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+
+  assert.equal(scripts.length, 1);
+  assert.doesNotThrow(() => new Function(scripts[0]));
+  assert.match(html, /音频输入路由/);
+  assert.match(html, /MiniJoy 蓝牙设备/);
 });
 
 test("M5 audio chunks are idempotent by chunk_id", async (t) => {
@@ -447,6 +530,10 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
 
   const started = await bridge.handleHostTriggerDown("minijoy_bt", "42");
   emitChunk(Buffer.from([1, 2, 3, 4]));
+  assert.equal(
+    bridge.audioRouting.captureHealthFor("pipewire:bluez_input.C8_85_41_68_39_0A").status,
+    "healthy"
+  );
   const stopped = await bridge.handleHostTriggerUp("minijoy_bt");
 
   assert.equal(started.handled, true);
@@ -460,6 +547,59 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   ]);
   assert.equal(rendererEvents[2].payload.bytes, 4);
   assert.equal(rendererEvents[2].payload.chunks, 1);
+});
+
+test("MiniJoy host capture with no PCM records an audio failure but remains retryable", async (t) => {
+  const { bridge, commands } = await startBridge(t);
+  let recoveryTimeoutMs = 0;
+  const runCommand = bridge.runCommand;
+  bridge.runCommand = (command, args, timeoutMs) => {
+    recoveryTimeoutMs = timeoutMs;
+    return runCommand(command, args);
+  };
+  const sourceId = "pipewire:bluez_input.C8_85_41_68_39_0A";
+  bridge.audioRouting.activateTrigger = () => ({
+    trigger_id: "minijoy_bt",
+    source_id: sourceId,
+    source: { node_name: "bluez_input.C8_85_41_68_39_0A.0", online: true },
+    available: true,
+  });
+  bridge.audioRouting.clearActiveRoute = () => {};
+  bridge.pipeWireUnifiedSource.activate = () => {};
+  bridge.pipeWireCapture.start = () => {};
+  bridge.pipeWireCapture.stop = () => true;
+  bridge.restoreUnifiedDefaultSource = () => {};
+  let finishCaptureCleanup;
+  bridge.waitForCaptureExit = () => new Promise((resolve) => {
+    finishCaptureCleanup = resolve;
+  });
+
+  const started = await bridge.handleHostTriggerDown("minijoy_bt", "42");
+  const stopped = await bridge.handleHostTriggerUp("minijoy_bt");
+
+  assert.equal(started.handled, true);
+  assert.equal(stopped.error, "recording contains no audio");
+  assert.equal(bridge.audioRouting.captureHealthFor(sourceId).status, "failed");
+  assert.equal(bridge.audioRouting.captureHealthFor(sourceId).failure_reason, "audio_input_empty");
+  assert.equal(commands.length, 0);
+  finishCaptureCleanup(true);
+  await waitFor(() => assert.equal(commands.length, 1));
+  assert.equal(commands[0].args.includes("repair"), true);
+  assert.equal(commands[0].args.includes("--audio-only"), true);
+  assert.equal(commands[0].args.includes("--recover-bluez"), true);
+  assert.equal(recoveryTimeoutMs, 180000);
+  assert.deepEqual(commands[0].args.slice(-2), ["--mac", "C8:85:41:68:39:0A"]);
+  assert.equal(
+    bridge.scheduleBluetoothAudioRecovery({ sourceId }, "audio_input_empty"),
+    false
+  );
+  assert.equal(
+    bridge.scheduleBluetoothAudioRecovery(
+      { sourceId: "pipewire:alsa_input.usb-microphone" },
+      "audio_input_empty"
+    ),
+    false
+  );
 });
 
 test("keyboard host trigger captures native USB PCM without browser recording", async (t) => {

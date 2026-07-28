@@ -66,12 +66,54 @@ class AudioRoutingManager {
     logger = null,
     runCommand = execFileSync,
     wifiDeviceProvider = () => [],
+    now = () => Date.now(),
   } = {}) {
     this.databaseManager = databaseManager;
     this.logger = logger;
     this.runCommand = runCommand;
     this.wifiDeviceProvider = wifiDeviceProvider;
+    this.now = now;
     this.activeRoutes = new Map();
+    this.captureHealth = new Map();
+  }
+
+  captureHealthFor(sourceId) {
+    return this.captureHealth.get(cleanId(sourceId)) || {
+      status: "unknown",
+      last_success_at: null,
+      last_failure_at: null,
+      failure_reason: "",
+    };
+  }
+
+  recordCaptureSuccess(sourceId, details = {}) {
+    const id = cleanId(sourceId);
+    if (!id) return null;
+    const previous = this.captureHealthFor(id);
+    const health = {
+      ...previous,
+      status: "healthy",
+      last_success_at: new Date(this.now()).toISOString(),
+      failure_reason: "",
+      last_success_bytes: Math.max(0, Number(details.bytes || 0)),
+    };
+    this.captureHealth.set(id, health);
+    return health;
+  }
+
+  recordCaptureFailure(sourceId, reason, details = {}) {
+    const id = cleanId(sourceId);
+    if (!id) return null;
+    const previous = this.captureHealthFor(id);
+    const health = {
+      ...previous,
+      status: "failed",
+      last_failure_at: new Date(this.now()).toISOString(),
+      failure_reason: cleanId(reason) || "audio_capture_failed",
+      failure_details: details && typeof details === "object" ? details : {},
+    };
+    this.captureHealth.set(id, health);
+    return health;
   }
 
   loadRoutes() {
@@ -126,8 +168,10 @@ class AudioRoutingManager {
             stable_node_name: stableName,
             properties,
           });
+          const sourceId = sourceIdForPipeWire(source);
+          const transportAvailable = String(source.state || "").toUpperCase() !== "UNAVAILABLE";
           return {
-            source_id: sourceIdForPipeWire(source),
+            source_id: sourceId,
             kind: "pipewire",
             node_name: nodeName,
             stable_node_name: stableName,
@@ -135,7 +179,10 @@ class AudioRoutingManager {
               ? `${description} ${bluetoothAddress.slice(-4, -2).toUpperCase()}:${bluetoothAddress.slice(-2).toUpperCase()}`
               : description,
             base_name: description,
-            online: String(source.state || "").toUpperCase() !== "UNAVAILABLE",
+            enumerated: true,
+            transport_available: transportAvailable,
+            online: transportAvailable,
+            audio_health: this.captureHealthFor(sourceId),
             bluetooth,
             bluetooth_address: bluetoothAddress,
             trigger_id: bluetooth ? miniJoyTriggerId(bluetoothAddress) : "",
@@ -212,7 +259,7 @@ class AudioRoutingManager {
       source_id: sourceId,
       source,
       trigger_name: miniJoyTriggerLabel(cleanTriggerId),
-      available: Boolean(sourceId && source.online),
+      available: Boolean(sourceId && (source.transport_available ?? source.online)),
     };
   }
 

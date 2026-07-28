@@ -17,6 +17,16 @@ export function isUsableASRPayload(payload) {
   return Boolean(extractASRText(payload) || payload.voice_command_applied === true);
 }
 
+export function selectRealtimeFinalTimeoutFallback(error, latestPayload) {
+  if (error?.code !== "REALTIME_ASR_FINAL_TIMEOUT" ||
+      error?.realtimePayload || error?.realtimeReason) {
+    return null;
+  }
+  return isUsableASRPayload(latestPayload)
+    ? { ...latestPayload, partial_fallback: true }
+    : null;
+}
+
 export function createRealtimeProtocolError(payload, fallbackMessage) {
   const error = new Error(
     payload?.error ||

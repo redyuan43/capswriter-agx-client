@@ -80,12 +80,25 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.run_id }}
 
-      - name: Prepare Linux desktop icon
-        run: cp assets/tray-icon.png release-assets/capswriter-agx-client.png
+      - name: Prepare Linux installation assets
+        run: |
+          cp assets/tray-icon.png release-assets/capswriter-agx-client.png
+          cp scripts/m5bridge-doctor.py release-assets/m5bridge-doctor.py
+          cp scripts/capswriter-m5-recover-bluetooth release-assets/capswriter-m5-recover-bluetooth
+          cp scripts/com.speechtranscription.m5-recover.policy release-assets/com.speechtranscription.m5-recover.policy
+          cp scripts/49-capswriter-m5-recover.rules release-assets/49-capswriter-m5-recover.rules
 
       - name: Generate checksums
         working-directory: release-assets
-        run: sha256sum CapsWriter-GUI-*.AppImage capswriter-agx-client.png > SHA256SUMS.txt
+        run: |
+          sha256sum \
+            CapsWriter-GUI-*.AppImage \
+            capswriter-agx-client.png \
+            m5bridge-doctor.py \
+            capswriter-m5-recover-bluetooth \
+            com.speechtranscription.m5-recover.policy \
+            49-capswriter-m5-recover.rules \
+            > SHA256SUMS.txt
 
       - name: Prepare Linux installer
         env:
@@ -130,6 +143,10 @@ jobs:
             gh release upload "${RELEASE_TAG}" \
               release-assets/CapsWriter-GUI-*.AppImage \
               release-assets/capswriter-agx-client.png \
+              release-assets/m5bridge-doctor.py \
+              release-assets/capswriter-m5-recover-bluetooth \
+              release-assets/com.speechtranscription.m5-recover.policy \
+              release-assets/49-capswriter-m5-recover.rules \
               release-assets/SHA256SUMS.txt \
               release-assets/install-capswriter-agx-client.sh \
               --clobber
@@ -137,6 +154,10 @@ jobs:
             gh release create "${RELEASE_TAG}" \
               release-assets/CapsWriter-GUI-*.AppImage \
               release-assets/capswriter-agx-client.png \
+              release-assets/m5bridge-doctor.py \
+              release-assets/capswriter-m5-recover-bluetooth \
+              release-assets/com.speechtranscription.m5-recover.policy \
+              release-assets/49-capswriter-m5-recover.rules \
               release-assets/SHA256SUMS.txt \
               release-assets/install-capswriter-agx-client.sh \
               --title "CapsWriter AGX Client ${RELEASE_TAG#v}" \

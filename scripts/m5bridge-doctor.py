@@ -119,18 +119,84 @@ def bluez_info(mac: str) -> dict:
 
 
 def pipewire_source(mac: str) -> dict:
-    result = run("wpctl", "status")
-    normalized = mac.replace(":", "_").lower()
-    return {"available": normalized in result["stdout"].lower(),
-            "raw": result["stdout"] if result["ok"] else result["stderr"]}
+    result = run("pactl", "-f", "json", "list", "sources")
+    normalized = mac.replace(":", "").replace("_", "").lower()
+    try:
+        sources = json.loads(result["stdout"] or "[]")
+    except json.JSONDecodeError:
+        sources = []
+    for source in sources:
+        properties = source.get("properties") or {}
+        node_name = str(source.get("name") or properties.get("node.name") or "")
+        address = str(properties.get("api.bluez5.address") or "")
+        identity = (address or node_name).replace(":", "").replace("_", "").lower()
+        if normalized not in identity:
+            continue
+        state = str(source.get("state") or "UNKNOWN").upper()
+        return {
+            "enumerated": True,
+            "available": state != "UNAVAILABLE",
+            "node_name": node_name,
+            "state": state,
+            "raw": source,
+        }
+    return {"enumerated": False, "available": False, "node_name": "",
+            "state": "MISSING", "raw": result["stderr"].strip()}
 
 
 def bridge_state(url: str) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=3) as response:
-            return {"available": True, "state": json.load(response)}
+            state = json.load(response)
+            bluetooth = state.get("bluetooth") or {}
+            return {
+                "available": True,
+                "state": {
+                    "ble": bool(state.get("ble")),
+                    "bluetooth": {
+                        "target_mac": bluetooth.get("target_mac", ""),
+                        "stage": bluetooth.get("stage", ""),
+                        "ready": bool(bluetooth.get("ready")),
+                        "audio_status": bluetooth.get("audio_status", "unknown"),
+                    },
+                },
+            }
     except Exception as error:  # noqa: BLE001 - return diagnostics to caller
         return {"available": False, "error": str(error)}
+
+
+def bridge_audio_status(bridge_result: dict, mac: str) -> str:
+    state = bridge_result.get("state") or {}
+    bluetooth = state.get("bluetooth") or {}
+    target = str(bluetooth.get("target_mac") or "").replace(":", "").lower()
+    normalized = mac.replace(":", "").lower()
+    if not target or target == normalized:
+        status = str(bluetooth.get("audio_status") or "").lower()
+        if status in {"healthy", "failed", "unknown", "unavailable"}:
+            return status
+    return "unknown"
+
+
+def diagnostic_stage(m5: dict, bluez: dict, source: dict,
+                     bridge_result: dict, mac: str) -> str:
+    if not m5.get("ok"):
+        return "serial"
+    if not bluez["known"]:
+        return "bluez_discovery"
+    if not bluez["paired"] or not bluez["bonded"]:
+        return "bluez_bond"
+    if not bluez["connected"]:
+        return "hid_hfp"
+    if not source["available"]:
+        return "pipewire_source_missing"
+    if not bridge_result.get("available"):
+        return "bridge"
+    audio_status = bridge_audio_status(bridge_result, mac)
+    if audio_status == "healthy":
+        return "ready"
+    if audio_status == "failed":
+        return "audio_capture_failed"
+    return "audio_unverified"
 
 
 def diagnose(port: str, mac: str, bridge: str) -> dict:
@@ -138,18 +204,11 @@ def diagnose(port: str, mac: str, bridge: str) -> dict:
     bluez = bluez_info(mac)
     source = pipewire_source(mac)
     bridge_result = bridge_state(bridge)
-    stage = "serial"
-    if m5.get("ok"):
-        stage = "bluez_discovery" if not bluez["known"] else "bluez_bond"
-        if bluez["paired"] and bluez["bonded"]:
-            stage = "hid_hfp" if not bluez["connected"] else "pipewire"
-        if source["available"]:
-            stage = "bridge"
-        if bridge_result.get("state", {}).get("ble"):
-            stage = "ready"
+    stage = diagnostic_stage(m5, bluez, source, bridge_result, mac)
     return {"ok": stage == "ready", "stage": stage, "m5": m5,
             "bluez": bluez, "pipewire": source,
-            "bridge": bridge_result}
+            "bridge": bridge_result,
+            "audio_status": bridge_audio_status(bridge_result, mac)}
 
 
 def bluetooth_pair(mac: str) -> dict:
@@ -214,31 +273,233 @@ def bluetooth_pair(mac: str) -> dict:
     return {"pair": pair, "state": state}
 
 
-def repair(port: str, mac: str, bridge: str, recover_bluez: bool) -> dict:
+def wait_for_bluez_connection(mac: str, connected: bool,
+                              timeout: float = 8.0) -> dict:
+    deadline = time.monotonic() + timeout
+    state = bluez_info(mac)
+    while state["connected"] != connected and time.monotonic() < deadline:
+        time.sleep(0.5)
+        state = bluez_info(mac)
+    return state
+
+
+def wait_for_pipewire_source(mac: str, timeout: float = 8.0) -> dict:
+    deadline = time.monotonic() + timeout
+    source = pipewire_source(mac)
+    while not source["available"] and time.monotonic() < deadline:
+        time.sleep(0.5)
+        source = pipewire_source(mac)
+    return source
+
+
+def connect_bluetooth(mac: str, attempts: int = 3,
+                      always_attempt: bool = False) -> dict:
+    commands = []
+    state = bluez_info(mac)
+    for _ in range(max(1, attempts)):
+        if state["connected"] and not always_attempt:
+            return {"ok": True, "commands": commands, "state": state}
+        command = run("bluetoothctl", "connect", mac)
+        commands.append(command)
+        state = wait_for_bluez_connection(mac, True, timeout=6)
+        if command["ok"] and state["connected"]:
+            return {"ok": True, "commands": commands, "state": state}
+        always_attempt = True
+        time.sleep(1)
+    return {"ok": False, "commands": commands, "state": state}
+
+
+def restart_audio_stack() -> dict:
+    return run(
+        "systemctl", "--user", "restart",
+        "pipewire.service", "pipewire-pulse.service", "wireplumber.service",
+        timeout=30,
+    )
+
+
+def recover_audio_stack(mac: str) -> dict:
+    audio_stack = restart_audio_stack()
+    source = wait_for_pipewire_source(mac, timeout=15) if audio_stack["ok"] else {
+        "available": False, "enumerated": False, "state": "MISSING",
+    }
+    bluetooth = None
+    if audio_stack["ok"] and not source["available"]:
+        state = bluez_info(mac)
+        bluetooth = connect_bluetooth(mac, always_attempt=state["connected"])
+        source = wait_for_pipewire_source(mac, timeout=15)
+    state = bluez_info(mac)
+    ok = audio_stack["ok"] and state["connected"] and source["available"]
+    return {
+        "ok": ok,
+        "audio_stack": audio_stack,
+        "bluetooth": bluetooth,
+        "bluez": state,
+        "pipewire": source,
+    }
+
+
+def recover_audio_stack_with_bluez(mac: str, recover_bluez: bool) -> dict:
+    initial = recover_audio_stack(mac)
+    if initial["ok"] or not recover_bluez:
+        return {**initial, "bluez_recovery": None}
+    bluez_recovery = run("pkexec", RECOVERY_HELPER, timeout=30)
+    if not bluez_recovery["ok"]:
+        return {**initial, "bluez_recovery": bluez_recovery}
+    time.sleep(2)
+    recovered = recover_audio_stack(mac)
+    return {
+        **recovered,
+        "initial_recovery": initial,
+        "bluez_recovery": bluez_recovery,
+    }
+
+
+def load_previous_state(state_file: str) -> dict:
+    try:
+        with open(state_file, encoding="utf-8") as handle:
+            value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def recovery_cooldown(previous: dict, now_epoch: float, cooldown_seconds: int) -> int:
+    recovery = previous.get("recovery") or {}
+    attempted_at = float(recovery.get("attempted_at_epoch") or 0)
+    if not recovery.get("attempted") or attempted_at <= 0:
+        return 0
+    return max(0, int(attempted_at + cooldown_seconds - now_epoch))
+
+
+def audio_only_diagnose(mac: str, bridge: str) -> dict:
+    bluez = bluez_info(mac)
+    source = pipewire_source(mac)
+    bridge_result = bridge_state(bridge)
+    if not bluez["known"]:
+        stage = "bluez_discovery"
+    elif not bluez["paired"] or not bluez["bonded"]:
+        stage = "bluez_bond"
+    elif not bluez["connected"]:
+        stage = "hid_hfp"
+    elif not source["available"]:
+        stage = "pipewire_source_missing"
+    elif not bridge_result.get("available"):
+        stage = "bridge"
+    else:
+        status = bridge_audio_status(bridge_result, mac)
+        stage = {"healthy": "ready", "failed": "audio_capture_failed"}.get(
+            status, "audio_unverified")
+    return {
+        "ok": stage == "ready",
+        "stage": stage,
+        "bluez": bluez,
+        "pipewire": source,
+        "bridge": bridge_result,
+        "audio_status": bridge_audio_status(bridge_result, mac),
+    }
+
+
+def repair_audio_only(mac: str, bridge: str, previous: dict | None = None,
+                      cooldown_seconds: int = 60,
+                      now_epoch: float | None = None,
+                      recover_bluez: bool = False) -> dict:
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    before = audio_only_diagnose(mac, bridge)
+    recovery = None
+    if before["stage"] == "hid_hfp":
+        connected = connect_bluetooth(mac)
+        recovery = {
+            "attempted": True,
+            "attempted_at_epoch": now_epoch,
+            "action": "connect",
+            "ok": connected["ok"],
+            "result": connected,
+        }
+    elif before["stage"] in {"pipewire_source_missing", "audio_capture_failed"}:
+        remaining = recovery_cooldown(previous or {}, now_epoch, cooldown_seconds)
+        if remaining:
+            recovery = {
+                "attempted": False,
+                "action": "audio_stack_restart_and_bluetooth_reconnect",
+                "reason": "cooldown",
+                "cooldown_remaining_seconds": remaining,
+            }
+        else:
+            recovered = recover_audio_stack_with_bluez(mac, recover_bluez)
+            recovery = {
+                "attempted": True,
+                "attempted_at_epoch": now_epoch,
+                "action": "audio_stack_restart_and_bluetooth_reconnect",
+                "pending_audio_verification": recovered["ok"],
+                **recovered,
+            }
+    after = audio_only_diagnose(mac, bridge)
+    return {"ok": after["ok"], "audio_only": True,
+            "recovery": recovery, "before": before, "after": after}
+
+
+def repair(port: str, mac: str, bridge: str, recover_bluez: bool,
+           previous: dict | None = None, cooldown_seconds: int = 60,
+           now_epoch: float | None = None) -> dict:
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    previous = previous or {}
     before = diagnose(port, mac, bridge)
+    bluez_recovery = None
     recovery = None
     if recover_bluez and before["m5"].get("pairing") and not before["bluez"]["known"]:
-        recovery = run("pkexec", RECOVERY_HELPER, timeout=30)
-        if recovery["ok"]:
+        bluez_recovery = run("pkexec", RECOVERY_HELPER, timeout=30)
+        if bluez_recovery["ok"]:
             time.sleep(2)
             before = diagnose(port, mac, bridge)
     m5_paired = bool(before["m5"].get("paired"))
     host_paired = before["bluez"]["paired"] and before["bluez"]["bonded"]
     reset = m5_paired != host_paired
+    pairing = None
     if reset:
         run("bluetoothctl", "remove", mac)
         response = m5ctl(port, "RESET_PAIRING")
         if not response.get("ok"):
             return {"ok": False, "stage": "m5_reset_pairing", "before": before,
                     "m5_response": response}
+        pairing = bluetooth_pair(mac)
     elif not m5_paired:
         response = m5ctl(port, "PAIR 180")
         if not response.get("ok"):
             return {"ok": False, "stage": "m5_pairing", "before": before,
                     "m5_response": response}
-    pairing = bluetooth_pair(mac)
+        pairing = bluetooth_pair(mac)
+    elif not before["bluez"]["connected"]:
+        run("bluetoothctl", "trust", mac)
+        connected = connect_bluetooth(mac)
+        recovery = {
+            "attempted": True,
+            "attempted_at_epoch": now_epoch,
+            "action": "connect",
+            "ok": connected["ok"],
+            "result": connected,
+        }
+    elif before["stage"] in {"pipewire_source_missing", "audio_capture_failed"}:
+        remaining = recovery_cooldown(previous, now_epoch, cooldown_seconds)
+        if remaining:
+            recovery = {
+                "attempted": False,
+                "action": "bluetooth_reconnect",
+                "reason": "cooldown",
+                "cooldown_remaining_seconds": remaining,
+            }
+        else:
+            recovered = recover_audio_stack_with_bluez(mac, recover_bluez)
+            recovery = {
+                "attempted": True,
+                "attempted_at_epoch": now_epoch,
+                "action": "audio_stack_restart_and_bluetooth_reconnect",
+                "pending_audio_verification": recovered["ok"],
+                **recovered,
+            }
     after = diagnose(port, mac, bridge)
-    return {"ok": after["ok"], "reset_pairing": reset, "bluez_recovery": recovery, "before": before,
+    return {"ok": after["ok"], "reset_pairing": reset,
+            "bluez_recovery": bluez_recovery,
+            "recovery": recovery, "before": before,
             "pairing": pairing, "after": after}
 
 
@@ -251,10 +512,31 @@ def main() -> int:
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--recover-bluez", action="store_true",
                         help="BlueZ cannot discover a pairing M5时，调用受限恢复助手")
+    parser.add_argument("--audio-only", action="store_true",
+                        help="只恢复主机蓝牙音频栈，不访问 M5 串口或修改配对信息")
+    parser.add_argument("--recovery-cooldown", type=int, default=60,
+                        help="重复音频栈恢复的最短间隔秒数（默认 60）")
     args = parser.parse_args()
     try:
-        port = serial_port(args.port)
-        result = diagnose(port, args.mac.upper(), args.bridge) if args.action == "diagnose" else repair(port, args.mac.upper(), args.bridge, args.recover_bluez)
+        previous = load_previous_state(args.state_file)
+        if args.action == "diagnose":
+            port = serial_port(args.port)
+            result = diagnose(port, args.mac.upper(), args.bridge)
+            if previous.get("recovery"):
+                result["recovery"] = previous["recovery"]
+        elif args.audio_only:
+            result = repair_audio_only(
+                args.mac.upper(), args.bridge, previous=previous,
+                cooldown_seconds=max(0, args.recovery_cooldown),
+                recover_bluez=args.recover_bluez,
+            )
+        else:
+            port = serial_port(args.port)
+            result = repair(
+                port, args.mac.upper(), args.bridge, args.recover_bluez,
+                previous=previous,
+                cooldown_seconds=max(0, args.recovery_cooldown),
+            )
     except Exception as error:  # noqa: BLE001 - CLI should return structured failures
         result = {"ok": False, "stage": "setup", "error": str(error)}
     try:

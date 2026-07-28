@@ -22,6 +22,7 @@ import { isExactSilentASRArtifactText } from "../../helpers/silentAsrArtifacts.j
 import {
   extractASRText,
   isUsableASRPayload,
+  selectRealtimeFinalTimeoutFallback,
 } from "../../helpers/asrResultPolicy.mjs";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -2258,11 +2259,26 @@ export default function FloatingBallApp() {
               );
             }
           } catch (error) {
-            realtimeError = error;
-            logRuntime("warn", "External M5 realtime final failed", {
-              sessionId,
-              error: error?.message || String(error),
-            });
+            const partialFallback = selectRealtimeFinalTimeoutFallback(
+              error,
+              realtimeSession.getLatestTextPayload?.()
+            );
+            if (partialFallback) {
+              finalPayload = partialFallback;
+              resultSource = "realtime_partial_timeout_fallback";
+              realtimeError = null;
+              logRuntime("warn", "External M5 realtime final timed out; latest partial selected", {
+                sessionId,
+                textLength: extractASRText(partialFallback).length,
+                error: error?.message || String(error),
+              });
+            } else {
+              realtimeError = error;
+              logRuntime("warn", "External M5 realtime final failed", {
+                sessionId,
+                error: error?.message || String(error),
+              });
+            }
           }
         }
       } else if (!realtimeError) {

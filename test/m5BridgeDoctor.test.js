@@ -1,0 +1,237 @@
+const assert = require("node:assert/strict");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const test = require("node:test");
+
+const doctorPath = path.resolve(__dirname, "../scripts/m5bridge-doctor.py");
+
+function runPython(body) {
+  const script = `
+import importlib.util
+import json
+import sys
+spec = importlib.util.spec_from_file_location("m5bridge_doctor", sys.argv[1])
+doctor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(doctor)
+${body}
+`;
+  const result = spawnSync("python3", ["-c", script, doctorPath], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test("doctor classifies residual PipeWire nodes by recent capture health", () => {
+  const result = runPython(`
+m5 = {"ok": True}
+bluez = {"known": True, "paired": True, "bonded": True, "connected": True}
+source = {"enumerated": True, "available": True}
+def bridge(status):
+    return {"available": True, "state": {"bluetooth": {
+        "target_mac": "14:08:08:52:F9:62", "audio_status": status}}}
+print(json.dumps({
+    "unknown": doctor.diagnostic_stage(m5, bluez, source, bridge("unknown"), "14:08:08:52:F9:62"),
+    "failed": doctor.diagnostic_stage(m5, bluez, source, bridge("failed"), "14:08:08:52:F9:62"),
+    "healthy": doctor.diagnostic_stage(m5, bluez, source, bridge("healthy"), "14:08:08:52:F9:62"),
+}))
+`);
+  assert.deepEqual(result, {
+    unknown: "audio_unverified",
+    failed: "audio_capture_failed",
+    healthy: "ready",
+  });
+});
+
+test("doctor reconnects a stale audio stack once and then observes cooldown", () => {
+  const result = runPython(`
+before = {
+    "ok": False, "stage": "audio_capture_failed", "m5": {"ok": True, "paired": True},
+    "bluez": {"known": True, "paired": True, "bonded": True, "connected": True},
+    "pipewire": {"available": True}, "audio_status": "failed",
+}
+after = dict(before)
+diagnoses = [before, after]
+doctor.diagnose = lambda *args: diagnoses.pop(0)
+calls = []
+doctor.recover_audio_stack_with_bluez = lambda mac, allowed: calls.append([mac, allowed]) or {
+    "ok": True, "audio_stack": {"ok": True}, "bluetooth": None,
+    "bluez": {"connected": True}, "pipewire": {"available": True},
+}
+doctor.time.sleep = lambda _seconds: None
+first = doctor.repair("serial", "14:08:08:52:F9:62", "bridge", False,
+                      previous={}, cooldown_seconds=60, now_epoch=100)
+
+diagnoses[:] = [before, after]
+doctor.recover_audio_stack_with_bluez = lambda mac, allowed: (_ for _ in ()).throw(
+    RuntimeError("must not recover"))
+second = doctor.repair("serial", "14:08:08:52:F9:62", "bridge", False,
+                       previous=first, cooldown_seconds=60, now_epoch=110)
+print(json.dumps({"first": first["recovery"], "second": second["recovery"], "calls": calls}))
+`);
+  assert.equal(result.first.action, "audio_stack_restart_and_bluetooth_reconnect");
+  assert.equal(result.first.attempted, true);
+  assert.equal(result.first.pending_audio_verification, true);
+  assert.deepEqual(result.calls, [["14:08:08:52:F9:62", false]]);
+  assert.equal(result.second.attempted, false);
+  assert.equal(result.second.reason, "cooldown");
+  assert.equal(result.second.cooldown_remaining_seconds, 50);
+});
+
+test("doctor audio-only recovery does not require or modify M5 serial pairing", () => {
+  const result = runPython(`
+before = {"ok": False, "stage": "audio_capture_failed", "audio_status": "failed"}
+after = {"ok": False, "stage": "audio_unverified", "audio_status": "unknown"}
+diagnoses = [before, after]
+doctor.audio_only_diagnose = lambda *args: diagnoses.pop(0)
+doctor.m5ctl = lambda *args: (_ for _ in ()).throw(RuntimeError("must not access serial"))
+doctor.bluetooth_pair = lambda *args: (_ for _ in ()).throw(RuntimeError("must not pair"))
+doctor.recover_audio_stack_with_bluez = lambda mac, allowed: {
+    "ok": True, "audio_stack": {"ok": True}, "bluetooth": None,
+    "bluez": {"connected": True}, "pipewire": {"available": True},
+}
+doctor.time.sleep = lambda _seconds: None
+value = doctor.repair_audio_only("14:08:08:52:F9:62", "bridge", now_epoch=100)
+print(json.dumps(value))
+`);
+  assert.equal(result.audio_only, true);
+  assert.equal(result.recovery.attempted, true);
+  assert.equal(result.recovery.pending_audio_verification, true);
+  assert.equal(result.recovery.action, "audio_stack_restart_and_bluetooth_reconnect");
+});
+
+test("doctor lets PipeWire re-enumerate before disrupting Bluetooth", () => {
+  const result = runPython(`
+calls = []
+doctor.restart_audio_stack = lambda: calls.append("restart") or {"ok": True}
+doctor.wait_for_pipewire_source = lambda mac, timeout: calls.append(["source", timeout]) or {
+    "available": True, "enumerated": True, "state": "SUSPENDED",
+}
+doctor.connect_bluetooth = lambda *args, **kwargs: (_ for _ in ()).throw(
+    RuntimeError("must not reconnect a recovered link"))
+doctor.bluez_info = lambda mac: {"connected": True}
+value = doctor.recover_audio_stack("14:08:08:52:F9:62")
+print(json.dumps({"value": value, "calls": calls}))
+`);
+  assert.equal(result.value.ok, true);
+  assert.equal(result.value.bluetooth, null);
+  assert.deepEqual(result.calls, ["restart", ["source", 15]]);
+});
+
+test("doctor reconnects only after PipeWire fails to re-enumerate", () => {
+  const result = runPython(`
+calls = []
+sources = [
+    {"available": False, "enumerated": False, "state": "MISSING"},
+    {"available": True, "enumerated": True, "state": "SUSPENDED"},
+]
+doctor.restart_audio_stack = lambda: {"ok": True}
+doctor.wait_for_pipewire_source = lambda mac, timeout: calls.append(
+    ["source", timeout]) or sources.pop(0)
+doctor.connect_bluetooth = lambda mac, **kwargs: calls.append(
+    ["connect", mac, kwargs.get("always_attempt")]) or {"ok": True}
+doctor.bluez_info = lambda mac: {"connected": True}
+value = doctor.recover_audio_stack("14:08:08:52:F9:62")
+print(json.dumps({"value": value, "calls": calls}))
+`);
+  assert.equal(result.value.ok, true);
+  assert.deepEqual(result.calls, [
+    ["source", 15],
+    ["connect", "14:08:08:52:F9:62", true],
+    ["source", 15],
+  ]);
+});
+
+test("doctor escalates to the restricted BlueZ helper only after ordinary recovery fails", () => {
+  const result = runPython(`
+recoveries = [
+    {"ok": False, "audio_stack": {"ok": True}},
+    {"ok": True, "audio_stack": {"ok": True}},
+]
+calls = []
+doctor.recover_audio_stack = lambda mac: calls.append(["audio", mac]) or recoveries.pop(0)
+doctor.run = lambda *args, **kwargs: calls.append(list(args)) or {"ok": True}
+doctor.time.sleep = lambda seconds: calls.append(["sleep", seconds])
+value = doctor.recover_audio_stack_with_bluez("14:08:08:52:F9:62", True)
+print(json.dumps({"value": value, "calls": calls}))
+`);
+  assert.equal(result.value.ok, true);
+  assert.equal(result.value.bluez_recovery.ok, true);
+  assert.deepEqual(result.calls, [
+    ["audio", "14:08:08:52:F9:62"],
+    ["pkexec", "/usr/libexec/capswriter-m5-recover-bluetooth"],
+    ["sleep", 2],
+    ["audio", "14:08:08:52:F9:62"],
+  ]);
+});
+
+test("doctor retries Bluetooth connect after a locally aborted attempt", () => {
+  const result = runPython(`
+states = [{"connected": False}]
+waits = [{"connected": False}, {"connected": True}]
+commands = []
+results = [{"ok": False}, {"ok": True}]
+doctor.bluez_info = lambda mac: states.pop(0)
+doctor.wait_for_bluez_connection = lambda mac, connected, timeout: waits.pop(0)
+doctor.run = lambda *args, **kwargs: commands.append(list(args)) or results.pop(0)
+doctor.time.sleep = lambda _seconds: None
+value = doctor.connect_bluetooth("14:08:08:52:F9:62", attempts=3)
+print(json.dumps({"value": value, "commands": commands}))
+`);
+  assert.equal(result.value.ok, true);
+  assert.equal(result.value.commands.length, 2);
+  assert.equal(result.commands.length, 2);
+});
+
+test("doctor reads the target source state from pactl JSON", () => {
+  const result = runPython(`
+payload = [{
+    "name": "bluez_input.14_08_08_52_F9_62.0",
+    "state": "SUSPENDED",
+    "properties": {"api.bluez5.address": "14:08:08:52:F9:62"},
+}]
+doctor.run = lambda *args, **kwargs: {"ok": True, "stdout": json.dumps(payload), "stderr": ""}
+print(json.dumps(doctor.pipewire_source("14:08:08:52:F9:62")))
+`);
+  assert.equal(result.enumerated, true);
+  assert.equal(result.available, true);
+  assert.equal(result.state, "SUSPENDED");
+  assert.equal(result.node_name, "bluez_input.14_08_08_52_F9_62.0");
+});
+
+test("doctor keeps only the bridge audio summary to prevent recursive state growth", () => {
+  const result = runPython(`
+class Response:
+    def __enter__(self):
+        return self
+    def __exit__(self, *_args):
+        return None
+    def read(self):
+        return json.dumps({
+            "ble": True,
+            "recording": {"status": "idle"},
+            "bluetooth": {
+                "target_mac": "14:08:08:52:F9:62",
+                "stage": "ready",
+                "ready": True,
+                "audio_status": "healthy",
+                "last_diagnostic": {"bridge": {"state": {"bluetooth": {}}}},
+            },
+        }).encode()
+doctor.urllib.request.urlopen = lambda *_args, **_kwargs: Response()
+print(json.dumps(doctor.bridge_state("http://127.0.0.1:8765/state")))
+`);
+  assert.deepEqual(result, {
+    available: true,
+    state: {
+      ble: true,
+      bluetooth: {
+        target_mac: "14:08:08:52:F9:62",
+        stage: "ready",
+        ready: true,
+        audio_status: "healthy",
+      },
+    },
+  });
+  assert.equal(JSON.stringify(result).includes("last_diagnostic"), false);
+});

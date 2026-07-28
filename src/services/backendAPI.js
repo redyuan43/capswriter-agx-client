@@ -185,10 +185,14 @@ function float32ToInt16LE(samples) {
   return buffer;
 }
 
-function withClientTimeout(promise, timeoutMs, message) {
+function withClientTimeout(promise, timeoutMs, message, code = "CLIENT_TIMEOUT") {
   let timerId = null;
   const timeout = new Promise((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timerId = setTimeout(() => {
+      const error = new Error(message);
+      error.code = code;
+      reject(error);
+    }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => {
     if (timerId !== null) {
@@ -735,7 +739,8 @@ export class PCMRealtimeSession {
     const payload = await withClientTimeout(
       this.finalPromise,
       timeoutMs,
-      `Realtime ASR final timeout (${timeoutMs}ms)`
+      `Realtime ASR final timeout (${timeoutMs}ms)`,
+      "REALTIME_ASR_FINAL_TIMEOUT"
     );
     this.websocket.close();
     return payload;

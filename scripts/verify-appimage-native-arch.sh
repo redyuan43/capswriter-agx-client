@@ -24,7 +24,19 @@ trap 'rm -rf "$workdir"' EXIT
   "$OLDPWD/$appimage" --appimage-extract >/dev/null
 )
 
-native_module="$(find "$workdir/squashfs-root/resources/app.asar.unpacked/node_modules/uiohook-napi/build/Release" -type f -name '*.node' -print -quit)"
-test -n "$native_module"
-readelf -h "$native_module" | grep -F 'Machine:' | grep -Fq "$expected_machine"
-printf 'Verified packaged %s uiohook native module: %s\n' "$expected_machine" "$native_module"
+verify_native_module() {
+  module_name="$1"
+  search_root="$2"
+  native_module="$(find "$search_root" -type f -name '*.node' -print -quit)"
+  test -n "$native_module"
+  readelf -h "$native_module" | grep -F 'Machine:' | grep -Fq "$expected_machine"
+  printf 'Verified packaged %s %s native module: %s\n' \
+    "$expected_machine" "$module_name" "$native_module"
+}
+
+verify_native_module \
+  uiohook \
+  "$workdir/squashfs-root/resources/app.asar.unpacked/node_modules/uiohook-napi/build/Release"
+verify_native_module \
+  better-sqlite3 \
+  "$workdir/squashfs-root/resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release"

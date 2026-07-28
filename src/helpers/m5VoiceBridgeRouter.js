@@ -28,6 +28,10 @@ class M5VoiceBridgeRouter {
         });
         return;
       }
+      if (path === "/bluetooth/devices") {
+        await bridge.handleBluetoothDeviceList(res);
+        return;
+      }
       if (path === "/device/commands/poll") {
         bridge.requireToken(req);
         await bridge.handleDeviceCommandPoll(req, res, url);
@@ -60,7 +64,9 @@ class M5VoiceBridgeRouter {
       return;
     }
 
-    bridge.requireToken(req, { allowLoopback: path === "/audio/routing" });
+    bridge.requireToken(req, {
+      allowLoopback: path === "/audio/routing" || path === "/bluetooth/repair",
+    });
     if (path === "/event" || path === "/quota/refresh") {
       await bridge.handleEvent(req, res);
       return;
@@ -79,6 +85,10 @@ class M5VoiceBridgeRouter {
     }
     if (path === "/audio/routing") {
       await bridge.handleAudioRoutingUpdate(req, res);
+      return;
+    }
+    if (path === "/bluetooth/repair") {
+      await bridge.handleBluetoothRepair(req, res);
       return;
     }
     if (path === "/device/commands/ack") {

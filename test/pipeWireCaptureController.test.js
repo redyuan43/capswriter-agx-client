@@ -62,3 +62,26 @@ test("PipeWire capture reports only unexpected process exits", () => {
   children[1].emit("close", null, "SIGTERM");
   assert.equal(exits.length, 1);
 });
+
+test("a replaced capture survives the previous process close event", () => {
+  const children = [];
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      children.push(child);
+      return child;
+    },
+  });
+
+  controller.start("same-session", "pipewire:first", () => {});
+  controller.start("same-session", "pipewire:second", () => {});
+  children[0].emit("error", new Error("old capture failed while stopping"));
+  assert.equal(controller.captures.get("same-session").child, children[1]);
+  children[0].emit("close", null, "SIGTERM");
+
+  assert.equal(controller.captures.get("same-session").child, children[1]);
+  assert.equal(controller.stop("same-session"), true);
+});

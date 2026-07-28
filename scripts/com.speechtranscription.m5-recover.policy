@@ -10,5 +10,6 @@
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/capswriter-m5-recover-bluetooth</annotate>
   </action>
 </policyconfig>

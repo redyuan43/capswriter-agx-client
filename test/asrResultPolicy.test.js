@@ -30,3 +30,42 @@ test("realtime protocol errors preserve server diagnostics", async () => {
   assert.equal(error.realtimeFallback, "upload");
   assert.equal(error.realtimePayload, payload);
 });
+
+test("final timeout falls back to the latest usable partial only", async () => {
+  const {
+    createRealtimeProtocolError,
+    selectRealtimeFinalTimeoutFallback,
+  } = await policyPromise;
+  const partial = { type: "partial", success: true, text: "latest partial" };
+  const timeout = new Error("Realtime ASR final timeout (31740ms)");
+  timeout.code = "REALTIME_ASR_FINAL_TIMEOUT";
+
+  assert.deepEqual(
+    selectRealtimeFinalTimeoutFallback(timeout, partial),
+    { ...partial, partial_fallback: true }
+  );
+  assert.equal(
+    selectRealtimeFinalTimeoutFallback(new Error("Realtime ASR websocket error"), partial),
+    null
+  );
+  assert.equal(
+    selectRealtimeFinalTimeoutFallback(
+      createRealtimeProtocolError({
+        type: "error",
+        error: "Realtime ASR final timeout (server-side explicit error)",
+        reason: "server_busy",
+      }, "realtime error"),
+      partial
+    ),
+    null
+  );
+  const emptyTimeout = new Error("Realtime ASR final timeout (5000ms)");
+  emptyTimeout.code = "REALTIME_ASR_FINAL_TIMEOUT";
+  assert.equal(
+    selectRealtimeFinalTimeoutFallback(
+      emptyTimeout,
+      { type: "partial", success: true, text: "" }
+    ),
+    null
+  );
+});

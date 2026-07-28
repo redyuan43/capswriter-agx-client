@@ -141,3 +141,31 @@ test("audio routing migrates the legacy shared MiniJoy route to its Bluetooth id
   );
   assert.equal(database.value().version, 2);
 });
+
+test("audio routing distinguishes enumeration from verified capture health", () => {
+  let now = Date.parse("2026-07-28T10:00:00.000Z");
+  const manager = new AudioRoutingManager({
+    runCommand: () => JSON.stringify(pactlSources),
+    now: () => now,
+  });
+  const sourceId = "pipewire:bluez_input.C8_85_41_68_39_0A";
+
+  let source = manager.listPipeWireSources().find((item) => item.source_id === sourceId);
+  assert.equal(source.enumerated, true);
+  assert.equal(source.transport_available, true);
+  assert.equal(source.audio_health.status, "unknown");
+
+  manager.recordCaptureFailure(sourceId, "first_audio_chunk_timeout", { sessionId: "failed" });
+  source = manager.listPipeWireSources().find((item) => item.source_id === sourceId);
+  assert.equal(source.audio_health.status, "failed");
+  assert.equal(source.audio_health.failure_reason, "first_audio_chunk_timeout");
+  assert.equal(manager.resolveRoute("minijoy_bt:c8854168390a").available, true);
+
+  now += 1000;
+  manager.recordCaptureSuccess(sourceId, { bytes: 640 });
+  source = manager.listPipeWireSources().find((item) => item.source_id === sourceId);
+  assert.equal(source.audio_health.status, "healthy");
+  assert.equal(source.audio_health.last_success_bytes, 640);
+  assert.equal(source.audio_health.failure_reason, "");
+  assert.equal(source.audio_health.last_success_at, "2026-07-28T10:00:01.000Z");
+});

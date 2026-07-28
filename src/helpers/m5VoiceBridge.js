@@ -13,6 +13,7 @@ const AudioRoutingManager = require("./audioRoutingManager");
 const M5DeviceCommandBroker = require("./m5DeviceCommandBroker");
 const PipeWireCaptureController = require("./pipeWireCaptureController");
 const PipeWireUnifiedSourceController = require("./pipeWireUnifiedSourceController");
+const BluetoothDeviceManager = require("./bluetoothDeviceManager");
 const { ENTER_FOLLOWUP } = require("./m5FollowupKeyDispatcher");
 
 const DEFAULT_HOST = "0.0.0.0";
@@ -27,6 +28,14 @@ const RECORDING_FIRST_CHUNK_TIMEOUT_MS = 12000;
 const RECORDING_STALL_TIMEOUT_MS = 10000;
 const RECORDING_MAX_DURATION_MS = 180000;
 const DEFAULT_MINIJOY_BLUETOOTH_MAC = "14:08:08:52:F9:62";
+const BLUETOOTH_RECOVERY_COOLDOWN_MS = 60000;
+const BLUETOOTH_RECOVERY_TIMEOUT_MS = 180000;
+const HOST_AUDIO_FAILURE_REASONS = new Set([
+  "audio_capture_exited",
+  "audio_input_empty",
+  "audio_input_stalled",
+  "first_audio_chunk_timeout",
+]);
 function cleanToken(value) {
   const token = String(value || "").trim();
   if (!token || [
@@ -39,6 +48,14 @@ function cleanToken(value) {
     return "";
   }
   return token;
+}
+
+function withoutNestedBridgeState(value) {
+  if (Array.isArray(value)) return value.map(withoutNestedBridgeState);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== "bridge")
+    .map(([key, item]) => [key, withoutNestedBridgeState(item)]));
 }
 
 function cleanBridgeIdentity(value, fallback) {
@@ -241,6 +258,12 @@ class M5VoiceBridge {
     this.pipeWireUnifiedSource = new PipeWireUnifiedSourceController({
       logger: this.logger,
     });
+    this.bluetoothDevices = new BluetoothDeviceManager({
+      runCommand: (...args) => this.runCommand(...args),
+      knownMacProvider: () => (this.audioRouting.getState().sources || [])
+        .filter((source) => source.bluetooth)
+        .map((source) => source.bluetooth_address),
+    });
     this.hostTriggerSessions = new Map();
     this.rendererSessionId = "";
     this.rendererQueue = [];
@@ -268,6 +291,9 @@ class M5VoiceBridge {
     this.ttsPlaybackRequestId = "";
     this.ttsPlaybackQueue = [];
     this.currentTtsPlayback = null;
+    this.bluetoothRecoveryInFlight = false;
+    this.bluetoothRecoveryPending = false;
+    this.bluetoothRecoveryLastAt = 0;
   }
 
   start() {
@@ -371,6 +397,10 @@ th { color: #344054; background: #f9fafb; font-weight: 600; }
 .ok { color: #067647; }
 .warn { color: #b54708; }
 .bad { color: #b42318; }
+.bluetooth-list { display: grid; gap: 10px; }
+.bluetooth-device { background: #fff; border: 1px solid #d0d5dd; padding: 12px 14px; display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+.bluetooth-device button { margin-top: 0; }
+.bluetooth-status { color: #475467; font-size: 13px; }
 .route-grid { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(260px, 2fr); gap: 10px 16px; align-items: center; }
 select { width: 100%; min-height: 38px; border: 1px solid #98a2b3; background: #fff; padding: 6px 9px; }
 button { margin-top: 14px; min-height: 38px; border: 0; background: #175cd3; color: #fff; padding: 8px 15px; cursor: pointer; }
@@ -385,6 +415,8 @@ button { margin-top: 14px; min-height: 38px; border: 0; background: #175cd3; col
 <h2>音频输入路由</h2>
 <div id="routes" class="route-grid"></div>
 <button id="save-routes" type="button">保存路由</button><span id="save-status"></span>
+<h2>MiniJoy 蓝牙设备</h2>
+<div id="bluetooth-devices" class="bluetooth-list"><div class="muted">正在读取蓝牙状态...</div></div>
 <h2>在线设备</h2>
 <table>
 <thead>
@@ -411,7 +443,15 @@ for (const [triggerId, route] of Object.entries(state.routes)) {
   for (const source of state.sources) {
     const option = document.createElement("option");
     option.value = source.source_id;
-    option.textContent = source.name + (source.online ? "" : "（离线）");
+    const audioStatus = source.audio_health?.status || "unknown";
+    const statusLabel = !source.online
+      ? "（离线）"
+      : source.bluetooth && audioStatus === "failed"
+        ? "（音频失败）"
+        : source.bluetooth && audioStatus === "unknown"
+          ? "（音频待验证）"
+          : "";
+    option.textContent = source.name + statusLabel;
     option.selected = source.source_id === route.source_id;
     select.appendChild(option);
   }
@@ -436,6 +476,75 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     status.textContent = "保存失败：" + error.message;
   }
 });
+const bluetoothRoot = document.getElementById("bluetooth-devices");
+const bluetoothStatusText = (device) => {
+  if (device.connected) return "已连接（HID / 音频通道可继续验证）";
+  if (device.paired) return "已配对，当前未连接";
+  if (device.known) return "已发现，等待配对";
+  return "未发现";
+};
+async function repairBluetooth(mac, confirmCleanup = false) {
+  const response = await fetch("/bluetooth/repair", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mac, confirm_cleanup: confirmCleanup }),
+  });
+  const payload = await response.json();
+  if (response.status === 409 && payload.requires_cleanup) {
+    const confirmed = window.confirm(
+      "检测到 " + mac + " 的 PC 残留配对记录。" +
+      "只删除这个 MAC 的残留记录并重新绑定，不影响其他 MiniJoy。是否继续？"
+    );
+    if (confirmed) return repairBluetooth(mac, true);
+    return;
+  }
+  if (!response.ok || !payload.success) {
+    throw new Error(payload.detail || payload.error || payload.stage || ("HTTP " + response.status));
+  }
+  await loadBluetoothDevices();
+}
+async function loadBluetoothDevices() {
+  try {
+    const response = await fetch("/bluetooth/devices");
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const payload = await response.json();
+    bluetoothRoot.replaceChildren();
+    if (!payload.devices.length) {
+      bluetoothRoot.innerHTML = '<div class="muted">未发现 MiniJoy 蓝牙设备。请让设备进入配对模式后刷新。</div>';
+      return;
+    }
+    for (const device of payload.devices) {
+      const row = document.createElement("div");
+      row.className = "bluetooth-device";
+      const text = document.createElement("div");
+      const title = document.createElement("strong");
+      title.textContent = device.label + " · " + device.mac;
+      const status = document.createElement("div");
+      status.className = "bluetooth-status";
+      status.textContent = bluetoothStatusText(device);
+      text.append(title, status);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = device.connected ? "重新检查" : "修复连接";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        status.textContent = "正在按 MAC 修复...";
+        try {
+          await repairBluetooth(device.mac);
+        } catch (error) {
+          status.textContent = "修复失败：" + error.message;
+        } finally {
+          button.disabled = false;
+        }
+      });
+      row.append(text, button);
+      bluetoothRoot.appendChild(row);
+    }
+  } catch (error) {
+    bluetoothRoot.textContent = "蓝牙状态读取失败：" + error.message;
+  }
+}
+loadBluetoothDevices();
 </script>
 </body>
 </html>`;
@@ -473,6 +582,35 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     return remoteAddress === "127.0.0.1" ||
       remoteAddress === "::1" ||
       remoteAddress === "::ffff:127.0.0.1";
+  }
+
+  isTrustedDashboardOrigin(req) {
+    const origin = String(req?.headers?.origin || "").trim();
+    if (!origin) return true;
+    try {
+      const url = new URL(origin);
+      const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      const localHost = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+      const listeningPort = String(this.server?.address?.()?.port || this.port);
+      return url.protocol === "http:" && localHost && url.port === listeningPort;
+    } catch {
+      return false;
+    }
+  }
+
+  async handleBluetoothDeviceList(res) {
+    this.sendJson(res, 200, { success: true, devices: await this.bluetoothDevices.list() });
+  }
+
+  async handleBluetoothRepair(req, res) {
+    if (!this.isLoopbackRequest(req) || !this.isTrustedDashboardOrigin(req)) {
+      throw Object.assign(new Error("bluetooth repair is only available on localhost"), { statusCode: 403 });
+    }
+    const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
+    const result = await this.bluetoothDevices.repair(body.mac, {
+      confirmCleanup: body.confirm_cleanup === true,
+    });
+    this.sendJson(res, result.statusCode || (result.success ? 200 : 502), result);
   }
 
   requireToken(req, { allowLoopback = false } = {}) {
@@ -527,7 +665,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     return {
       time: new Date().toISOString(),
       wifi: true,
-      ble: bluetooth.pipewire_available,
+      ble: bluetooth.ready,
       bluetooth,
       active_provider: "codex",
       provider: {
@@ -562,6 +700,9 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       source_id: source.source_id,
       name: source.name,
       online: Boolean(source.online),
+      enumerated: Boolean(source.enumerated),
+      transport_available: Boolean(source.transport_available),
+      audio_health: source.audio_health || { status: "unknown" },
       bluetooth_address: source.bluetooth_address || "",
     }));
     const target = sources.find((source) =>
@@ -570,15 +711,30 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       path.join(os.homedir(), ".cache", "capswriter-agx-client", "m5bridge-doctor.json");
     let diagnostic = null;
     try {
-      diagnostic = JSON.parse(fs.readFileSync(diagnosticFile, "utf8"));
+      diagnostic = withoutNestedBridgeState(
+        JSON.parse(fs.readFileSync(diagnosticFile, "utf8"))
+      );
     } catch {
       // The diagnostic command is optional; absence is itself represented below.
     }
-    const pipewireAvailable = Boolean(target?.online);
+    const pipewireAvailable = Boolean(target?.transport_available);
+    const audioStatus = pipewireAvailable
+      ? String(target?.audio_health?.status || "unknown")
+      : "unavailable";
+    const ready = pipewireAvailable && audioStatus === "healthy";
+    const stage = !pipewireAvailable
+      ? (diagnostic?.stage || "pipewire_source_missing")
+      : audioStatus === "failed"
+        ? "audio_capture_failed"
+        : audioStatus === "healthy"
+          ? "ready"
+          : "audio_unverified";
     return {
       target_mac: targetMac,
-      stage: pipewireAvailable ? "pipewire" : (diagnostic?.stage || "pipewire_source_missing"),
+      stage,
+      ready,
       pipewire_available: pipewireAvailable,
+      audio_status: audioStatus,
       source: target || null,
       sources,
       last_diagnostic: diagnostic,
@@ -898,13 +1054,14 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     this.armSessionWatchdogs(session);
     if (captureMode === "host_capture") {
       this.pipeWireUnifiedSource.activate(route.source.node_name);
-      this.pipeWireCapture.start(
+      const capture = this.pipeWireCapture.start(
         sessionId,
         sourceId,
         (chunk) => this.appendRecordingAudio(session, chunk),
         route.source.node_name,
         { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
+      session.capturePid = capture?.pid || null;
     } else if (captureMode === "remote_device") {
       this.commandBroker.enqueue(session.sourceDeviceId, {
         type: "recording_start",
@@ -939,6 +1096,9 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     }
     if (!session.firstAudioAt) {
       session.firstAudioAt = session.lastAudioAt;
+      if (session.captureMode === "host_capture") {
+        this.audioRouting.recordCaptureSuccess(session.sourceId, { bytes: body.length });
+      }
       this.logger?.info?.("M5 first audio chunk accepted", {
         sessionId: session.id,
         delayMs: session.firstAudioAt - session.createdAt,
@@ -1282,13 +1442,14 @@ document.getElementById("save-routes").addEventListener("click", async () => {
         targetWindowId,
         captureMode: "host_capture",
       });
-      this.pipeWireCapture.start(
+      const capture = this.pipeWireCapture.start(
         sessionId,
         route.source_id,
         (chunk) => this.appendRecordingAudio(session, chunk),
         route.source.node_name,
         { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
+      session.capturePid = capture?.pid || null;
       return { handled: true, route, session_id: sessionId };
     }
 
@@ -1555,13 +1716,105 @@ document.getElementById("save-routes").addEventListener("click", async () => {
   }
 
   abortSession(session, reason, details = {}) {
-    return this.terminateSession(session, {
+    const recoverBluetooth = session?.captureMode === "host_capture" &&
+      HOST_AUDIO_FAILURE_REASONS.has(reason) &&
+      String(session?.sourceId || "").startsWith("pipewire:bluez_input.");
+    if (session?.captureMode === "host_capture" && HOST_AUDIO_FAILURE_REASONS.has(reason)) {
+      this.audioRouting.recordCaptureFailure(session.sourceId, reason, details);
+    }
+    const terminated = this.terminateSession(session, {
       reason,
       success: false,
       status: "recording_failed",
       error: reason,
       details,
     });
+    if (terminated && recoverBluetooth) {
+      this.queueBluetoothAudioRecovery(session, reason);
+    }
+    return terminated;
+  }
+
+  async waitForCaptureExit(session, timeoutMs = 2000) {
+    const pid = Number(session?.capturePid || 0);
+    if (!pid) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return true;
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if (error?.code === "ESRCH") return true;
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
+  queueBluetoothAudioRecovery(session, reason) {
+    if (this.bluetoothRecoveryPending || this.bluetoothRecoveryInFlight ||
+        Date.now() - this.bluetoothRecoveryLastAt < BLUETOOTH_RECOVERY_COOLDOWN_MS) {
+      return false;
+    }
+    this.bluetoothRecoveryPending = true;
+    this.waitForCaptureExit(session).then((exited) => {
+      if (!exited) {
+        this.logger?.warn?.("MiniJoy capture did not exit before audio recovery", {
+          sourceId: session.sourceId,
+          pid: session.capturePid,
+        });
+        this.bluetoothRecoveryPending = false;
+        return;
+      }
+      this.bluetoothRecoveryPending = false;
+      this.scheduleBluetoothAudioRecovery(session, reason);
+    }).catch((error) => {
+      this.bluetoothRecoveryPending = false;
+      this.logger?.warn?.("Unable to wait for MiniJoy capture cleanup", {
+        sourceId: session.sourceId,
+        error: error?.message || String(error),
+      });
+    });
+    return true;
+  }
+
+  scheduleBluetoothAudioRecovery(session, reason, now = Date.now()) {
+    const sourceId = String(session?.sourceId || "");
+    if (!sourceId.startsWith("pipewire:bluez_input.")) return false;
+    if (!HOST_AUDIO_FAILURE_REASONS.has(reason)) return false;
+    if (this.bluetoothRecoveryInFlight ||
+        now - this.bluetoothRecoveryLastAt < BLUETOOTH_RECOVERY_COOLDOWN_MS) {
+      return false;
+    }
+    this.bluetoothRecoveryInFlight = true;
+    this.bluetoothRecoveryLastAt = now;
+    const sourceDoctor = path.resolve(__dirname, "../../scripts/m5bridge-doctor.py");
+    const command = fs.existsSync(sourceDoctor) ? "python3" : "m5bridge-doctor";
+    const sourceMac = sourceId.match(/bluez_input\.([0-9a-f_:-]{17})/i)?.[1]
+      ?.replace(/_/g, ":").toUpperCase() || "";
+    const args = fs.existsSync(sourceDoctor)
+      ? [sourceDoctor, "repair", "--audio-only", "--recover-bluez", "--recovery-cooldown", "60"]
+      : ["repair", "--audio-only", "--recover-bluez", "--recovery-cooldown", "60"];
+    if (sourceMac) args.push("--mac", sourceMac);
+    this.logger?.warn?.("Recovering failed MiniJoy Bluetooth audio stack", {
+      sourceId,
+      reason,
+    });
+    this.runCommand(command, args, BLUETOOTH_RECOVERY_TIMEOUT_MS).then((result) => {
+      const log = result.success ? this.logger?.info : this.logger?.warn;
+      log?.call(this.logger, "MiniJoy Bluetooth audio recovery finished", {
+        sourceId,
+        reason,
+        success: result.success,
+        error: result.error || result.stderr || "",
+      });
+    }).finally(() => {
+      this.bluetoothRecoveryInFlight = false;
+    });
+    return true;
   }
 
   terminateSession(session, result = {}) {
@@ -1932,3 +2185,4 @@ module.exports.selectCyberAgentCommand = selectCyberAgentCommand;
 module.exports.crc32 = crc32;
 module.exports.crc32Hex = crc32Hex;
 module.exports.createPcmWavBuffer = createPcmWavBuffer;
+module.exports.withoutNestedBridgeState = withoutNestedBridgeState;
