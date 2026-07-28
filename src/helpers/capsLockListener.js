@@ -13,6 +13,7 @@ const CAPS_RESTORE_EVENT_IGNORE_MS = 250;
 const CAPS_RESTORE_VERIFY_DELAY_MS = 120;
 const CAPS_DOUBLE_PRESS_CANCEL_MS = 350;
 const LINUX_INPUT_REFRESH_INTERVAL_MS = 2000;
+const MINIJOY_INPUT_POLL_INTERVAL_MS = 10;
 const DEFAULT_DICTATION_HOLD_KEY = 'right shift';
 const DEFAULT_CODEX_HOLD_KEY = 'caps lock';
 const EXTRA_KEYBOARD_DEVICE_NAMES = [
@@ -27,6 +28,20 @@ const MINIJOY_MIDDLE_BUTTON_CONFIG = {
   evdevCode: BTN_MIDDLE,
   restoresCapsLock: false
 };
+
+function normalizeBluetoothAddress(value) {
+  const hex = String(value || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+  return hex.length === 12 ? hex : '';
+}
+
+function miniJoyTriggerId(value) {
+  const address = normalizeBluetoothAddress(value);
+  return address ? `minijoy_bt:${address}` : 'minijoy_bt';
+}
+
+function isMiniJoyTriggerId(value) {
+  return value === 'minijoy_bt' || String(value || '').startsWith('minijoy_bt:');
+}
 
 function normalizeDictationKeyName(value) {
   return String(value || '')
@@ -80,12 +95,14 @@ function describeLinuxInputDevice(text, devicePath) {
       continue;
     }
     const name = block.match(/^N:\s+Name="([^"]+)"$/m)?.[1] || '';
+    const deviceUniq = block.match(/^U:\s+Uniq=(.+)$/m)?.[1]?.trim() || '';
     return {
-      trigger_id: /VibeStick MiniJoy/i.test(name) ? 'minijoy_bt' : 'keyboard',
+      trigger_id: /VibeStick MiniJoy/i.test(name) ? miniJoyTriggerId(deviceUniq) : 'keyboard',
       device_path: devicePath,
       device_name: name,
       device_phys: block.match(/^P:\s+Phys=(.+)$/m)?.[1]?.trim() || '',
-      device_uniq: block.match(/^U:\s+Uniq=(.+)$/m)?.[1]?.trim() || '',
+      device_uniq: deviceUniq,
+      bluetooth_address: normalizeBluetoothAddress(deviceUniq),
       backend: 'evdev'
     };
   }
@@ -143,8 +160,11 @@ class CapsLockListener {
     this._uiohookKey = null;
     this._inputStreams = [];
     this._inputRefreshTimer = null;
+    this._inputPollTimer = null;
     this._inputBuffers = new Map();
     this._inputDeviceInfo = new Map();
+    this._inputDeviceHandles = new Map();
+    this._evdevHolds = new Map();
     this._ignoreCapsEventsUntil = 0;
     this._capsLockRestoreTargetState = null;
     this._capsLockRestoreVerifyTimer = null;
@@ -217,6 +237,10 @@ class CapsLockListener {
       clearInterval(this._inputRefreshTimer);
       this._inputRefreshTimer = null;
     }
+    if (this._inputPollTimer) {
+      clearInterval(this._inputPollTimer);
+      this._inputPollTimer = null;
+    }
     this._recordingTriggered = false;
     this.isCapsLockPressed = false;
     this._activeHoldRole = null;
@@ -233,6 +257,9 @@ class CapsLockListener {
       if (this._backend === 'uiohook' && this._uiohook) {
         this._uiohook.stop();
       } else if (this._backend === 'wayland-input') {
+        for (const handle of [...this._inputDeviceHandles.values()]) {
+          this._closeLinuxInputDevice(handle.devicePath, handle, 'listener_stopped');
+        }
         for (const stream of this._inputStreams) {
           try {
             stream.destroy();
@@ -243,6 +270,8 @@ class CapsLockListener {
         this._inputStreams = [];
         this._inputBuffers.clear();
         this._inputDeviceInfo.clear();
+        this._inputDeviceHandles.clear();
+        this._clearEvdevHolds('listener_stopped');
       }
 
       this.isListening = false;
@@ -391,33 +420,50 @@ class CapsLockListener {
       this._refreshLinuxInputDevices();
     }, LINUX_INPUT_REFRESH_INTERVAL_MS);
     this._inputRefreshTimer.unref?.();
+    this._inputPollTimer = setInterval(() => {
+      this._pollMiniJoyInputDevices();
+    }, MINIJOY_INPUT_POLL_INTERVAL_MS);
+    this._inputPollTimer.unref?.();
 
     this._logInfo(`Wayland input listener 已连接 ${openedCount} 个输入设备`, devicePaths);
     return true;
   }
 
   _openLinuxInputDevice(devicePath) {
-    if (this._inputDeviceInfo.has(devicePath)) {
+    if (this._inputDeviceHandles.has(devicePath)) {
       return false;
     }
 
     try {
-      const fd = fs.openSync(devicePath, 'r');
-      const stream = fs.createReadStream(devicePath, {
+      const deviceInfo = this._describeLinuxInputDevice(devicePath);
+      const pollMiniJoy = isMiniJoyTriggerId(deviceInfo.trigger_id);
+      const fd = fs.openSync(
+        devicePath,
+        pollMiniJoy ? fs.constants.O_RDONLY | fs.constants.O_NONBLOCK : 'r'
+      );
+      const stream = pollMiniJoy ? null : fs.createReadStream(devicePath, {
         fd,
         autoClose: true,
         flags: 'r',
         highWaterMark: INPUT_EVENT_SIZE * 32
       });
-      const deviceInfo = this._describeLinuxInputDevice(devicePath);
+      const handle = {
+        devicePath,
+        stream,
+        fd,
+        deviceInfo,
+        pollMiniJoy,
+        readBuffer: pollMiniJoy ? Buffer.alloc(INPUT_EVENT_SIZE * 32) : null,
+      };
 
       this._inputBuffers.set(devicePath, Buffer.alloc(0));
       this._inputDeviceInfo.set(devicePath, deviceInfo);
+      this._inputDeviceHandles.set(devicePath, handle);
 
-      stream.on('data', (chunk) => {
-        this._onInputEventData(devicePath, chunk);
-      });
-      stream.on('error', (error) => {
+      if (stream) stream.on('data', (chunk) => {
+          this._onInputEventData(devicePath, chunk);
+        });
+      if (stream) stream.on('error', (error) => {
         if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
           this._logWarn(
             `Wayland input listener 无法读取 ${devicePath} (${error.code})，请将用户加入 input 组或配置 udev 规则`
@@ -425,14 +471,16 @@ class CapsLockListener {
         } else {
           this._logWarn(`Wayland input listener 设备读取失败 ${devicePath}:`, error?.message || error);
         }
+        this._closeLinuxInputDevice(devicePath, handle, 'input_device_error');
       });
-      stream.on('close', () => {
-        this._inputBuffers.delete(devicePath);
-        this._inputDeviceInfo.delete(devicePath);
-        this._inputStreams = this._inputStreams.filter((item) => item !== stream);
+      if (stream) stream.on('end', () => {
+        this._closeLinuxInputDevice(devicePath, handle, 'input_device_end');
+      });
+      if (stream) stream.on('close', () => {
+        this._closeLinuxInputDevice(devicePath, handle, 'input_device_closed');
       });
 
-      this._inputStreams.push(stream);
+      if (stream) this._inputStreams.push(stream);
       return true;
     } catch (error) {
       if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
@@ -448,13 +496,77 @@ class CapsLockListener {
 
   _refreshLinuxInputDevices() {
     const added = [];
-    for (const devicePath of this._discoverLinuxKeyboardDevicePaths()) {
+    const discovered = new Set(this._discoverLinuxKeyboardDevicePaths());
+    for (const [devicePath, handle] of this._inputDeviceHandles) {
+      if (!discovered.has(devicePath)) {
+        this._closeLinuxInputDevice(devicePath, handle.stream, 'input_device_removed');
+        continue;
+      }
+      const currentInfo = this._describeLinuxInputDevice(devicePath);
+      const identityChanged = currentInfo.trigger_id !== handle.deviceInfo.trigger_id ||
+        currentInfo.device_name !== handle.deviceInfo.device_name ||
+        currentInfo.device_uniq !== handle.deviceInfo.device_uniq;
+      if (identityChanged) {
+        this._reopenLinuxInputDevice(devicePath, handle);
+      }
+    }
+    for (const devicePath of discovered) {
       if (this._openLinuxInputDevice(devicePath)) {
         added.push(devicePath);
       }
     }
     if (added.length) {
       this._logInfo('Wayland input listener 已连接新输入设备', added);
+    }
+  }
+
+  _pollMiniJoyInputDevices() {
+    for (const handle of [...this._inputDeviceHandles.values()]) {
+      if (!handle.pollMiniJoy || typeof handle.fd !== 'number') continue;
+      try {
+        for (;;) {
+          const bytesRead = fs.readSync(handle.fd, handle.readBuffer, 0,
+            handle.readBuffer.length, null);
+          if (bytesRead <= 0) break;
+          this._onInputEventData(handle.devicePath,
+            Buffer.from(handle.readBuffer.subarray(0, bytesRead)));
+          if (bytesRead < handle.readBuffer.length) break;
+        }
+      } catch (error) {
+        if (error?.code === 'EAGAIN' || error?.code === 'EWOULDBLOCK') continue;
+        this._logWarn(`Wayland input listener MiniJoy 轮询失败 ${handle.devicePath}:`,
+          error?.message || error);
+        this._closeLinuxInputDevice(handle.devicePath, handle, 'minijoy_poll_error');
+      }
+    }
+  }
+
+  _closeLinuxInputDevice(devicePath, expected, reason) {
+    const current = this._inputDeviceHandles.get(devicePath);
+    if (!current || (expected !== current && expected !== current.stream)) return;
+    this._inputDeviceHandles.delete(devicePath);
+    this._inputBuffers.delete(devicePath);
+    this._inputDeviceInfo.delete(devicePath);
+    this._inputStreams = this._inputStreams.filter((item) => item !== current.stream);
+    this._releaseEvdevHoldsForDevice(devicePath, reason);
+    if (current.stream && !current.stream.destroyed) current.stream.destroy();
+    if (!current.stream && typeof current.fd === 'number') {
+      try {
+        fs.closeSync(current.fd);
+      } catch (_) {
+        // Already closed by the kernel/device removal path.
+      }
+    }
+  }
+
+  _reopenLinuxInputDevice(devicePath, handle) {
+    this._closeLinuxInputDevice(devicePath, handle, 'input_device_identity_changed');
+    if (this._openLinuxInputDevice(devicePath)) {
+      this._logInfo('Wayland input listener 已重建输入设备', {
+        devicePath,
+        trigger_id: this._inputDeviceInfo.get(devicePath)?.trigger_id,
+        reason: 'identity_changed',
+      });
     }
   }
 
@@ -578,6 +690,10 @@ class CapsLockListener {
   }
 
   _handleHoldKeyDown(role, keyConfig, keycode, source = {}) {
+    if (source.backend === 'evdev' && source.device_path) {
+      this._handleEvdevHoldKeyDown(role, keyConfig, keycode, source);
+      return;
+    }
     if (this._shouldIgnoreCapsEvent()) return;
     if (this.isCapsLockPressed) return;
 
@@ -616,6 +732,10 @@ class CapsLockListener {
   }
 
   _handleHoldKeyUp(role, keyConfig, keycode, source = {}) {
+    if (source.backend === 'evdev' && source.device_path) {
+      this._handleEvdevHoldKeyUp(role, keyConfig, keycode, source);
+      return;
+    }
     if (this._shouldIgnoreCapsEvent()) return;
     if (!this.isCapsLockPressed) return;
     if (this._activeHoldRole !== role || this._activeHoldKeyConfig !== keyConfig) {
@@ -650,6 +770,94 @@ class CapsLockListener {
     this._activeHoldRole = null;
     this._activeHoldKeyConfig = null;
     this._activeHoldSource = null;
+  }
+
+  _evdevHoldId(role, keyConfig, source = {}) {
+    return `${source.device_path || 'unknown'}:${role}:${keyConfig.evdevCode}`;
+  }
+
+  _handleEvdevHoldKeyDown(role, keyConfig, keycode, source = {}) {
+    if (this._shouldIgnoreCapsEvent()) return;
+    const holdId = this._evdevHoldId(role, keyConfig, source);
+    if (this._evdevHolds.has(holdId)) return;
+
+    const hold = {
+      id: holdId,
+      role,
+      keyConfig,
+      keycode,
+      source: { trigger_id: source.trigger_id || 'keyboard', ...source },
+      timer: null,
+      recordingTriggered: false,
+    };
+    this._evdevHolds.set(holdId, hold);
+    this.isCapsLockPressed = true;
+    this._logInfo(`${keyConfig.displayName} 按下, keycode:`, keycode);
+
+    const trigger = () => {
+      hold.timer = null;
+      if (!this._evdevHolds.has(holdId)) return;
+      hold.recordingTriggered = true;
+      if (keyConfig.restoresCapsLock) {
+        this._lastCapsShortPressAt = 0;
+        this._captureLinuxCapsLockRestoreTarget();
+      }
+      this._emitHoldKeyDown(role, hold.source);
+    };
+
+    if (this.minHoldMs > 0) {
+      hold.timer = setTimeout(trigger, this.minHoldMs + 1);
+      hold.timer.unref?.();
+    } else {
+      trigger();
+    }
+  }
+
+  _handleEvdevHoldKeyUp(role, keyConfig, keycode, source = {}) {
+    const holdId = this._evdevHoldId(role, keyConfig, source);
+    const hold = this._evdevHolds.get(holdId);
+    if (!hold) return;
+    this._finishEvdevHold(hold, keycode, false, 'key_released');
+  }
+
+  _finishEvdevHold(hold, keycode, forced, reason) {
+    this._evdevHolds.delete(hold.id);
+    this.isCapsLockPressed = this._evdevHolds.size > 0;
+    if (hold.timer) {
+      clearTimeout(hold.timer);
+      hold.timer = null;
+      if (!forced) {
+        this._handleShortHoldKeyPress(hold.role, hold.keyConfig, keycode);
+        this._logInfo(hold.keyConfig.displayName + ' 短按忽略 (<= ' + this.minHoldMs + 'ms)');
+      }
+      return;
+    }
+
+    this._logInfo(`${hold.keyConfig.displayName} ${forced ? '强制释放' : '松开'}, keycode:`, keycode, {
+      reason,
+      trigger_id: hold.source.trigger_id,
+      device_path: hold.source.device_path,
+    });
+    if (hold.recordingTriggered) {
+      this._emitHoldKeyUp(hold.role, { ...hold.source, forced, reason });
+      if (hold.keyConfig.restoresCapsLock) {
+        this._restoreLinuxCapsLockAfterLongPress();
+      }
+    }
+  }
+
+  _releaseEvdevHoldsForDevice(devicePath, reason = 'input_device_closed') {
+    for (const hold of [...this._evdevHolds.values()]) {
+      if (hold.source.device_path === devicePath) {
+        this._finishEvdevHold(hold, hold.keycode, true, reason);
+      }
+    }
+  }
+
+  _clearEvdevHolds(reason = 'listener_stopped') {
+    for (const hold of [...this._evdevHolds.values()]) {
+      this._finishEvdevHold(hold, hold.keycode, true, reason);
+    }
   }
 
   _emitHoldKeyDown(role, source = {}) {
@@ -692,7 +900,7 @@ class CapsLockListener {
   }
 
   _findHoldKeyByEvdevCode(code, source = {}) {
-    if (source.trigger_id === 'minijoy_bt' && code === BTN_MIDDLE) {
+    if (isMiniJoyTriggerId(source.trigger_id) && code === BTN_MIDDLE) {
       return { role: 'dictation', config: MINIJOY_MIDDLE_BUTTON_CONFIG };
     }
     if (code === this.dictationKeyConfig.evdevCode) {
@@ -873,3 +1081,6 @@ class CapsLockListener {
 module.exports = CapsLockListener;
 module.exports.describeLinuxInputDevice = describeLinuxInputDevice;
 module.exports.discoverNamedLinuxInputDevicePaths = discoverNamedLinuxInputDevicePaths;
+module.exports.normalizeBluetoothAddress = normalizeBluetoothAddress;
+module.exports.miniJoyTriggerId = miniJoyTriggerId;
+module.exports.isMiniJoyTriggerId = isMiniJoyTriggerId;

@@ -6,7 +6,8 @@ const {
   dialog,
   Notification,
   shell,
-  systemPreferences
+  systemPreferences,
+  crashReporter
 } = require("electron");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
@@ -20,6 +21,20 @@ const LogManager = require("./src/helpers/logManager");
 
 // Create logger instance
 const logger = new LogManager();
+
+try {
+  crashReporter.start({
+    uploadToServer: false,
+    compress: false,
+    companyName: "CapsWriter",
+    productName: "CapsWriter AGX Client",
+  });
+  logger.info("Electron crash reporter started", {
+    crashDumpsPath: app.getPath("crashDumps"),
+  });
+} catch (error) {
+  logger.warn("Electron crash reporter failed to start", error?.message || error);
+}
 
 const HEADLESS_MODE = process.env.SPEECH_TRANSCRIPTION_HEADLESS === '1';
 const MANAGED_STACK_MODE = process.env.CAPSWRITER_DEV_MANAGED === '1';
@@ -342,6 +357,40 @@ const m5VoiceBridge = new M5VoiceBridge({
   clipboardManager,
   databaseManager,
   sendToRenderer: safeSendToMainWindow,
+});
+let rendererRecoveryActive = false;
+let lastRendererHeartbeatAt = Date.now();
+let rendererHeartbeatWatchdog = null;
+
+async function recoverMainRenderer(reason, details = {}) {
+  if (rendererRecoveryActive || app.isQuitting) return;
+  rendererRecoveryActive = true;
+  logger.error("Main renderer recovery started", { reason, details });
+  m5VoiceBridge.abortAllSessions(reason);
+  const current = windowManager.mainWindow;
+  if (current && !current.isDestroyed()) current.destroy();
+  try {
+    const next = await windowManager.createMainWindow();
+    trayManager.setWindows(next, windowManager.controlPanelWindow);
+    lastRendererHeartbeatAt = Date.now();
+    logger.info("Main renderer recovery completed", { reason });
+  } catch (error) {
+    logger.error("Main renderer recovery failed", error?.stack || error?.message || error);
+  } finally {
+    rendererRecoveryActive = false;
+  }
+}
+
+windowManager.setRendererFailureHandler((reason, details) => {
+  recoverMainRenderer(reason, details).catch((error) => {
+    logger.error("Unhandled renderer recovery error", error?.stack || error?.message || error);
+  });
+});
+
+ipcMain.on("renderer-heartbeat", (event) => {
+  if (event.sender === windowManager.mainWindow?.webContents) {
+    lastRendererHeartbeatAt = Date.now();
+  }
 });
 const voiceActionManager = new VoiceActionManager({
   logger,
@@ -779,12 +828,22 @@ async function startApp() {
   capsLockListener.setOnCapsLockDown(async (payload = {}) => {
     const triggerId = payload.trigger_id || 'keyboard';
     logger.info(`${capsLockListener.getDictationKeyDisplayName()} pressed - showing floating ball and starting recording`);
-    windowManager.showFloatingBall();
+    windowManager.showFloatingBall({
+      rememberActiveWindow: !m5VoiceBridge.hasActiveRecordings(),
+    });
     const routed = await m5VoiceBridge.handleHostTriggerDown(
       triggerId,
       windowManager.previousActiveWindow || ''
     );
     if (!routed.handled) {
+      if (routed.busy || triggerId.startsWith('minijoy_bt')) {
+        safeSendToMainWindow('external-recording-error', {
+          trigger_id: triggerId,
+          error: routed.busy ? '录音任务已满，请稍后重试' : '对应的 MiniJoy 蓝牙麦克风当前不可用',
+        });
+        setTimeout(() => windowManager.hideFloatingBall(), 1600);
+        return;
+      }
       safeSendToMainWindow('caps-lock-down', payload);
     }
   });
@@ -799,7 +858,9 @@ async function startApp() {
     }
     
     // 然后发送停止录音事件
-    const routed = await m5VoiceBridge.handleHostTriggerUp(triggerId);
+    const routed = payload.forced
+      ? { handled: m5VoiceBridge.abortHostTrigger(triggerId, payload.reason || 'input_device_closed') }
+      : await m5VoiceBridge.handleHostTriggerUp(triggerId);
     if (!routed.handled) {
       safeSendToMainWindow('caps-lock-up', payload);
     }
@@ -882,6 +943,18 @@ async function startApp() {
 
   m5VoiceBridge.start();
 
+  if (!rendererHeartbeatWatchdog) {
+    rendererHeartbeatWatchdog = setInterval(() => {
+      if (!windowManager.mainWindow || rendererRecoveryActive) return;
+      if (Date.now() - lastRendererHeartbeatAt > 6000) {
+        recoverMainRenderer("renderer_heartbeat_timeout", {
+          silentForMs: Date.now() - lastRendererHeartbeatAt,
+        }).catch(() => {});
+      }
+    }, 2000);
+    rendererHeartbeatWatchdog.unref?.();
+  }
+
   logger.info('Application startup complete');
 }
 
@@ -907,6 +980,8 @@ app.on("activate", () => {
 });
 
 app.on("will-quit", () => {
+  app.isQuitting = true;
+  if (rendererHeartbeatWatchdog) clearInterval(rendererHeartbeatWatchdog);
   stopClipboardWatch();
   m5VoiceBridge.stop();
   globalShortcut.unregisterAll();

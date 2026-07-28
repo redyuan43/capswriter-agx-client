@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Installed by install-linux-client.sh with root ownership.  Keep this helper
+# intentionally narrow: Polkit may authorize this action for the active local
+# desktop user, but it must never become a generic privileged command runner.
+if [ "$#" -ne 0 ]; then
+  echo "Usage: capswriter-m5-recover-bluetooth" >&2
+  exit 2
+fi
+
+exec /usr/bin/systemctl restart bluetooth.service

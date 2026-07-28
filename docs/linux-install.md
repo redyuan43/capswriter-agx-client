@@ -1,8 +1,19 @@
 # Linux Release Installation
 
+## MiniJoy 蓝牙诊断与恢复
+
+Linux 安装器会安装 `m5bridge-doctor`。接入 M5StickC Plus SE 的 USB 串口后，可运行：
+
+```bash
+m5bridge-doctor diagnose
+m5bridge-doctor repair --recover-bluez
+```
+
+它分别报告 M5 串口、BlueZ 配对、HID/HFP、PipeWire 与 CapsWriter Bridge。`repair` 仅在主机和 M5 的绑定状态不一致时清理目标 MiniJoy；`--recover-bluez` 仅允许受限助手重启 `bluetooth.service`。
+
 The official Linux release path installs the AppImage, verifies its SHA-256
-checksum, enables desktop-login autostart, and starts CapsWriter in tray/background
-mode. It is intended for the current desktop user. By default it asks for `sudo`
+checksum, enables desktop-login autostart, and starts CapsWriter under a
+restartable systemd user service. It is intended for the current desktop user. By default it asks for `sudo`
 once to configure MiniJoy trackball input access; use `--skip-input-permission`
 to leave system permissions unchanged.
 
@@ -38,9 +49,10 @@ The installer automatically:
 - downloads `SHA256SUMS.txt` and verifies the AppImage;
 - installs the client at `~/.local/opt/capswriter-agx-client/`;
 - writes a launcher at `~/.local/bin/capswriter-agx-client`;
-- creates a menu entry and a GNOME/XDG autostart entry;
+- creates one systemd user service plus a GNOME/XDG login starter;
 - installs a udev `uaccess` rule for keyboard input and the `VibeStick MiniJoy Mouse` input device;
-- starts the client in the current graphical desktop session.
+- imports the graphical-session environment and starts the monitored client;
+- restarts the complete client process group after an unexpected crash.
 
 After a system reboot, CapsWriter starts again when the user logs into the
 graphical desktop. A GUI application cannot run before a user graphical session
@@ -78,6 +90,11 @@ default, so it can distinguish ordinary Right Shift from MiniJoy input. The
 rule remains effective when MiniJoy reconnects and does not add the user to the
 global `input` group.
 
+When multiple MiniJoy devices share the same Bluetooth name, CapsWriter uses
+their Bluetooth MAC addresses to keep their HID buttons and HFP microphones
+separate. The routing page shows a short suffix such as `MiniJoy F9:62`, and
+the saved route survives `/dev/input/eventN` changes after reconnecting.
+
 Use `--skip-input-permission` when MiniJoy is not used or system permissions
 must remain unchanged. If MiniJoy was already connected during installation,
 reconnect it once and restart CapsWriter.
@@ -86,6 +103,7 @@ reconnect it once and restart CapsWriter.
 
 ```bash
 pgrep -af "CapsWriter-GUI.*AppImage"
+systemctl --user status capswriter-agx-client.service
 desktop-file-validate "$HOME/.config/autostart/capswriter-agx-client.desktop"
 tail -f "$HOME/.cache/capswriter-agx-client/capswriter-agx-client.log"
 ```
@@ -96,8 +114,11 @@ Stop the client first, then remove its files:
 
 ```bash
 pkill -u "$(id -u)" -f "CapsWriter-GUI.*AppImage" || true
+systemctl --user disable --now capswriter-agx-client.service || true
 rm -f "$HOME/.config/autostart/capswriter-agx-client.desktop"
+rm -f "$HOME/.config/systemd/user/capswriter-agx-client.service"
 rm -f "$HOME/.local/share/applications/capswriter-agx-client.desktop"
 rm -f "$HOME/.local/bin/capswriter-agx-client"
+rm -f "$HOME/.local/bin/capswriter-agx-client-service-start"
 rm -rf "$HOME/.local/opt/capswriter-agx-client"
 ```

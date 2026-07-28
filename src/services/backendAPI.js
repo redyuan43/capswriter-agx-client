@@ -16,7 +16,7 @@ const ASR_STREAM_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_ASR_STREAM_CON
 const ASR_STREAM_IDLE_TIMEOUT_MS = Number(import.meta.env.VITE_ASR_STREAM_IDLE_TIMEOUT_MS || 20000);
 const DEFAULT_REALTIME_ASR_URL = 'ws://agx.taild500c8.ts.net:18011/api/asr/realtime';
 const REALTIME_ASR_URL = (import.meta.env.VITE_REALTIME_ASR_URL || DEFAULT_REALTIME_ASR_URL).trim();
-const REALTIME_ASR_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS || 2500);
+const REALTIME_ASR_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS || 30000);
 const REALTIME_ASR_FINAL_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MS || 15000);
 const REALTIME_ASR_FINAL_TIMEOUT_MAX_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MAX_MS || 120000);
 const REALTIME_ASR_FINAL_TIMEOUT_AUDIO_RATIO = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_AUDIO_RATIO || 1.5);
@@ -451,6 +451,7 @@ export class PCMRealtimeSession {
       : Infinity;
     this.bufferFlushedEventType = options.bufferFlushedEventType || 'realtime_pcm_buffer_flushed';
     this.watchdogEventType = options.watchdogEventType || 'realtime_pcm_watchdog_stalled';
+    this.pcmWatchdogEnabled = options.pcmWatchdogEnabled !== false;
     this.pendingChunks = [];
     this.pendingBytes = 0;
     this.websocket = null;
@@ -675,6 +676,9 @@ export class PCMRealtimeSession {
   }
 
   startPcmWatchdog() {
+    if (!this.pcmWatchdogEnabled) {
+      return;
+    }
     const timeoutMs = normalizePositiveNumber(REALTIME_ASR_PCM_STALL_TIMEOUT_MS, 3500);
     this.pcmStartedAt = Date.now();
     const check = () => {
@@ -825,6 +829,7 @@ export class ExternalPCMRealtimeSession extends PCMRealtimeSession {
   constructor(options = {}) {
     super({
       ...options,
+      pcmWatchdogEnabled: options.pcmWatchdogEnabled ?? false,
       bufferFlushedEventType: 'external_pcm_buffer_flushed',
       watchdogEventType: 'external_pcm_watchdog_stalled',
     });

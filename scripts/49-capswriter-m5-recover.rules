@@ -1,0 +1,6 @@
+polkit.addRule(function(action, subject) {
+  if (action.id == "com.speechtranscription.m5-recover-bluetooth" &&
+      subject.local && subject.active) {
+    return polkit.Result.YES;
+  }
+});

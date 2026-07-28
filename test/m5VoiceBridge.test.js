@@ -4,6 +4,7 @@ const test = require("node:test");
 const { once } = require("node:events");
 
 const M5VoiceBridge = require("../src/helpers/m5VoiceBridge");
+const { crc32Hex } = M5VoiceBridge;
 
 function request(port, headers = {}) {
   return requestJson(port, "/health", { headers });
@@ -136,7 +137,18 @@ test("health requires the configured token and returns bridge identity", async (
 
   const authorized = await request(port, { "X-Vibe-Stick-Token": "test-bridge-token" });
   assert.equal(authorized.statusCode, 200);
-  assert.deepEqual(JSON.parse(authorized.body), {
+  const health = JSON.parse(authorized.body);
+  assert.equal(typeof health.bridge_instance_id, "string");
+  assert.equal(health.recording_protocol_version, 2);
+  assert.equal(health.max_concurrent_recordings, 4);
+  assert.equal(health.recording_first_chunk_timeout_ms, 12000);
+  assert.equal(health.recording_stall_timeout_ms, 10000);
+  delete health.bridge_instance_id;
+  delete health.recording_protocol_version;
+  delete health.max_concurrent_recordings;
+  delete health.recording_first_chunk_timeout_ms;
+  delete health.recording_stall_timeout_ms;
+  assert.deepEqual(health, {
     ok: true,
     bridge_id: "desk-a",
     bridge_label: "Desk A",
@@ -158,6 +170,30 @@ test("health requires the configured token and returns bridge identity", async (
     ),
     { message: "unauthorized", statusCode: 401 }
   );
+});
+
+test("bridge state separates a live bridge from the MiniJoy PipeWire route", () => {
+  const bridge = new M5VoiceBridge({
+    logger: { warn() {}, error() {}, info() {} },
+    windowManager: {},
+    clipboardManager: {},
+    sendToRenderer() {},
+  });
+  bridge.getAudioRoutingState = () => ({
+    sources: [{
+      source_id: "pipewire:bluez_input.14_08_08_52_F9_62.0",
+      name: "VibeStick MiniJoy F9:62",
+      online: true,
+      bluetooth: true,
+      bluetooth_address: "14080852f962",
+    }],
+  });
+  const state = bridge.buildState();
+  assert.equal(state.wifi, true);
+  assert.equal(state.ble, true);
+  assert.equal(state.bluetooth.stage, "pipewire");
+  assert.equal(state.bluetooth.target_mac, "14:08:08:52:F9:62");
+  assert.equal(state.bluetooth.source.source_id, "pipewire:bluez_input.14_08_08_52_F9_62.0");
 });
 
 test("HTTP routing preserves method and unknown-path responses", async (t) => {
@@ -192,7 +228,10 @@ test("M5 audio chunks are idempotent by chunk_id", async (t) => {
     headers,
     body: { session_id: "idempotent-audio", intent: "dictation" },
   });
-  assert.equal(JSON.parse(started.body).recording.capture_mode, "device_upload");
+  const startPayload = JSON.parse(started.body);
+  assert.equal(startPayload.recording.capture_mode, "device_upload");
+  assert.equal("state" in startPayload, false);
+  assert.ok(Buffer.byteLength(started.body) < 1024);
 
   const first = await requestBuffer(
     port,
@@ -216,6 +255,143 @@ test("M5 audio chunks are idempotent by chunk_id", async (t) => {
   });
   assert.equal(JSON.parse(duplicate.body).recording.duplicate, true);
   assert.equal(JSON.parse(duplicate.body).recording.bytes, 4);
+});
+
+test("M5 starts renderer ASR only after the first accepted audio chunk", async (t) => {
+  const rendererEvents = [];
+  const { bridge, port } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "wifi-delayed-first-chunk",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+  };
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    headers,
+    body: { session_id: "delayed-first-chunk", intent: "dictation" },
+  });
+  assert.deepEqual(rendererEvents, []);
+
+  await requestBuffer(
+    port,
+    "/recording/audio?session_id=delayed-first-chunk&chunk_id=0",
+    Buffer.from([1, 2, 3, 4]),
+    headers
+  );
+  assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-start",
+    "external-recording-chunk",
+  ]);
+  bridge.abortAllSessions("test_cleanup");
+});
+
+test("M5 watchdog separates first-chunk delay from live-stream stalls", async (t) => {
+  const { bridge } = await startBridge(t);
+  const createdAt = 100000;
+  const session = bridge.recordingSessions.create({
+    id: "watchdog-policy",
+    intent: "dictation",
+  });
+  session.createdAt = createdAt;
+
+  assert.equal(bridge.sessionTimeoutReason(session, createdAt + 4000), "");
+  assert.equal(bridge.sessionTimeoutReason(session, createdAt + 12000), "first_audio_chunk_timeout");
+
+  session.lastUploadAttemptAt = createdAt + 11000;
+  assert.equal(bridge.sessionTimeoutReason(session, createdAt + 22000), "");
+  assert.equal(bridge.sessionTimeoutReason(session, createdAt + 23000), "first_audio_chunk_timeout");
+
+  session.lastAudioAt = createdAt + 24000;
+  assert.equal(bridge.sessionTimeoutReason(session, createdAt + 33999), "");
+  assert.equal(bridge.sessionTimeoutReason(session, createdAt + 34000), "audio_input_stalled");
+});
+
+test("protocol v2 rejects gaps and checksum mismatches before accepting audio", async (t) => {
+  const { port } = await startBridge(t);
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "wifi-stick-v2",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+  };
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    headers,
+    body: { session_id: "verified-audio", intent: "dictation", protocol_version: 2 },
+  });
+  const audio = Buffer.from([1, 2, 3, 4]);
+  const gap = await requestBuffer(
+    port,
+    "/recording/audio?session_id=verified-audio&chunk_id=1",
+    audio,
+    { ...headers, "X-Vibe-Stick-Chunk-CRC32": crc32Hex(audio) }
+  );
+  assert.equal(gap.statusCode, 409);
+
+  const badCrc = await requestBuffer(
+    port,
+    "/recording/audio?session_id=verified-audio&chunk_id=0",
+    audio,
+    { ...headers, "X-Vibe-Stick-Chunk-CRC32": "00000000" }
+  );
+  assert.equal(badCrc.statusCode, 422);
+
+  const accepted = await requestBuffer(
+    port,
+    "/recording/audio?session_id=verified-audio&chunk_id=0",
+    audio,
+    { ...headers, "X-Vibe-Stick-Chunk-CRC32": crc32Hex(audio) }
+  );
+  assert.deepEqual(JSON.parse(accepted.body).recording, {
+    status: "recording",
+    session_id: "verified-audio",
+    bytes: 4,
+    chunks: 1,
+    chunk_id: "0",
+    duplicate: false,
+    expected_chunk_id: 1,
+  });
+});
+
+test("simultaneous device recordings stay isolated and reach the renderer serially", async (t) => {
+  const rendererEvents = [];
+  const { bridge, port } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  const headersA = { "X-Vibe-Stick-Device-Id": "wifi-a", "X-Vibe-Stick-Firmware-Name": "vibestick" };
+  const headersB = { "X-Vibe-Stick-Device-Id": "wifi-b", "X-Vibe-Stick-Firmware-Name": "vibestick" };
+  await requestJson(port, "/recording/start", {
+    method: "POST", headers: headersA, body: { session_id: "serial-a" },
+  });
+  await requestJson(port, "/recording/start", {
+    method: "POST", headers: headersB, body: { session_id: "serial-b" },
+  });
+  await requestBuffer(port, "/recording/audio?session_id=serial-a&chunk_id=0", Buffer.from([1, 1]), headersA);
+  await requestBuffer(port, "/recording/audio?session_id=serial-b&chunk_id=0", Buffer.from([2, 2]), headersB);
+
+  assert.deepEqual(
+    rendererEvents.filter((event) => event.eventName === "external-recording-start").map((event) => event.payload.session_id),
+    ["serial-a"]
+  );
+  const stopB = requestJson(port, "/recording/stop", {
+    method: "POST", headers: headersB, body: { session_id: "serial-b" },
+  });
+  const stopA = requestJson(port, "/recording/stop", {
+    method: "POST", headers: headersA, body: { session_id: "serial-a" },
+  });
+  await waitFor(() => assert.ok(rendererEvents.some((event) =>
+    event.eventName === "external-recording-stop" && event.payload.session_id === "serial-a"
+  )));
+  await bridge.handleRendererResult({ session_id: "serial-a", success: true, status: "pasted", text: "a" });
+  await waitFor(() => assert.ok(rendererEvents.some((event) =>
+    event.eventName === "external-recording-stop" && event.payload.session_id === "serial-b"
+  )));
+  const replayedB = rendererEvents.find((event) =>
+    event.eventName === "external-recording-chunk" && event.payload.session_id === "serial-b"
+  );
+  assert.equal(Buffer.from(replayedB.payload.chunk).toString("hex"), "0202");
+  await bridge.handleRendererResult({ session_id: "serial-b", success: true, status: "pasted", text: "b" });
+  assert.equal((await stopA).statusCode, 200);
+  assert.equal((await stopB).statusCode, 200);
 });
 
 test("device command poll returns commands for the requesting device", async (t) => {
@@ -343,6 +519,11 @@ test("M5 confirmation is accepted while transcription is still pending and runs 
     body: { session_id: sessionId, intent: "dictation" },
   });
   assert.equal(start.statusCode, 200);
+  await requestBuffer(
+    port,
+    `/recording/audio?session_id=${sessionId}&chunk_id=0`,
+    Buffer.from([1, 2, 3, 4])
+  );
 
   const stopRequest = requestJson(port, "/recording/stop", {
     method: "POST",
@@ -451,6 +632,11 @@ test("M5 double click cancels the current dictation without sending Escape", asy
     method: "POST",
     body: { session_id: sessionId, intent: "dictation" },
   });
+  await requestBuffer(
+    port,
+    `/recording/audio?session_id=${sessionId}&chunk_id=0`,
+    Buffer.from([1, 2, 3, 4])
+  );
   const stopRequest = requestJson(port, "/recording/stop", {
     method: "POST",
     body: { session_id: sessionId, intent: "dictation", paste: true },

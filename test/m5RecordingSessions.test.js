@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const test = require("node:test");
 
 const M5RecordingSessions = require("../src/helpers/m5RecordingSessions");
@@ -22,7 +23,7 @@ test("recording sessions track audio and expose the newest active session", () =
   assert.equal(sessions.appendAudio(first, Buffer.from([1, 2, 3])), true);
   assert.equal(first.bytes, 3);
   assert.equal(first.chunks, 1);
-  assert.equal(Buffer.concat(first.audioChunks).toString("hex"), "010203");
+  assert.equal(fs.readFileSync(first.pcmFile).toString("hex"), "010203");
   assert.equal(sessions.latestId(), "second");
   assert.deepEqual(sessions.currentState(), {
     status: "recording",
@@ -39,6 +40,7 @@ test("recording sessions track audio and expose the newest active session", () =
     intent: "cyber_fortune",
   });
   assert.equal(sessions.appendAudio(first, Buffer.from([4])), false);
+  sessions.clear();
 });
 
 test("recording session wait resolves once and clears its timeout", async (t) => {

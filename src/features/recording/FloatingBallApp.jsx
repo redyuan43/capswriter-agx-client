@@ -2098,13 +2098,11 @@ export default function FloatingBallApp() {
             });
           }
         },
-        onClientEvent: (event) => {
-          if (event?.type === "external_pcm_watchdog_stalled") {
-            logRuntime("warn", "External M5 realtime PCM watchdog stalled; recording will fail on stop", event);
-          }
-        },
       });
       externalRealtimeSessionRef.current = realtimeSession;
+      for (const pendingChunk of externalPCMChunksRef.current) {
+        realtimeSession.sendPCM(pendingChunk);
+      }
       externalRecordingRef.current.realtimeStartPromise = realtimeSession.start().catch((error) => {
         externalRecordingRef.current.realtimeFailed = true;
         externalRecordingRef.current.realtimeError = error;
@@ -2712,6 +2710,17 @@ export default function FloatingBallApp() {
       };
     }
   }, [scheduleStopRecordingAfterRelease, startRecordingWithCheck]);
+
+  useEffect(() => {
+    if (!window.electronAPI) {
+      return undefined;
+    }
+    window.electronAPI.rendererHeartbeat?.();
+    const heartbeatTimer = window.setInterval(() => {
+      window.electronAPI.rendererHeartbeat?.();
+    }, 2000);
+    return () => window.clearInterval(heartbeatTimer);
+  }, []);
 
   useEffect(() => {
     if (!window.electronAPI) {

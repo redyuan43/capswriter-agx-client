@@ -22,6 +22,11 @@ class WindowManager {
     this.previousActiveWindow = null;
     this.floatingWindowDefaultSize = { width: 400, height: 72 };
     this.floatingWindowMaxSize = { width: 1100, height: 640 };
+    this.rendererFailureHandler = options.rendererFailureHandler || null;
+  }
+
+  setRendererFailureHandler(handler) {
+    this.rendererFailureHandler = typeof handler === 'function' ? handler : null;
   }
 
   rememberActiveWindow() {
@@ -133,6 +138,14 @@ class WindowManager {
 
     this.mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
       console.error('Main window failed to load:', errorCode, errorDescription);
+    });
+
+    this.mainWindow.webContents.on('render-process-gone', (_event, details) => {
+      this.rendererFailureHandler?.('render_process_gone', details || {});
+    });
+
+    this.mainWindow.on('unresponsive', () => {
+      this.rendererFailureHandler?.('renderer_unresponsive', {});
     });
 
     // 悬浮球默认隐藏，按住录音键时才显示

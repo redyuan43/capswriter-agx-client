@@ -12,7 +12,7 @@ class PipeWireCaptureController {
     this.captures = new Map();
   }
 
-  start(sessionId, sourceId, onChunk, nodeNameOverride = "") {
+  start(sessionId, sourceId, onChunk, nodeNameOverride = "", options = {}) {
     const id = String(sessionId || "").trim();
     const nodeName = String(nodeNameOverride || nodeNameFromSourceId(sourceId)).trim();
     if (!id || !nodeName) {
@@ -36,10 +36,20 @@ class PipeWireCaptureController {
     child.stderr?.on("data", (chunk) => {
       stderr += chunk.toString();
     });
+    const capture = { child, stopping: false };
     child.on("close", (code, signal) => {
       this.captures.delete(id);
       if (code && code !== 0) {
         this.logger?.warn?.("PipeWire capture exited", {
+          sessionId: id,
+          sourceId,
+          code,
+          signal,
+          stderr: stderr.trim(),
+        });
+      }
+      if (!capture.stopping) {
+        options.onUnexpectedExit?.({
           sessionId: id,
           sourceId,
           code,
@@ -55,17 +65,26 @@ class PipeWireCaptureController {
         sourceId,
         error: error?.message || String(error),
       });
+      if (!capture.stopping) {
+        options.onUnexpectedExit?.({
+          sessionId: id,
+          sourceId,
+          error: error?.message || String(error),
+          stderr: stderr.trim(),
+        });
+      }
     });
-    this.captures.set(id, child);
+    this.captures.set(id, capture);
     return { session_id: id, source_id: sourceId, pid: child.pid || null };
   }
 
   stop(sessionId) {
     const id = String(sessionId || "").trim();
-    const child = this.captures.get(id);
-    if (!child) return false;
+    const capture = this.captures.get(id);
+    if (!capture) return false;
     this.captures.delete(id);
-    child.kill?.("SIGTERM");
+    capture.stopping = true;
+    capture.child.kill?.("SIGTERM");
     return true;
   }
 

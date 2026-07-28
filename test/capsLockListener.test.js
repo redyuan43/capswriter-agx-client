@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const test = require('node:test');
 
 const CapsLockListener = require('../src/helpers/capsLockListener');
@@ -37,7 +38,7 @@ H: Handlers=sysrq kbd event6
 
   assert.equal(
     describeLinuxInputDevice(devices, '/dev/input/event17').trigger_id,
-    'minijoy_bt'
+    'minijoy_bt:112233445566'
   );
   assert.equal(
     describeLinuxInputDevice(devices, '/dev/input/event6').trigger_id,
@@ -69,7 +70,7 @@ test('routes the MiniJoy mouse middle button to dictation callbacks', () => {
   listener.minHoldMs = 0;
   listener._inputBuffers.set('/dev/input/event18', Buffer.alloc(0));
   listener._inputDeviceInfo.set('/dev/input/event18', {
-    trigger_id: 'minijoy_bt',
+    trigger_id: 'minijoy_bt:112233445566',
     device_path: '/dev/input/event18',
     device_name: 'VibeStick MiniJoy Mouse',
     backend: 'evdev'
@@ -89,7 +90,126 @@ test('routes the MiniJoy mouse middle button to dictation callbacks', () => {
   listener._onInputEventData('/dev/input/event18', inputEvent(0));
 
   assert.deepEqual(events, [
-    ['down', 'minijoy_bt'],
-    ['up', 'minijoy_bt']
+    ['down', 'minijoy_bt:112233445566'],
+    ['up', 'minijoy_bt:112233445566']
+  ]);
+});
+
+test('routes MiniJoy Right Shift exactly like the physical dictation key', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  const devicePath = '/dev/input/event257';
+  listener._inputBuffers.set(devicePath, Buffer.alloc(0));
+  listener._inputDeviceInfo.set(devicePath, {
+    trigger_id: 'minijoy_bt:14080852f962',
+    device_path: devicePath,
+    device_name: 'VibeStick MiniJoy Keyboard',
+    backend: 'evdev',
+  });
+  const events = [];
+  listener.setOnCapsLockDown((payload) => events.push(['down', payload.trigger_id]));
+  listener.setOnCapsLockUp((payload) => events.push(['up', payload.trigger_id]));
+  const inputEvent = (value) => {
+    const event = Buffer.alloc(24);
+    event.writeUInt16LE(1, 16);
+    event.writeUInt16LE(54, 18);
+    event.writeInt32LE(value, 20);
+    return event;
+  };
+
+  listener._onInputEventData(devicePath, inputEvent(1));
+  listener._onInputEventData(devicePath, inputEvent(2));
+  listener._onInputEventData(devicePath, inputEvent(0));
+
+  assert.deepEqual(events, [
+    ['down', 'minijoy_bt:14080852f962'],
+    ['up', 'minijoy_bt:14080852f962'],
+  ]);
+});
+
+test('ignores close events from a replaced input stream generation', () => {
+  const listener = new CapsLockListener();
+  const devicePath = '/dev/input/event257';
+  const oldStream = { destroyed: true };
+  const newStream = { destroyed: false, destroy() { this.destroyed = true; } };
+  listener._inputDeviceHandles.set(devicePath, { stream: newStream });
+  listener._inputDeviceInfo.set(devicePath, { trigger_id: 'minijoy_bt:14080852f962' });
+  listener._inputBuffers.set(devicePath, Buffer.alloc(0));
+
+  listener._closeLinuxInputDevice(devicePath, oldStream, 'stale_close');
+
+  assert.equal(listener._inputDeviceHandles.get(devicePath).stream, newStream);
+  assert.equal(listener._inputDeviceInfo.get(devicePath).trigger_id, 'minijoy_bt:14080852f962');
+});
+
+test('polls MiniJoy evdev without relying on fs.ReadStream', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  const devicePath = '/dev/input/event257';
+  const event = Buffer.alloc(24);
+  event.writeUInt16LE(1, 16);
+  event.writeUInt16LE(54, 18);
+  event.writeInt32LE(1, 20);
+  listener._inputDeviceHandles.set(devicePath, {
+    devicePath,
+    fd: 123,
+    pollMiniJoy: true,
+    readBuffer: Buffer.alloc(24 * 32),
+  });
+  listener._inputBuffers.set(devicePath, Buffer.alloc(0));
+  listener._inputDeviceInfo.set(devicePath, {
+    trigger_id: 'minijoy_bt:14080852f962',
+    device_path: devicePath,
+    backend: 'evdev',
+  });
+  const received = [];
+  listener.setOnCapsLockDown((payload) => received.push(payload.trigger_id));
+  const originalReadSync = fs.readSync;
+  let reads = 0;
+  fs.readSync = (_fd, buffer) => {
+    if (reads++ === 0) {
+      event.copy(buffer);
+      return event.length;
+    }
+    const error = new Error('try again');
+    error.code = 'EAGAIN';
+    throw error;
+  };
+  try {
+    listener._pollMiniJoyInputDevices();
+  } finally {
+    fs.readSync = originalReadSync;
+  }
+
+  assert.deepEqual(received, ['minijoy_bt:14080852f962']);
+});
+
+test('tracks same-name MiniJoy hold keys independently and releases a disconnected device', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  const events = [];
+  listener.setOnCapsLockDown((payload) => events.push(['down', payload.trigger_id, payload.reason || '']));
+  listener.setOnCapsLockUp((payload) => events.push(['up', payload.trigger_id, payload.reason || '']));
+
+  const first = {
+    trigger_id: 'minijoy_bt:112233445566',
+    device_path: '/dev/input/event17',
+    backend: 'evdev',
+  };
+  const second = {
+    trigger_id: 'minijoy_bt:aabbccddeeff',
+    device_path: '/dev/input/event19',
+    backend: 'evdev',
+  };
+  listener._handleHoldKeyDown('dictation', listener.dictationKeyConfig, 54, first);
+  listener._handleHoldKeyDown('dictation', listener.dictationKeyConfig, 54, second);
+  listener._releaseEvdevHoldsForDevice(first.device_path);
+  listener._handleHoldKeyUp('dictation', listener.dictationKeyConfig, 54, second);
+
+  assert.deepEqual(events, [
+    ['down', first.trigger_id, ''],
+    ['down', second.trigger_id, ''],
+    ['up', first.trigger_id, 'input_device_closed'],
+    ['up', second.trigger_id, 'key_released'],
   ]);
 });

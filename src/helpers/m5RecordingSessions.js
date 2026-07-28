@@ -1,18 +1,32 @@
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
 class M5RecordingSessions {
   constructor({
     now = Date.now,
     cleanupMs = 60000,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
+    spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), "capswriter-recordings-")),
   } = {}) {
     this.now = now;
     this.cleanupMs = cleanupMs;
     this.setTimer = setTimer;
     this.clearTimer = clearTimer;
+    this.spoolDir = spoolDir;
     this.sessions = new Map();
   }
 
-  create({ id, intent, mode, targetWindowId = "" }) {
+  create({ id, intent, mode, targetWindowId = "", ownerDeviceId = "", triggerId = "" }) {
+    const existing = this.sessions.get(id);
+    if (existing && !existing.done) {
+      return existing;
+    }
+    const safeId = String(id || "session").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const pcmFile = path.join(this.spoolDir, `${safeId}.pcm`);
+    fs.mkdirSync(this.spoolDir, { recursive: true });
+    fs.writeFileSync(pcmFile, Buffer.alloc(0));
     const session = {
       id,
       status: "recording",
@@ -20,12 +34,22 @@ class M5RecordingSessions {
       mode,
       bytes: 0,
       chunks: 0,
-      audioChunks: [],
+      pcmFile,
       sampleRate: 16000,
       audioFile: "",
       done: false,
       createdAt: this.now(),
       targetWindowId,
+      ownerDeviceId,
+      triggerId,
+      expectedChunkId: 0,
+      receivedChunkIds: new Map(),
+      firstAudioAt: 0,
+      lastAudioAt: 0,
+      lastUploadAttemptAt: 0,
+      rendererDispatched: false,
+      rendererStopped: false,
+      terminationStarted: false,
       pendingEnter: false,
       enterSent: false,
       enterDispatching: false,
@@ -50,7 +74,8 @@ class M5RecordingSessions {
     const audio = Buffer.from(chunk);
     session.bytes += audio.length;
     session.chunks += 1;
-    session.audioChunks.push(audio);
+    session.lastAudioAt = this.now();
+    fs.appendFileSync(session.pcmFile, audio);
     return true;
   }
 
@@ -163,6 +188,11 @@ class M5RecordingSessions {
     }
     session.cleanupTimer = this.setTimer(() => {
       this.sessions.delete(session.id);
+      try {
+        fs.rmSync(session.pcmFile, { force: true });
+      } catch (_) {
+        // Best-effort cleanup only.
+      }
       session.cleanupTimer = null;
     }, this.cleanupMs);
     session.cleanupTimer.unref?.();
@@ -179,6 +209,11 @@ class M5RecordingSessions {
       }
     }
     this.sessions.clear();
+    try {
+      fs.rmSync(this.spoolDir, { recursive: true, force: true });
+    } catch (_) {
+      // Best-effort cleanup only.
+    }
   }
 }
 

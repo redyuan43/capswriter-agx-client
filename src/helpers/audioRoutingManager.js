@@ -1,11 +1,39 @@
 const { execFileSync } = require("child_process");
 
-const ROUTING_SETTING_KEY = "audio_input_routes_v1";
+const ROUTING_SETTING_KEY = "audio_input_routes_v2";
+const LEGACY_ROUTING_SETTING_KEY = "audio_input_routes_v1";
 const DEFAULT_USB_DESCRIPTION = "MI Speakphone Mono";
 const UNIFIED_SOURCE_NAME = "capswriter_input_bus.monitor";
 
 function cleanId(value) {
   return String(value || "").trim();
+}
+
+function normalizeBluetoothAddress(value) {
+  const hex = cleanId(value).toLowerCase().replace(/[^0-9a-f]/g, "");
+  return hex.length === 12 ? hex : "";
+}
+
+function bluetoothAddressFromSource(source) {
+  const properties = source?.properties || {};
+  const explicit = normalizeBluetoothAddress(
+    source?.bluetooth_address ||
+    properties["api.bluez5.address"] ||
+    properties["device.string"]
+  );
+  if (explicit) return explicit;
+  const nodeName = cleanId(source?.stable_node_name || source?.name || properties["node.name"]);
+  return normalizeBluetoothAddress(nodeName.match(/bluez_input\.([0-9a-f_:-]{17})/i)?.[1] || "");
+}
+
+function miniJoyTriggerId(address) {
+  const normalized = normalizeBluetoothAddress(address);
+  return normalized ? `minijoy_bt:${normalized}` : "minijoy_bt";
+}
+
+function miniJoyTriggerLabel(triggerId) {
+  const address = normalizeBluetoothAddress(String(triggerId || "").split(":").slice(1).join(":"));
+  return address ? `MiniJoy ${address.slice(-4, -2).toUpperCase()}:${address.slice(-2).toUpperCase()}` : "MiniJoy 蓝牙按键";
 }
 
 function stableNodeName(value) {
@@ -29,7 +57,7 @@ function normalizeRoutes(value) {
       }
     }
   }
-  return { version: 1, routes: normalized };
+  return { version: 2, routes: normalized };
 }
 
 class AudioRoutingManager {
@@ -43,12 +71,14 @@ class AudioRoutingManager {
     this.logger = logger;
     this.runCommand = runCommand;
     this.wifiDeviceProvider = wifiDeviceProvider;
-    this.activeRoute = null;
+    this.activeRoutes = new Map();
   }
 
   loadRoutes() {
+    const current = this.databaseManager?.getSetting?.(ROUTING_SETTING_KEY, null);
+    if (current) return normalizeRoutes(current);
     return normalizeRoutes(
-      this.databaseManager?.getSetting?.(ROUTING_SETTING_KEY, { version: 1, routes: {} })
+      this.databaseManager?.getSetting?.(LEGACY_ROUTING_SETTING_KEY, { version: 1, routes: {} })
     );
   }
 
@@ -56,6 +86,19 @@ class AudioRoutingManager {
     const normalized = normalizeRoutes(value);
     this.databaseManager?.setSetting?.(ROUTING_SETTING_KEY, normalized);
     return normalized;
+  }
+
+  routesForSources(sources) {
+    const saved = this.loadRoutes();
+    const legacy = saved.routes.minijoy_bt;
+    if (!legacy) return saved;
+    const source = sources.find((candidate) => candidate.source_id === legacy.source_id);
+    if (!source?.bluetooth_address) return saved;
+    const triggerId = miniJoyTriggerId(source.bluetooth_address);
+    if (!saved.routes[triggerId]) saved.routes[triggerId] = { ...legacy };
+    delete saved.routes.minijoy_bt;
+    this.databaseManager?.setSetting?.(ROUTING_SETTING_KEY, saved);
+    return saved;
   }
 
   listPipeWireSources() {
@@ -78,14 +121,24 @@ class AudioRoutingManager {
           const description = cleanId(source.description || properties["device.description"] || nodeName);
           const bluetooth = stableName.startsWith("bluez_input.") ||
             /VibeStick MiniJoy/i.test(description);
+          const bluetoothAddress = bluetoothAddressFromSource({
+            name: nodeName,
+            stable_node_name: stableName,
+            properties,
+          });
           return {
             source_id: sourceIdForPipeWire(source),
             kind: "pipewire",
             node_name: nodeName,
             stable_node_name: stableName,
-            name: description,
+            name: bluetooth && bluetoothAddress
+              ? `${description} ${bluetoothAddress.slice(-4, -2).toUpperCase()}:${bluetoothAddress.slice(-2).toUpperCase()}`
+              : description,
+            base_name: description,
             online: String(source.state || "").toUpperCase() !== "UNAVAILABLE",
             bluetooth,
+            bluetooth_address: bluetoothAddress,
+            trigger_id: bluetooth ? miniJoyTriggerId(bluetoothAddress) : "",
             unified: stableName === UNIFIED_SOURCE_NAME,
             properties,
           };
@@ -123,6 +176,12 @@ class AudioRoutingManager {
   }
 
   defaultSourceForTrigger(triggerId, sources = this.listSources()) {
+    if (triggerId.startsWith("minijoy_bt:")) {
+      const address = normalizeBluetoothAddress(triggerId.slice("minijoy_bt:".length));
+      return sources.find((source) =>
+        source.kind === "pipewire" && source.bluetooth_address === address
+      )?.source_id || "";
+    }
     if (triggerId === "minijoy_bt") {
       return sources.find((source) => source.kind === "pipewire" && source.bluetooth)?.source_id || "";
     }
@@ -138,10 +197,8 @@ class AudioRoutingManager {
     )?.source_id || "";
   }
 
-  resolveRoute(triggerId) {
+  resolveRoute(triggerId, sources = this.listSources(), saved = this.routesForSources(sources)) {
     const cleanTriggerId = cleanId(triggerId) || "keyboard";
-    const sources = this.listSources();
-    const saved = this.loadRoutes();
     const sourceId = cleanId(saved.routes[cleanTriggerId]?.source_id) ||
       this.defaultSourceForTrigger(cleanTriggerId, sources);
     const source = sources.find((candidate) => candidate.source_id === sourceId) || {
@@ -154,42 +211,46 @@ class AudioRoutingManager {
       trigger_id: cleanTriggerId,
       source_id: sourceId,
       source,
+      trigger_name: miniJoyTriggerLabel(cleanTriggerId),
       available: Boolean(sourceId && source.online),
     };
   }
 
   activateTrigger(triggerId) {
     const route = this.resolveRoute(triggerId);
-    this.activeRoute = {
+    const activeRoute = {
       ...route,
       activated_at: Date.now(),
     };
-    this.logger?.info?.("Audio input route activated", this.activeRoute);
-    return this.activeRoute;
+    this.activeRoutes.set(route.trigger_id, activeRoute);
+    this.logger?.info?.("Audio input route activated", activeRoute);
+    return activeRoute;
   }
 
   clearActiveRoute(triggerId = "") {
-    if (!this.activeRoute) return;
-    if (!triggerId || this.activeRoute.trigger_id === triggerId) {
-      this.activeRoute = null;
-    }
+    if (!triggerId) this.activeRoutes.clear();
+    else this.activeRoutes.delete(triggerId);
   }
 
   getState() {
     const sources = this.listSources();
-    const saved = this.loadRoutes();
+    const saved = this.routesForSources(sources);
+    const bluetoothTriggerIds = sources
+      .filter((source) => source.bluetooth && source.bluetooth_address)
+      .map((source) => miniJoyTriggerId(source.bluetooth_address));
     const triggerIds = new Set([
       "keyboard",
-      "minijoy_bt",
+      ...bluetoothTriggerIds,
+      ...(bluetoothTriggerIds.length ? [] : ["minijoy_bt"]),
       ...this.listWifiSources().map((source) => source.source_id),
       ...Object.keys(saved.routes),
     ]);
     const routes = {};
     for (const triggerId of triggerIds) {
-      routes[triggerId] = this.resolveRoute(triggerId);
+      routes[triggerId] = this.resolveRoute(triggerId, sources, saved);
     }
     return {
-      version: 1,
+      version: 2,
       unified_source: {
         source_id: `pipewire:${UNIFIED_SOURCE_NAME}`,
         node_name: UNIFIED_SOURCE_NAME,
@@ -197,15 +258,21 @@ class AudioRoutingManager {
       },
       sources,
       routes,
-      active_route: this.activeRoute,
+      active_route: [...this.activeRoutes.values()].at(-1) || null,
+      active_routes: [...this.activeRoutes.values()],
     };
   }
 }
 
 module.exports = AudioRoutingManager;
 module.exports.ROUTING_SETTING_KEY = ROUTING_SETTING_KEY;
+module.exports.LEGACY_ROUTING_SETTING_KEY = LEGACY_ROUTING_SETTING_KEY;
 module.exports.DEFAULT_USB_DESCRIPTION = DEFAULT_USB_DESCRIPTION;
 module.exports.UNIFIED_SOURCE_NAME = UNIFIED_SOURCE_NAME;
 module.exports.normalizeRoutes = normalizeRoutes;
 module.exports.sourceIdForPipeWire = sourceIdForPipeWire;
 module.exports.stableNodeName = stableNodeName;
+module.exports.normalizeBluetoothAddress = normalizeBluetoothAddress;
+module.exports.bluetoothAddressFromSource = bluetoothAddressFromSource;
+module.exports.miniJoyTriggerId = miniJoyTriggerId;
+module.exports.miniJoyTriggerLabel = miniJoyTriggerLabel;

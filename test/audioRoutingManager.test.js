@@ -29,7 +29,19 @@ const pactlSources = [
     name: "bluez_input.C8_85_41_68_39_0A.0",
     description: "VibeStick MiniJoy",
     state: "RUNNING",
-    properties: { "node.name": "bluez_input.C8_85_41_68_39_0A.0" },
+    properties: {
+      "node.name": "bluez_input.C8_85_41_68_39_0A.0",
+      "api.bluez5.address": "C8:85:41:68:39:0A",
+    },
+  },
+  {
+    name: "bluez_input.F0_16_1D_03_3B_CE.0",
+    description: "VibeStick MiniJoy",
+    state: "SUSPENDED",
+    properties: {
+      "node.name": "bluez_input.F0_16_1D_03_3B_CE.0",
+      "api.bluez5.address": "F0:16:1D:03:3B:CE",
+    },
   },
   {
     name: "capswriter_input_bus.monitor",
@@ -57,6 +69,10 @@ test("audio routing assigns defaults by trigger origin", () => {
 
   assert.match(manager.resolveRoute("keyboard").source_id, /MI_Speakphone/);
   assert.match(manager.resolveRoute("minijoy_bt").source_id, /bluez_input/);
+  assert.equal(
+    manager.resolveRoute("minijoy_bt:f0161d033bce").source_id,
+    "pipewire:bluez_input.F0_16_1D_03_3B_CE"
+  );
   assert.equal(
     manager.resolveRoute("wifi:14:c1:9f:d5:65:c4").source_id,
     "wifi:14:c1:9f:d5:65:c4"
@@ -99,4 +115,29 @@ test("audio routing advertises the actual unified PipeWire monitor", () => {
     manager.getState().unified_source.node_name,
     "capswriter_input_bus.monitor"
   );
+});
+
+test("audio routing exposes same-name MiniJoy devices as independent triggers", () => {
+  const state = createManager().getState();
+  assert.equal(state.version, 2);
+  assert.equal(state.routes["minijoy_bt:c8854168390a"].trigger_name, "MiniJoy 39:0A");
+  assert.equal(state.routes["minijoy_bt:f0161d033bce"].trigger_name, "MiniJoy 3B:CE");
+  assert.equal(state.routes["minijoy_bt:c8854168390a"].source_id, "pipewire:bluez_input.C8_85_41_68_39_0A");
+  assert.equal(state.routes["minijoy_bt:f0161d033bce"].source_id, "pipewire:bluez_input.F0_16_1D_03_3B_CE");
+});
+
+test("audio routing migrates the legacy shared MiniJoy route to its Bluetooth identity", () => {
+  const database = createDatabase({
+    version: 1,
+    routes: {
+      minijoy_bt: { source_id: "pipewire:bluez_input.F0_16_1D_03_3B_CE" },
+    },
+  });
+  const state = createManager(database).getState();
+  assert.equal("minijoy_bt" in state.routes, false);
+  assert.equal(
+    state.routes["minijoy_bt:f0161d033bce"].source_id,
+    "pipewire:bluez_input.F0_16_1D_03_3B_CE"
+  );
+  assert.equal(database.value().version, 2);
 });

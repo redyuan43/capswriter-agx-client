@@ -22,6 +22,11 @@ const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
 const STOP_WAIT_MS = 210000;
 const CYBER_AGENT_TIMEOUT_MS = 180000;
 const MAX_TTS_AUDIO_BYTES = 1024 * 1024;
+const MAX_CONCURRENT_RECORDINGS = 4;
+const RECORDING_FIRST_CHUNK_TIMEOUT_MS = 12000;
+const RECORDING_STALL_TIMEOUT_MS = 10000;
+const RECORDING_MAX_DURATION_MS = 180000;
+const DEFAULT_MINIJOY_BLUETOOTH_MAC = "14:08:08:52:F9:62";
 function cleanToken(value) {
   const token = String(value || "").trim();
   if (!token || [
@@ -50,6 +55,21 @@ function parseBool(value, defaultValue = true) {
     return defaultValue;
   }
   return !["0", "false", "off", "no"].includes(String(value).trim().toLowerCase());
+}
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer || []) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function crc32Hex(buffer) {
+  return crc32(buffer).toString(16).padStart(8, "0");
 }
 
 function readRequestBody(req, limitBytes) {
@@ -222,6 +242,12 @@ class M5VoiceBridge {
       logger: this.logger,
     });
     this.hostTriggerSessions = new Map();
+    this.rendererSessionId = "";
+    this.rendererQueue = [];
+    this.bridgeInstanceId = randomUUID();
+    this.recordingFirstChunkTimeoutMs = RECORDING_FIRST_CHUNK_TIMEOUT_MS;
+    this.recordingStallTimeoutMs = RECORDING_STALL_TIMEOUT_MS;
+    this.recordingMaxDurationMs = RECORDING_MAX_DURATION_MS;
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
@@ -283,6 +309,7 @@ class M5VoiceBridge {
     if (!this.server) {
       return;
     }
+    this.rendererRecovery = true;
     for (const session of this.sessions.values()) {
       this.finishSession(session, {
         success: false,
@@ -291,6 +318,11 @@ class M5VoiceBridge {
       });
     }
     this.pipeWireCapture.stopAll();
+    this.recordingSessions.clear();
+    this.hostTriggerSessions.clear();
+    this.rendererQueue = [];
+    this.rendererSessionId = "";
+    this.rendererRecovery = false;
     this.server.close();
     this.server = null;
   }
@@ -364,10 +396,14 @@ button { margin-top: 14px; min-height: 38px; border: 0; background: #175cd3; col
 <script>
 const state = ${routingState};
 const routeRoot = document.getElementById("routes");
-const triggerLabel = (id) => id === "keyboard" ? "键盘按键" : id === "minijoy_bt" ? "MiniJoy 蓝牙按键" : "WiFi 设备 " + id.slice(5);
+const triggerLabel = (id, route) => id === "keyboard"
+  ? "键盘按键"
+  : id.startsWith("minijoy_bt")
+    ? (route.trigger_name || "MiniJoy 蓝牙按键")
+    : "WiFi 设备 " + id.slice(5);
 for (const [triggerId, route] of Object.entries(state.routes)) {
   const label = document.createElement("label");
-  label.textContent = triggerLabel(triggerId);
+  label.textContent = triggerLabel(triggerId, route);
   label.htmlFor = "route-" + triggerId;
   const select = document.createElement("select");
   select.id = "route-" + triggerId;
@@ -392,7 +428,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     const response = await fetch("/audio/routing", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ version: 1, routes }),
+      body: JSON.stringify({ version: 2, routes }),
     });
     if (!response.ok) throw new Error("HTTP " + response.status);
     status.textContent = "已保存";
@@ -459,6 +495,11 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       bridge_label: this.bridgeLabel,
       bridge_name: "capswriter-m5-voice-bridge",
       bridge_version: "1.0.0",
+      bridge_instance_id: this.bridgeInstanceId,
+      recording_protocol_version: 2,
+      max_concurrent_recordings: MAX_CONCURRENT_RECORDINGS,
+      recording_first_chunk_timeout_ms: this.recordingFirstChunkTimeoutMs,
+      recording_stall_timeout_ms: this.recordingStallTimeoutMs,
       token_required: Boolean(this.token),
     };
   }
@@ -482,10 +523,12 @@ document.getElementById("save-routes").addEventListener("click", async () => {
   }
 
   buildState() {
+    const bluetooth = this.bluetoothDiagnosticState();
     return {
       time: new Date().toISOString(),
       wifi: true,
-      ble: false,
+      ble: bluetooth.pipewire_available,
+      bluetooth,
       active_provider: "codex",
       provider: {
         id: "codex",
@@ -507,6 +550,38 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       recording: this.currentRecordingState(),
       tts_playback_request_id: this.ttsPlaybackRequestId,
       ...this.healthPayload(),
+    };
+  }
+
+  bluetoothDiagnosticState() {
+    const targetMac = String(process.env.M5_MINIJOY_BLUETOOTH_MAC ||
+      DEFAULT_MINIJOY_BLUETOOTH_MAC).trim().toUpperCase();
+    const normalizedTargetMac = targetMac.replace(/[^0-9A-F]/g, "");
+    const routing = this.getAudioRoutingState();
+    const sources = (routing.sources || []).filter((source) => source.bluetooth).map((source) => ({
+      source_id: source.source_id,
+      name: source.name,
+      online: Boolean(source.online),
+      bluetooth_address: source.bluetooth_address || "",
+    }));
+    const target = sources.find((source) =>
+      String(source.bluetooth_address || "").toUpperCase().replace(/[^0-9A-F]/g, "") === normalizedTargetMac);
+    const diagnosticFile = process.env.M5_BRIDGE_DIAGNOSTIC_FILE ||
+      path.join(os.homedir(), ".cache", "capswriter-agx-client", "m5bridge-doctor.json");
+    let diagnostic = null;
+    try {
+      diagnostic = JSON.parse(fs.readFileSync(diagnosticFile, "utf8"));
+    } catch {
+      // The diagnostic command is optional; absence is itself represented below.
+    }
+    const pipewireAvailable = Boolean(target?.online);
+    return {
+      target_mac: targetMac,
+      stage: pipewireAvailable ? "pipewire" : (diagnostic?.stage || "pipewire_source_missing"),
+      pipewire_available: pipewireAvailable,
+      source: target || null,
+      sources,
+      last_diagnostic: diagnostic,
     };
   }
 
@@ -590,6 +665,10 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     return this.recordingSessions.currentState();
   }
 
+  hasActiveRecordings() {
+    return [...this.sessions.values()].some((session) => !session.done);
+  }
+
   handleFollowupKey(body, res, options) {
     const responseKey = `followup_${options.name}`;
     const sessionId = String(body.session_id || "").trim();
@@ -667,11 +746,8 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     }
 
     const session = cancellation.session;
-    this.sendToRenderer("external-recording-cancel", {
-      session_id: sessionId,
+    this.terminateSession(session, {
       reason: "button_followup_escape",
-    });
-    this.finishSession(session, {
       success: true,
       status: "cancelled",
       cancelled: true,
@@ -771,6 +847,26 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       body.trigger_id ||
       (req.vibeDevice?.device_id ? `wifi:${req.vibeDevice.device_id}` : "wifi:unknown")
     ).trim();
+    const ownerDeviceId = String(req.vibeDevice?.device_id || body.device_id || triggerId).trim();
+    const existing = this.sessions.get(sessionId);
+    if (existing && !existing.done) {
+      if (existing.ownerDeviceId !== ownerDeviceId) {
+        this.sendJson(res, 409, { success: false, error: "session_id belongs to another device" });
+        return;
+      }
+      const response = {
+        success: true,
+        recording: this.recordingStartPayload(existing, true),
+      };
+      if (!req.vibeDevice) response.state = this.buildState();
+      this.sendJson(res, 200, response);
+      return;
+    }
+    const activeCount = [...this.sessions.values()].filter((session) => !session.done).length;
+    if (activeCount >= MAX_CONCURRENT_RECORDINGS) {
+      this.sendJson(res, 429, { success: false, error: "recording capacity reached" });
+      return;
+    }
     const route = this.audioRouting.activateTrigger(triggerId);
     const requestingSourceId = req.vibeDevice?.device_id
       ? `wifi:${req.vibeDevice.device_id}`
@@ -781,37 +877,33 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       : sourceId.startsWith("wifi:")
         ? "remote_device"
         : "host_capture";
-    this.windowManager?.showFloatingBall?.();
+    this.windowManager?.showFloatingBall?.({ rememberActiveWindow: activeCount === 0 });
     const targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
     const session = this.recordingSessions.create({
       id: sessionId,
       intent,
       mode,
       targetWindowId,
+      ownerDeviceId,
+      triggerId,
     });
     session.triggerId = triggerId;
     session.sourceId = sourceId;
     session.captureMode = captureMode;
     session.sourceDeviceId = sourceId.startsWith("wifi:") ? sourceId.slice(5) : "";
+    session.source = body.source || "m5stickc_plus";
+    session.audioSource = body.audio_source || "stickc_plus_pcm";
+    session.protocolVersion = Math.max(1, Number(body.protocol_version || 1));
     session.seenChunkIds = new Set();
-    this.sendToRenderer("external-recording-start", {
-      session_id: sessionId,
-      source: body.source || "m5stickc_plus",
-      audio_source: body.audio_source || "stickc_plus_pcm",
-      sample_rate: 16000,
-      bits_per_sample: 16,
-      channels: 1,
-      mode: intent,
-      trigger_mode: mode,
-      intent,
-    });
+    this.armSessionWatchdogs(session);
     if (captureMode === "host_capture") {
       this.pipeWireUnifiedSource.activate(route.source.node_name);
       this.pipeWireCapture.start(
         sessionId,
         sourceId,
         (chunk) => this.appendRecordingAudio(session, chunk),
-        route.source.node_name
+        route.source.node_name,
+        { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
     } else if (captureMode === "remote_device") {
       this.commandBroker.enqueue(session.sourceDeviceId, {
@@ -833,34 +925,40 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       captureMode,
       targetWindowId: session.targetWindowId || null,
     });
-    this.sendJson(res, 200, {
+    const response = {
       success: true,
-      recording: {
-        status: "recording",
-        session_id: sessionId,
-        intent,
-        capture_mode: captureMode,
-        source_id: sourceId,
-        audio_format: {
-          codec: "pcm_s16le",
-          sample_rate: 16000,
-          channels: 1,
-        },
-      },
-      state: this.buildState(),
-    });
+      recording: this.recordingStartPayload(session, false),
+    };
+    if (!req.vibeDevice) response.state = this.buildState();
+    this.sendJson(res, 200, response);
   }
 
   appendRecordingAudio(session, body) {
     if (!this.recordingSessions.appendAudio(session, body)) {
       return false;
     }
+    if (!session.firstAudioAt) {
+      session.firstAudioAt = session.lastAudioAt;
+      this.logger?.info?.("M5 first audio chunk accepted", {
+        sessionId: session.id,
+        delayMs: session.firstAudioAt - session.createdAt,
+        bytes: body.length,
+      });
+    }
     const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
-    this.sendToRenderer("external-recording-chunk", {
-      session_id: session.id,
-      chunk,
-      byte_length: body.length,
-    });
+    const dispatchedNow = !session.rendererDispatched &&
+      !this.rendererSessionId &&
+      this.dispatchRendererSessionIfIdle(session);
+    if (dispatchedNow) {
+      return true;
+    }
+    if (this.rendererSessionId === session.id) {
+      this.sendToRenderer("external-recording-chunk", {
+        session_id: session.id,
+        chunk,
+        byte_length: body.length,
+      });
+    }
     return true;
   }
 
@@ -884,22 +982,94 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       this.sendJson(res, 404, { success: false, error: "recording session not found" });
       return;
     }
-    const body = await readRequestBody(req, MAX_AUDIO_CHUNK_BYTES);
-    const duplicate = Boolean(chunkId && session.seenChunkIds?.has(chunkId));
-    if (!duplicate) {
-      if (chunkId) session.seenChunkIds?.add(chunkId);
-      this.appendRecordingAudio(session, body);
+    const requestDeviceId = String(req.vibeDevice?.device_id || "").trim();
+    if (requestDeviceId && session.ownerDeviceId && requestDeviceId !== session.ownerDeviceId) {
+      this.logger?.warn?.("M5 audio chunk rejected", {
+        sessionId,
+        statusCode: 403,
+        error: "recording session belongs to another device",
+        requestDeviceId,
+        ownerDeviceId: session.ownerDeviceId,
+      });
+      this.sendJson(res, 403, { success: false, error: "recording session belongs to another device" });
+      return;
     }
+    session.lastUploadAttemptAt = Date.now();
+    const body = await readRequestBody(req, MAX_AUDIO_CHUNK_BYTES);
+    const strictProtocol = session.protocolVersion >= 2;
+    const numericChunkId = chunkId === "" ? null : Number(chunkId);
+    const duplicate = strictProtocol
+      ? numericChunkId !== null && numericChunkId < session.expectedChunkId
+      : Boolean(chunkId && session.seenChunkIds.has(chunkId));
+    if (numericChunkId !== null && (!Number.isInteger(numericChunkId) || numericChunkId < 0)) {
+      this.logger?.warn?.("M5 audio chunk rejected", {
+        sessionId, statusCode: 400, error: "invalid chunk_id", chunkId,
+      });
+      this.sendJson(res, 400, { success: false, error: "invalid chunk_id" });
+      return;
+    }
+    if (strictProtocol && numericChunkId === null) {
+      this.logger?.warn?.("M5 audio chunk rejected", {
+        sessionId, statusCode: 400, error: "chunk_id is required for protocol v2",
+      });
+      this.sendJson(res, 400, { success: false, error: "chunk_id is required for protocol v2" });
+      return;
+    }
+    if (strictProtocol && numericChunkId > session.expectedChunkId) {
+      this.logger?.warn?.("M5 audio chunk rejected", {
+        sessionId,
+        statusCode: 409,
+        error: "audio chunk out of order",
+        chunkId: numericChunkId,
+        expectedChunkId: session.expectedChunkId,
+      });
+      this.sendJson(res, 409, {
+        success: false,
+        error: "audio chunk out of order",
+        recording: { session_id: sessionId, expected_chunk_id: session.expectedChunkId },
+      });
+      return;
+    }
+    if (strictProtocol) {
+      const expectedCrc = String(
+        req.headers["x-vibe-stick-chunk-crc32"] || url.searchParams.get("chunk_crc32") || ""
+      ).trim().toLowerCase().replace(/^0x/, "");
+      const actualCrc = crc32Hex(body);
+      if (!expectedCrc || expectedCrc !== actualCrc) {
+        this.logger?.warn?.("M5 audio chunk rejected", {
+          sessionId,
+          statusCode: 422,
+          error: expectedCrc ? "audio chunk checksum mismatch" : "chunk CRC32 is required for protocol v2",
+          chunkId: numericChunkId,
+          expectedChunkId: session.expectedChunkId,
+          expectedCrc: expectedCrc || null,
+          actualCrc,
+        });
+        this.sendJson(res, 422, {
+          success: false,
+          error: expectedCrc ? "audio chunk checksum mismatch" : "chunk CRC32 is required for protocol v2",
+          recording: { session_id: sessionId, expected_chunk_id: session.expectedChunkId, actual_crc32: actualCrc },
+        });
+        return;
+      }
+    }
+    if (!duplicate) {
+      this.appendRecordingAudio(session, body);
+      if (strictProtocol) session.expectedChunkId += 1;
+      else if (chunkId) session.seenChunkIds.add(chunkId);
+    }
+    const recording = {
+      status: "recording",
+      session_id: sessionId,
+      bytes: session.bytes,
+      chunks: session.chunks,
+      chunk_id: chunkId,
+      duplicate,
+    };
+    if (strictProtocol) recording.expected_chunk_id = session.expectedChunkId;
     this.sendJson(res, 200, {
       success: true,
-      recording: {
-        status: "recording",
-        session_id: sessionId,
-        bytes: session.bytes,
-        chunks: session.chunks,
-        chunk_id: chunkId,
-        duplicate,
-      },
+      recording,
     });
   }
 
@@ -915,9 +1085,14 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       });
       return;
     }
+    const requestDeviceId = String(req.vibeDevice?.device_id || body.device_id || "").trim();
+    if (requestDeviceId && session.ownerDeviceId && requestDeviceId !== session.ownerDeviceId) {
+      this.sendJson(res, 403, { success: false, error: "recording session belongs to another device" });
+      return;
+    }
     if (session.done) {
       if (session.status === "cancelled") {
-        this.sendJson(res, 200, {
+        const response = {
           success: true,
           recording: {
             status: "cancelled",
@@ -926,8 +1101,9 @@ document.getElementById("save-routes").addEventListener("click", async () => {
             intent: session.intent,
             message: session.result?.message || "External M5 recording cancelled",
           },
-          state: this.buildState(),
-        });
+        };
+        if (!req.vibeDevice) response.state = this.buildState();
+        this.sendJson(res, 200, response);
         return;
       }
       this.sendJson(res, 404, {
@@ -936,6 +1112,48 @@ document.getElementById("save-routes").addEventListener("click", async () => {
         error: "recording session already completed",
       });
       return;
+    }
+    if (session.protocolVersion >= 2) {
+      if (body.upload_failed === true) {
+        this.abortSession(session, "device_audio_upload_failed");
+        this.sendJson(res, 422, {
+          success: false,
+          recording: { status: "recording_failed", session_id: sessionId },
+          error: "device reported an audio upload failure",
+        });
+        return;
+      }
+      const totalChunks = Number(body.total_chunks);
+      const totalBytes = Number(body.total_bytes);
+      if (!Number.isInteger(totalChunks) || !Number.isInteger(totalBytes) ||
+          totalChunks !== session.chunks || totalBytes !== session.bytes) {
+        this.abortSession(session, "audio_integrity_mismatch", {
+          expectedChunks: session.chunks,
+          expectedBytes: session.bytes,
+          reportedChunks: body.total_chunks,
+          reportedBytes: body.total_bytes,
+        });
+        this.sendJson(res, 422, {
+          success: false,
+          recording: { status: "recording_failed", session_id: sessionId },
+          error: "audio totals do not match",
+        });
+        return;
+      }
+    }
+    if (session.bytes === 0) {
+      this.abortSession(session, "audio_input_empty");
+      this.sendJson(res, 422, {
+        success: false,
+        recording: { status: "recording_failed", session_id: sessionId },
+        error: "recording contains no audio",
+      });
+      return;
+    }
+    session.status = "stopping";
+    if (session.watchdogTimer) {
+      clearTimeout(session.watchdogTimer);
+      session.watchdogTimer = null;
     }
     this.pipeWireCapture.stop(sessionId);
     if (session.captureMode === "remote_device" && session.sourceDeviceId) {
@@ -955,7 +1173,7 @@ document.getElementById("save-routes").addEventListener("click", async () => {
         });
       }
     }
-    session.status = "processing";
+    session.status = "queued";
     session.intent = normalizeRecordingIntent(body.intent, session.intent);
     session.mode = String(body.mode || session.mode || session.intent).trim() || session.intent;
     const paste = body.paste !== false && !isCyberIntent(session.intent);
@@ -968,20 +1186,18 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     } else {
       this.logger?.warn?.("M5 recording has no target window", { sessionId });
     }
-    this.sendToRenderer("external-recording-stop", {
-      session_id: sessionId,
-      paste,
-      mode: session.intent,
-      trigger_mode: session.mode,
-      intent: session.intent,
-      bytes: session.bytes,
-      chunks: session.chunks,
-    });
+    session.paste = paste;
+    session.rendererStopped = true;
+    if (this.rendererSessionId === session.id) {
+      this.dispatchRendererStop(session);
+    } else if (!this.rendererQueue.includes(session.id)) {
+      this.rendererQueue.push(session.id);
+    }
     this.audioRouting.clearActiveRoute(session.triggerId);
     this.restoreUnifiedDefaultSource();
 
     const result = await this.waitForSessionResult(session);
-    this.sendJson(res, 200, {
+    const response = {
       success: result.success !== false,
       recording: {
         status: result.status || (result.success === false ? "transcription_failed" : "pasted"),
@@ -993,8 +1209,9 @@ document.getElementById("save-routes").addEventListener("click", async () => {
         agent_source: result.agent_source || "",
         message: result.error || result.message || "",
       },
-      state: this.buildState(),
-    });
+    };
+    if (!req.vibeDevice) response.state = this.buildState();
+    this.sendJson(res, 200, response);
   }
 
   getAudioRoutingState() {
@@ -1040,6 +1257,14 @@ document.getElementById("save-routes").addEventListener("click", async () => {
   }
 
   async handleHostTriggerDown(triggerId, targetWindowId = "") {
+    if (this.hostTriggerSessions.has(triggerId)) {
+      const sessionId = this.hostTriggerSessions.get(triggerId);
+      return { handled: true, duplicate: true, session_id: sessionId };
+    }
+    const activeCount = [...this.sessions.values()].filter((session) => !session.done).length;
+    if (activeCount >= MAX_CONCURRENT_RECORDINGS) {
+      return { handled: false, busy: true };
+    }
     const route = this.audioRouting.activateTrigger(triggerId);
     if (!route.source_id.startsWith("wifi:")) {
       if (route.available && route.source.node_name) {
@@ -1061,14 +1286,15 @@ document.getElementById("save-routes").addEventListener("click", async () => {
         sessionId,
         route.source_id,
         (chunk) => this.appendRecordingAudio(session, chunk),
-        route.source.node_name
+        route.source.node_name,
+        { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
       return { handled: true, route, session_id: sessionId };
     }
 
     const sessionId = randomUUID().replace(/-/g, "");
     const sourceDeviceId = route.source_id.slice(5);
-    const session = this.createHostRecordingSession({
+    this.createHostRecordingSession({
       sessionId,
       triggerId,
       route,
@@ -1101,6 +1327,8 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       intent: "dictation",
       mode: "dictation",
       targetWindowId,
+      ownerDeviceId: triggerId,
+      triggerId,
     });
     Object.assign(session, {
       triggerId,
@@ -1110,17 +1338,9 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       seenChunkIds: new Set(),
     });
     this.hostTriggerSessions.set(triggerId, sessionId);
-    this.sendToRenderer("external-recording-start", {
-      session_id: sessionId,
-      source: "audio_router",
-      audio_source: route.source_id,
-      sample_rate: 16000,
-      bits_per_sample: 16,
-      channels: 1,
-      mode: "dictation",
-      trigger_mode: "dictation",
-      intent: "dictation",
-    });
+    session.source = "audio_router";
+    session.audioSource = route.source_id;
+    this.armSessionWatchdogs(session);
     return session;
   }
 
@@ -1134,6 +1354,11 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     const session = this.sessions.get(sessionId);
     if (!session || session.done) {
       return { handled: true, session_id: sessionId };
+    }
+    session.status = "stopping";
+    if (session.watchdogTimer) {
+      clearTimeout(session.watchdogTimer);
+      session.watchdogTimer = null;
     }
     let acknowledgement = null;
     if (session.captureMode === "host_capture") {
@@ -1155,16 +1380,18 @@ document.getElementById("save-routes").addEventListener("click", async () => {
         });
       }
     }
-    session.status = "processing";
-    this.sendToRenderer("external-recording-stop", {
-      session_id: sessionId,
-      paste: true,
-      mode: session.intent,
-      trigger_mode: session.mode,
-      intent: session.intent,
-      bytes: session.bytes,
-      chunks: session.chunks,
-    });
+    if (session.bytes === 0) {
+      this.abortSession(session, "audio_input_empty");
+      return { handled: true, session_id: sessionId, acknowledgement, error: "recording contains no audio" };
+    }
+    session.status = "queued";
+    session.paste = true;
+    session.rendererStopped = true;
+    if (this.rendererSessionId === session.id) {
+      this.dispatchRendererStop(session);
+    } else if (!this.rendererQueue.includes(session.id)) {
+      this.rendererQueue.push(session.id);
+    }
     this.audioRouting.clearActiveRoute(triggerId);
     this.restoreUnifiedDefaultSource();
     return { handled: true, session_id: sessionId, acknowledgement };
@@ -1206,6 +1433,170 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     }
     this.finishSession(session, payload);
     return { success: true };
+  }
+
+  recordingStartPayload(session, duplicate = false) {
+    return {
+      status: "recording",
+      session_id: session.id,
+      intent: session.intent,
+      capture_mode: session.captureMode,
+      source_id: session.sourceId,
+      duplicate,
+      expected_chunk_id: session.expectedChunkId,
+      bridge_instance_id: this.bridgeInstanceId,
+      audio_format: { codec: "pcm_s16le", sample_rate: 16000, channels: 1 },
+    };
+  }
+
+  rendererStartPayload(session) {
+    return {
+      session_id: session.id,
+      source: session.source || "audio_router",
+      audio_source: session.audioSource || session.sourceId,
+      sample_rate: session.sampleRate || 16000,
+      bits_per_sample: 16,
+      channels: 1,
+      mode: session.intent,
+      trigger_mode: session.mode,
+      intent: session.intent,
+    };
+  }
+
+  dispatchRendererSessionIfIdle(session) {
+    if (this.rendererSessionId || !session || session.done || session.rendererDispatched || session.bytes <= 0) {
+      return false;
+    }
+    this.rendererSessionId = session.id;
+    session.rendererDispatched = true;
+    this.sendToRenderer("external-recording-start", this.rendererStartPayload(session));
+    if (session.bytes > 0 && session.pcmFile) {
+      const pcm = fs.readFileSync(session.pcmFile);
+      for (let offset = 0; offset < pcm.length; offset += MAX_AUDIO_CHUNK_BYTES) {
+        const chunk = pcm.subarray(offset, Math.min(offset + MAX_AUDIO_CHUNK_BYTES, pcm.length));
+        this.sendToRenderer("external-recording-chunk", {
+          session_id: session.id,
+          chunk,
+          byte_length: chunk.length,
+        });
+      }
+    }
+    if (session.rendererStopped) this.dispatchRendererStop(session);
+    return true;
+  }
+
+  dispatchRendererStop(session) {
+    if (!session || session.done || this.rendererSessionId !== session.id || session.stopDispatched) return;
+    session.stopDispatched = true;
+    session.status = "processing";
+    this.sendToRenderer("external-recording-stop", {
+      session_id: session.id,
+      paste: session.paste !== false,
+      mode: session.intent,
+      trigger_mode: session.mode,
+      intent: session.intent,
+      bytes: session.bytes,
+      chunks: session.chunks,
+    });
+  }
+
+  advanceRendererQueue() {
+    if (this.rendererSessionId) return;
+    while (this.rendererQueue.length) {
+      const session = this.sessions.get(this.rendererQueue.shift());
+      if (session && !session.done && this.dispatchRendererSessionIfIdle(session)) return;
+    }
+    const recording = [...this.sessions.values()]
+      .filter((session) => !session.done && !session.rendererDispatched && session.bytes > 0)
+      .sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (recording) this.dispatchRendererSessionIfIdle(recording);
+  }
+
+  sessionTimeoutReason(session, now = Date.now()) {
+    if (!session || session.done || session.terminationStarted || session.status !== "recording") {
+      return "";
+    }
+    if (now - session.createdAt >= this.recordingMaxDurationMs) {
+      return "recording_duration_exceeded";
+    }
+    if (session.lastAudioAt) {
+      const activityAt = Math.max(session.lastAudioAt, session.lastUploadAttemptAt || 0);
+      return now - activityAt >= this.recordingStallTimeoutMs ? "audio_input_stalled" : "";
+    }
+    const firstChunkActivityAt = session.lastUploadAttemptAt || session.createdAt;
+    return now - firstChunkActivityAt >= this.recordingFirstChunkTimeoutMs
+      ? "first_audio_chunk_timeout"
+      : "";
+  }
+
+  armSessionWatchdogs(session) {
+    if (!session || session.watchdogTimer) return;
+    const check = () => {
+      session.watchdogTimer = null;
+      if (session.done || session.terminationStarted) return;
+      if (session.status !== "recording") return;
+      const reason = this.sessionTimeoutReason(session);
+      if (reason) {
+        this.abortSession(session, reason);
+        return;
+      }
+      session.watchdogTimer = setTimeout(check, 1000);
+      session.watchdogTimer.unref?.();
+    };
+    session.watchdogTimer = setTimeout(check, 1000);
+    session.watchdogTimer.unref?.();
+  }
+
+  abortHostTrigger(triggerId, reason = "input_device_closed") {
+    const sessionId = this.hostTriggerSessions.get(triggerId);
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return this.abortSession(session, reason);
+  }
+
+  abortSession(session, reason, details = {}) {
+    return this.terminateSession(session, {
+      reason,
+      success: false,
+      status: "recording_failed",
+      error: reason,
+      details,
+    });
+  }
+
+  terminateSession(session, result = {}) {
+    if (!session || session.done || session.terminationStarted) return false;
+    session.terminationStarted = true;
+    if (session.watchdogTimer) clearTimeout(session.watchdogTimer);
+    this.pipeWireCapture.stop(session.id);
+    for (const [triggerId, sessionId] of this.hostTriggerSessions.entries()) {
+      if (sessionId === session.id) this.hostTriggerSessions.delete(triggerId);
+    }
+    this.audioRouting.clearActiveRoute(session.triggerId);
+    if (session.rendererDispatched) {
+      this.sendToRenderer("external-recording-cancel", {
+        session_id: session.id,
+        reason: result.reason || result.error || result.status,
+      });
+    }
+    this.finishSession(session, result);
+    const hasActiveSession = [...this.sessions.values()].some((candidate) => !candidate.done);
+    if (!hasActiveSession) {
+      this.restoreUnifiedDefaultSource();
+      this.windowManager?.hideFloatingBall?.();
+    }
+    return true;
+  }
+
+  abortAllSessions(reason = "bridge_recovery") {
+    this.rendererRecovery = true;
+    for (const session of [...this.sessions.values()]) {
+      if (!session.done) this.abortSession(session, reason);
+    }
+    this.rendererQueue = [];
+    this.rendererSessionId = "";
+    this.rendererRecovery = false;
+    this.windowManager?.hideFloatingBall?.();
   }
 
   startCyberAgentForSession(session, payload = {}) {
@@ -1465,17 +1856,21 @@ document.getElementById("save-routes").addEventListener("click", async () => {
     if (session.audioFile) {
       return session.audioFile;
     }
-    if (!session.audioChunks?.length) {
+    if (!session.pcmFile || !fs.existsSync(session.pcmFile)) {
       return "";
     }
     const fileName = `vibestick-${session.id.replace(/[^a-zA-Z0-9_-]/g, "") || randomUUID()}.wav`;
     const filePath = path.join(os.tmpdir(), fileName);
-    fs.writeFileSync(filePath, createPcmWavBuffer(session.audioChunks, session.sampleRate || 16000));
+    fs.writeFileSync(filePath, createPcmWavBuffer([fs.readFileSync(session.pcmFile)], session.sampleRate || 16000));
     session.audioFile = filePath;
     return filePath;
   }
 
   finishSession(session, result) {
+    if (session?.watchdogTimer) {
+      clearTimeout(session.watchdogTimer);
+      session.watchdogTimer = null;
+    }
     const completion = this.recordingSessions.finish(session, result);
     if (!completion.finished) {
       return;
@@ -1487,6 +1882,10 @@ document.getElementById("save-routes").addEventListener("click", async () => {
       chunks: session.chunks,
       success: session.result.success !== false,
     });
+    if (this.rendererSessionId === session.id) {
+      this.rendererSessionId = "";
+      if (!this.rendererRecovery) this.advanceRendererQueue();
+    }
     if (completion.pendingEnter) {
       this.scheduleFollowupKey(session, session.result, ENTER_FOLLOWUP, "queued");
     }
@@ -1530,4 +1929,6 @@ function escapeHtml(value) {
 module.exports = M5VoiceBridge;
 module.exports.normalizeRecordingIntent = normalizeRecordingIntent;
 module.exports.selectCyberAgentCommand = selectCyberAgentCommand;
+module.exports.crc32 = crc32;
+module.exports.crc32Hex = crc32Hex;
 module.exports.createPcmWavBuffer = createPcmWavBuffer;

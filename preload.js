@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 // 暴露安全的API给渲染进程
 contextBridge.exposeInMainWorld("electronAPI", {
+  rendererHeartbeat: () => ipcRenderer.send("renderer-heartbeat"),
   // 窗口控制
   hideWindow: () => ipcRenderer.invoke("hide-window"),
   hideFloatingBall: () => ipcRenderer.invoke("hide-floating-ball"),
