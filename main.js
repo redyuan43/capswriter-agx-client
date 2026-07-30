@@ -6,6 +6,7 @@ const {
   dialog,
   Notification,
   shell,
+  session,
   systemPreferences,
   crashReporter
 } = require("electron");
@@ -15,6 +16,53 @@ const { spawn, execSync } = require("child_process");
 // Codex completion chimes are owned by the renderer UI. The event is triggered
 // by global hold-key/task IPC rather than a DOM click, so allow that app audio.
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+const ASR_PROXY_BYPASS_RULES = (process.env.CAPSWRITER_ASR_PROXY_BYPASS_LIST
+  || '<local>,asr.yuanspaces.com,*.taild500c8.ts.net,100.64.0.0/10')
+  .replaceAll(';', ',');
+const ASR_PROXY_SERVER = normalizeProxyServer(
+  process.env.CAPSWRITER_ASR_PROXY_SERVER
+  || process.env.HTTPS_PROXY
+  || process.env.https_proxy,
+);
+const ASR_PROXY_CONFIG_TIMEOUT_MS = 3000;
+
+function normalizeProxyServer(value) {
+  try {
+    const proxy = new URL(String(value || '').trim());
+    if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(proxy.protocol) || !proxy.hostname) {
+      return '';
+    }
+    return `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ''}`;
+  } catch {
+    return '';
+  }
+}
+
+function buildSessionProxyConfig() {
+  if (ASR_PROXY_SERVER) {
+    return {
+      mode: 'fixed_servers',
+      proxyRules: ASR_PROXY_SERVER,
+      proxyBypassRules: ASR_PROXY_BYPASS_RULES,
+    };
+  }
+  return {
+    mode: 'system',
+    proxyBypassRules: ASR_PROXY_BYPASS_RULES,
+  };
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 // Initialize log manager
 const LogManager = require("./src/helpers/logManager");
@@ -959,8 +1007,28 @@ async function startApp() {
 }
 
 // App ready handler
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  try {
+    await session.defaultSession.setProxy(buildSessionProxyConfig());
+  } catch (error) {
+    logger.warn('Realtime ASR proxy bypass was not applied', error?.message || error);
+  }
   startApp();
+
+  withTimeout(
+    session.defaultSession.resolveProxy('https://asr.yuanspaces.com/'),
+    ASR_PROXY_CONFIG_TIMEOUT_MS,
+    'proxy resolution timed out',
+  ).then((asrProxy) => {
+    const fields = { host: 'asr.yuanspaces.com', result: asrProxy };
+    if (/^DIRECT(?:;|$)/i.test(String(asrProxy).trim())) {
+      logger.info('Realtime ASR proxy bypass verified', fields);
+    } else {
+      logger.warn('Realtime ASR proxy bypass is not direct', fields);
+    }
+  }).catch((error) => {
+    logger.warn('Realtime ASR proxy resolution failed', error?.message || error);
+  });
 });
 
 app.on("window-all-closed", () => {

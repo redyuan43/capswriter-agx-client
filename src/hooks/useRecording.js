@@ -5,6 +5,7 @@ import {
   computeRealtimeASRFinalTimeoutMs,
   isRealtimeASRConfigured,
   translateText,
+  warmRealtimeAsrConnection,
 } from '../services/backendAPI.js';
 import {
   buildSystemDefaultAudioCaptureProfiles,
@@ -462,6 +463,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
   }, [logRecordingDebug, releaseMicrophoneStream]);
 
   const startRecording = useCallback(async (options = {}) => {
+    const recordingRequestedAt = performance.now();
     if (isFinalizingRef.current) {
       logRecordingDebug('info', 'Ignore recording start while previous transcription is finalizing');
       return { started: false, reason: 'processing_previous' };
@@ -501,6 +503,9 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       }
 
       isStartingRef.current = true;
+      if (isRealtimeASRConfigured()) {
+        warmRealtimeAsrConnection().catch(() => {});
+      }
       const clientIntentPayload = await resolveClientIntentPayload(options);
       recordingClientIntentRef.current = clientIntentPayload;
       recordingHotwordRef.current = String(options.hotword || '');
@@ -551,6 +556,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
         realtimeStartErrorRef.current = null;
         const currentMode = translateMode === 'translate' ? 'translate' : 'transcribe';
         const realtimeSession = new RealtimeASRSession(stream, {
+          requestedAt: recordingRequestedAt,
           hotword: recordingHotwordRef.current,
           optimizeMode: currentMode === 'translate' ? 'translate' : 'none',
           translateTarget: translateTarget || 'zh',
@@ -607,6 +613,10 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
           onClientEvent: (event) => {
             if (event?.type === 'preroll_flushed') {
               logRecordingDebug('info', 'Realtime ASR preroll flushed', event);
+            } else if (event?.type === 'realtime_transport_ready') {
+              logRecordingDebug('info', 'Realtime ASR transport ready', event);
+            } else if (event?.type === 'realtime_first_pcm_sent') {
+              logRecordingDebug('info', 'Realtime ASR first PCM sent', event);
             } else if (event?.type === 'realtime_pcm_watchdog_stalled') {
               logRecordingDebug('warn', 'Realtime ASR PCM watchdog stalled; recording will fail on stop', event);
             }

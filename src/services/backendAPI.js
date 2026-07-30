@@ -7,6 +7,11 @@
 import axios from 'axios';
 import backendConfig from '../config/backend.js';
 import { createRealtimeProtocolError } from '../helpers/asrResultPolicy.mjs';
+import {
+  buildRealtimeAsrProtocols,
+  connectRealtimeAsrWithFallback,
+  resolveRealtimeAsrConnection,
+} from '../helpers/realtimeAsrConnection.mjs';
 
 const TTS_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_REQUEST_TIMEOUT_MS || 120000);
 const TRANSLATE_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TRANSLATE_REQUEST_TIMEOUT_MS || 20000);
@@ -14,8 +19,9 @@ const TTS_PLAN_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_PLAN_REQUEST
 const TTS_CONTROL_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_CONTROL_REQUEST_TIMEOUT_MS || 10000);
 const ASR_STREAM_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_ASR_STREAM_CONNECT_TIMEOUT_MS || 15000);
 const ASR_STREAM_IDLE_TIMEOUT_MS = Number(import.meta.env.VITE_ASR_STREAM_IDLE_TIMEOUT_MS || 20000);
-const DEFAULT_REALTIME_ASR_URL = 'ws://agx.taild500c8.ts.net:18011/api/asr/realtime';
+const DEFAULT_REALTIME_ASR_URL = 'ws://spark-31d6.taild500c8.ts.net:18011/api/asr/realtime';
 const REALTIME_ASR_URL = (import.meta.env.VITE_REALTIME_ASR_URL || DEFAULT_REALTIME_ASR_URL).trim();
+const REALTIME_ASR_FALLBACK_URL = String(import.meta.env.VITE_REALTIME_ASR_FALLBACK_URL || '').trim();
 const REALTIME_ASR_CONNECT_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS || 30000);
 const REALTIME_ASR_FINAL_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MS || 15000);
 const REALTIME_ASR_FINAL_TIMEOUT_MAX_MS = Number(import.meta.env.VITE_REALTIME_ASR_FINAL_TIMEOUT_MAX_MS || 120000);
@@ -23,7 +29,277 @@ const REALTIME_ASR_FINAL_TIMEOUT_AUDIO_RATIO = Number(import.meta.env.VITE_REALT
 const REALTIME_ASR_PCM_STALL_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_PCM_STALL_TIMEOUT_MS || 3500);
 const REALTIME_ASR_PCM_WATCHDOG_INTERVAL_MS = 500;
 const REALTIME_ASR_PREROLL_MS = Number(import.meta.env.VITE_REALTIME_ASR_PREROLL_MS || 5000);
+const REALTIME_ASR_PRECONNECT_MAX_AGE_MS = Number(import.meta.env.VITE_REALTIME_ASR_PRECONNECT_MAX_AGE_MS || 45000);
+const REALTIME_ASR_SOCKET_OPEN_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME_ASR_SOCKET_OPEN_TIMEOUT_MS || 10000);
+const REALTIME_ASR_PRECONNECT_ENABLED = String(import.meta.env.VITE_REALTIME_ASR_PRECONNECT_ENABLED || '1') !== '0';
 const SERVER_LLM_MODEL = import.meta.env.VITE_SERVER_LLM_MODEL || 'caps-voice-edit-qwen3-4b';
+
+function canStartupPreconnectRealtimeAsr() {
+  if (!REALTIME_ASR_PRECONNECT_ENABLED || typeof window === 'undefined') return false;
+  const search = String(window.location?.search || '');
+  const params = new URLSearchParams(search);
+  return !params.has('panel') && !params.has('page');
+}
+
+async function getRealtimeAsrConnection() {
+  const getSetting = typeof window !== 'undefined' && window.electronAPI?.getSetting
+    ? (key, fallback) => window.electronAPI.getSetting(key, fallback)
+    : null;
+  return resolveRealtimeAsrConnection({
+    getSetting,
+    defaultUrl: REALTIME_ASR_URL,
+    defaultFallbackUrl: REALTIME_ASR_FALLBACK_URL,
+  });
+}
+
+function monotonicNow() {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+function candidateKey(candidate) {
+  return JSON.stringify([candidate?.url || '', ...(candidate?.protocols || [])]);
+}
+
+function isPreconnectCandidate(candidate) {
+  return candidate?.route === 'primary'
+    && /^wss:\/\//i.test(candidate?.url || '')
+    && Array.isArray(candidate?.protocols)
+    && candidate.protocols.some((protocol) => String(protocol).startsWith('auth.'));
+}
+
+let realtimeAsrIdleEntry = null;
+let realtimeAsrActiveEntry = null;
+let realtimeAsrWarmOperation = null;
+let realtimeAsrPreconnectSchedule = null;
+let realtimeAsrPreconnectIdleCallback = null;
+let realtimeAsrCoordinatorGeneration = 0;
+const realtimeAsrNoRefreshSockets = new WeakSet();
+
+function clearPreconnectSchedule() {
+  if (realtimeAsrPreconnectSchedule !== null && typeof window !== 'undefined') {
+    window.clearTimeout(realtimeAsrPreconnectSchedule);
+  }
+  realtimeAsrPreconnectSchedule = null;
+}
+
+function clearEntryTimers(entry) {
+  if (!entry) return;
+  if (typeof window !== 'undefined') {
+    if (entry.openTimer !== null) window.clearTimeout(entry.openTimer);
+    if (entry.expiryTimer !== null) window.clearTimeout(entry.expiryTimer);
+  }
+  entry.openTimer = null;
+  entry.expiryTimer = null;
+}
+
+function closeSocketEntry(entry) {
+  if (!entry) return;
+  entry.dead = true;
+  clearEntryTimers(entry);
+  if (realtimeAsrIdleEntry === entry) realtimeAsrIdleEntry = null;
+  if (realtimeAsrActiveEntry === entry) realtimeAsrActiveEntry = null;
+  if (entry.socket.readyState === WebSocket.OPEN || entry.socket.readyState === WebSocket.CONNECTING) {
+    entry.socket.close();
+  }
+}
+
+function handleIdleSocketDeath(entry) {
+  entry.dead = true;
+  clearEntryTimers(entry);
+  entry.socket.onerror = null;
+  entry.socket.onclose = null;
+  if (entry.socket.readyState === WebSocket.OPEN || entry.socket.readyState === WebSocket.CONNECTING) {
+    entry.socket.close();
+  }
+  if (realtimeAsrIdleEntry === entry) {
+    realtimeAsrIdleEntry = null;
+    if (!realtimeAsrActiveEntry && !realtimeAsrNoRefreshSockets.has(entry.socket)) {
+      scheduleRealtimeAsrPreconnect(1000);
+    }
+  }
+}
+
+function createSocketEntry(candidate, owner) {
+  const socket = candidate.protocols.length
+    ? new WebSocket(candidate.url, candidate.protocols)
+    : new WebSocket(candidate.url);
+  const entry = {
+    socket,
+    promise: null,
+    candidate,
+    key: candidateKey(candidate),
+    owner,
+    createdAt: monotonicNow(),
+    openedAt: 0,
+    openTimer: null,
+    expiryTimer: null,
+    dead: false,
+  };
+  entry.promise = new Promise((resolve, reject) => {
+    let settled = false;
+    const rejectOpening = (message) => {
+      if (settled) return;
+      settled = true;
+      entry.dead = true;
+      clearEntryTimers(entry);
+      reject(new Error(message));
+    };
+    socket.onopen = () => {
+      if (settled) return;
+      settled = true;
+      entry.openedAt = monotonicNow();
+      if (entry.openTimer !== null) window.clearTimeout(entry.openTimer);
+      entry.openTimer = null;
+      socket.onopen = null;
+      if (entry.owner === 'idle') {
+        socket.onerror = () => handleIdleSocketDeath(entry);
+        socket.onclose = () => handleIdleSocketDeath(entry);
+      } else {
+        socket.onerror = null;
+        socket.onclose = null;
+      }
+      resolve(socket);
+    };
+    socket.onerror = () => {
+      rejectOpening('Realtime ASR websocket error');
+    };
+    socket.onclose = () => {
+      rejectOpening('Realtime ASR websocket closed before open');
+    };
+  });
+  entry.promise.catch(() => {});
+  entry.openTimer = window.setTimeout(() => {
+    if (socket.readyState !== WebSocket.CONNECTING) return;
+    closeSocketEntry(entry);
+  }, REALTIME_ASR_SOCKET_OPEN_TIMEOUT_MS);
+  return entry;
+}
+
+export async function warmRealtimeAsrConnection() {
+  if (!REALTIME_ASR_PRECONNECT_ENABLED) return false;
+  if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return false;
+  if (realtimeAsrWarmOperation) return realtimeAsrWarmOperation;
+  const generation = realtimeAsrCoordinatorGeneration;
+  const operation = (async () => {
+    const runtime = await getRealtimeAsrConnection();
+    if (generation !== realtimeAsrCoordinatorGeneration) return false;
+    if (realtimeAsrActiveEntry) return false;
+    const candidate = runtime.candidates[0];
+    if (!isPreconnectCandidate(candidate)) return false;
+    const key = candidateKey(candidate);
+    if (realtimeAsrIdleEntry?.key === key && !realtimeAsrIdleEntry.dead) {
+      return realtimeAsrIdleEntry.promise.then(() => true, () => false);
+    }
+    if (realtimeAsrIdleEntry) closeSocketEntry(realtimeAsrIdleEntry);
+    if (realtimeAsrActiveEntry) return false;
+    const entry = createSocketEntry(candidate, 'idle');
+    realtimeAsrIdleEntry = entry;
+    entry.expiryTimer = window.setTimeout(() => {
+      if (realtimeAsrIdleEntry !== entry) return;
+      closeSocketEntry(entry);
+      scheduleRealtimeAsrPreconnect(1000);
+    }, REALTIME_ASR_PRECONNECT_MAX_AGE_MS);
+    const opened = await entry.promise.then(() => true, () => false);
+    if (!opened && realtimeAsrIdleEntry === entry) realtimeAsrIdleEntry = null;
+    return opened && realtimeAsrIdleEntry === entry && !entry.dead;
+  })();
+  realtimeAsrWarmOperation = operation;
+  try {
+    return await operation;
+  } finally {
+    if (realtimeAsrWarmOperation === operation) realtimeAsrWarmOperation = null;
+  }
+}
+
+function scheduleRealtimeAsrPreconnect(delayMs = 1000) {
+  if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+  clearPreconnectSchedule();
+  realtimeAsrPreconnectSchedule = window.setTimeout(() => {
+    realtimeAsrPreconnectSchedule = null;
+    warmRealtimeAsrConnection().catch(() => {});
+  }, delayMs);
+}
+
+export function resetRealtimeAsrPreconnection() {
+  realtimeAsrCoordinatorGeneration += 1;
+  if (
+    realtimeAsrPreconnectIdleCallback !== null
+    && typeof window !== 'undefined'
+    && typeof window.cancelIdleCallback === 'function'
+  ) {
+    window.cancelIdleCallback(realtimeAsrPreconnectIdleCallback);
+  }
+  realtimeAsrPreconnectIdleCallback = null;
+  clearPreconnectSchedule();
+  if (realtimeAsrIdleEntry?.socket) realtimeAsrNoRefreshSockets.add(realtimeAsrIdleEntry.socket);
+  if (realtimeAsrActiveEntry?.socket) realtimeAsrNoRefreshSockets.add(realtimeAsrActiveEntry.socket);
+  closeSocketEntry(realtimeAsrIdleEntry);
+  closeSocketEntry(realtimeAsrActiveEntry);
+  realtimeAsrWarmOperation = null;
+}
+
+function releaseRealtimeAsrSocket(socket) {
+  const entry = realtimeAsrActiveEntry;
+  if (!entry || entry.socket !== socket) return;
+  clearEntryTimers(entry);
+  realtimeAsrActiveEntry = null;
+}
+
+async function acquireRealtimeAsrSocket(candidate, onSocket) {
+  clearPreconnectSchedule();
+  const key = candidateKey(candidate);
+  if (realtimeAsrActiveEntry) {
+    throw new Error('Realtime ASR websocket is already owned by an active session');
+  }
+  if (realtimeAsrIdleEntry && realtimeAsrIdleEntry.key !== key) {
+    closeSocketEntry(realtimeAsrIdleEntry);
+  }
+  const idleEntry = realtimeAsrIdleEntry?.key === key && !realtimeAsrIdleEntry.dead
+    ? realtimeAsrIdleEntry
+    : null;
+  const entry = idleEntry || createSocketEntry(candidate, 'session');
+  const preconnected = Boolean(idleEntry);
+  if (idleEntry) {
+    realtimeAsrIdleEntry = null;
+    if (entry.expiryTimer !== null) window.clearTimeout(entry.expiryTimer);
+    entry.expiryTimer = null;
+  }
+  entry.owner = 'session';
+  realtimeAsrActiveEntry = entry;
+  if (typeof onSocket === 'function') onSocket(entry.socket);
+  try {
+    const socket = await entry.promise;
+    if (entry.dead || socket.readyState !== WebSocket.OPEN || realtimeAsrActiveEntry !== entry) {
+      throw new Error('Realtime ASR websocket became unavailable during acquisition');
+    }
+    socket.onerror = null;
+    socket.onclose = null;
+    return {
+      socket,
+      preconnected,
+      socketCreatedAt: entry.createdAt,
+      socketOpenedAt: entry.openedAt,
+    };
+  } catch (error) {
+    if (realtimeAsrActiveEntry === entry) realtimeAsrActiveEntry = null;
+    closeSocketEntry(entry);
+    throw error;
+  }
+}
+
+if (canStartupPreconnectRealtimeAsr() && typeof window.requestIdleCallback === 'function') {
+  const idleGeneration = realtimeAsrCoordinatorGeneration;
+  realtimeAsrPreconnectIdleCallback = window.requestIdleCallback(() => {
+    realtimeAsrPreconnectIdleCallback = null;
+    if (idleGeneration !== realtimeAsrCoordinatorGeneration) return;
+    scheduleRealtimeAsrPreconnect(0);
+  }, { timeout: 2000 });
+}
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => resetRealtimeAsrPreconnection());
+}
 const TTS_SPEAKER_DISPLAY_NAMES = {
   vivian: 'Vivian',
   serena: 'Serena',
@@ -437,7 +713,16 @@ function learnHotwordsOverWebSocket(terms, options = {}) {
 
 export class PCMRealtimeSession {
   constructor(options = {}) {
-    this.url = options.url || REALTIME_ASR_URL;
+    this.requestedAt = Number.isFinite(Number(options.requestedAt))
+      ? Number(options.requestedAt)
+      : monotonicNow();
+    this.explicitUrl = String(options.url || '').trim();
+    this.explicitToken = String(options.authToken || '').trim();
+    this.explicitFallbackUrl = String(options.fallbackUrl || '').trim();
+    this.url = this.explicitUrl || REALTIME_ASR_URL;
+    this.connectionCandidates = [];
+    this.activeRoute = '';
+    this.connectionGeneration = 0;
     this.language = options.language || '';
     this.hotword = options.hotword || '';
     this.optimizeMode = options.optimizeMode || 'none';
@@ -464,6 +749,7 @@ export class PCMRealtimeSession {
     this.finalPayload = null;
     this.latestTextPayload = null;
     this.sentAudioBytes = 0;
+    this.firstPcmSentAt = 0;
     this.lastPcmSentAt = 0;
     this.pcmStartedAt = 0;
     this.pcmStalled = false;
@@ -479,6 +765,24 @@ export class PCMRealtimeSession {
   }
 
   async start() {
+    const runtimeConnection = await getRealtimeAsrConnection();
+    if (this.explicitUrl) {
+      this.connectionCandidates = [{
+        route: 'primary',
+        url: this.explicitUrl,
+        protocols: buildRealtimeAsrProtocols(this.explicitToken),
+      }];
+      if (this.explicitFallbackUrl && this.explicitFallbackUrl !== this.explicitUrl) {
+        this.connectionCandidates.push({
+          route: 'fallback',
+          url: this.explicitFallbackUrl,
+          protocols: [],
+        });
+      }
+    } else {
+      this.connectionCandidates = runtimeConnection.candidates;
+    }
+    this.url = this.connectionCandidates[0]?.url || '';
     if (!this.url) {
       throw new Error('Realtime ASR URL is not configured');
     }
@@ -500,14 +804,73 @@ export class PCMRealtimeSession {
     }
   }
 
-  openWebSocket() {
+  async openWebSocket() {
+    return connectRealtimeAsrWithFallback(
+      this.connectionCandidates,
+      async (candidate) => {
+        if (this.stopped) throw new Error('Realtime ASR session was cancelled before ready');
+        const payload = await this.openWebSocketCandidate(candidate);
+        this.activeRoute = candidate.route;
+        return payload;
+      },
+      ({ from, to }) => {
+        if (typeof this.onClientEvent === 'function') {
+          this.onClientEvent({ type: 'realtime_connection_fallback', from, to });
+        }
+      },
+    );
+  }
+
+  async openWebSocketCandidate(candidate) {
+    const generation = ++this.connectionGeneration;
+    const acquireRequestAt = monotonicNow();
+    let acquired;
+    try {
+      acquired = await acquireRealtimeAsrSocket(candidate, (socket) => {
+        if (this.connectionGeneration === generation && !this.stopped) {
+          this.websocket = socket;
+        } else if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+      });
+    } catch (error) {
+      if (this.connectionGeneration === generation) this.websocket = null;
+      throw error;
+    }
+    const ws = acquired.socket;
+    if (this.stopped || this.connectionGeneration !== generation) {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      throw new Error('Realtime ASR session was cancelled before websocket acquisition');
+    }
+    this.websocket = ws;
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.url);
-      this.websocket = ws;
       let ready = false;
+      let settled = false;
+      let startSentAt = 0;
       ws.binaryType = 'arraybuffer';
 
-      ws.onopen = () => {
+      const isCurrent = () => this.connectionGeneration === generation && this.websocket === ws;
+      const clearHandlers = () => {
+        ws.onopen = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        ws.onmessage = null;
+      };
+      const failBeforeReady = (error) => {
+        if (settled) return;
+        settled = true;
+        clearHandlers();
+        if (this.websocket === ws) this.websocket = null;
+        releaseRealtimeAsrSocket(ws);
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+        reject(error);
+      };
+
+      const sendStart = () => {
+        if (!isCurrent()) return;
+        startSentAt = monotonicNow();
         ws.send(JSON.stringify({
           type: 'start',
           sample_rate: this.targetSampleRate,
@@ -522,23 +885,28 @@ export class PCMRealtimeSession {
       };
 
       ws.onerror = () => {
+        if (!isCurrent()) return;
         const error = new Error('Realtime ASR websocket error');
         if (!ready) {
-          reject(error);
+          failBeforeReady(error);
         } else if (!this.finalPayload) {
           this.finalReject(error);
         }
       };
 
       ws.onclose = () => {
+        if (!isCurrent()) return;
+        releaseRealtimeAsrSocket(ws);
+        if (!realtimeAsrNoRefreshSockets.has(ws)) scheduleRealtimeAsrPreconnect(1000);
         if (!ready) {
-          reject(new Error('Realtime ASR websocket closed before ready'));
+          failBeforeReady(new Error('Realtime ASR websocket closed before ready'));
         } else if (!this.finalPayload && !this.stopped) {
           this.finalReject(new Error('Realtime ASR websocket closed before final'));
         }
       };
 
       ws.onmessage = (event) => {
+        if (!isCurrent()) return;
         let payload = null;
         try {
           payload = JSON.parse(event.data);
@@ -555,7 +923,19 @@ export class PCMRealtimeSession {
           this.latestTextPayload = payload;
         }
         if (type === 'ready') {
+          if (settled) return;
           ready = true;
+          settled = true;
+          const readyAt = monotonicNow();
+          this.emitClientEvent({
+            type: 'realtime_transport_ready',
+            route: candidate.route,
+            preconnected: acquired.preconnected,
+            socketAcquireWaitMs: Math.round(startSentAt - acquireRequestAt),
+            socketOpenAgeMs: Math.round(readyAt - acquired.socketOpenedAt),
+            startToReadyMs: Math.round(readyAt - startSentAt),
+            requestToReadyMs: Math.round(readyAt - this.requestedAt),
+          });
           resolve(payload);
           return;
         }
@@ -582,12 +962,13 @@ export class PCMRealtimeSession {
             'Realtime ASR returned an error event'
           );
           if (!ready) {
-            reject(error);
+            failBeforeReady(error);
           } else {
             this.finalReject(error);
           }
         }
       };
+      sendStart();
     });
   }
 
@@ -663,8 +1044,18 @@ export class PCMRealtimeSession {
     if (!byteLength) {
       return;
     }
+    const firstChunk = this.sentAudioBytes === 0;
     this.sentAudioBytes += byteLength;
     this.lastPcmSentAt = Date.now();
+    if (firstChunk) {
+      this.firstPcmSentAt = monotonicNow();
+      this.emitClientEvent({
+        type: 'realtime_first_pcm_sent',
+        route: this.activeRoute,
+        requestToFirstPcmMs: Math.round(this.firstPcmSentAt - this.requestedAt),
+        bytes: byteLength,
+      });
+    }
   }
 
   hasSentAudio() {
@@ -743,16 +1134,20 @@ export class PCMRealtimeSession {
       "REALTIME_ASR_FINAL_TIMEOUT"
     );
     this.websocket.close();
+    releaseRealtimeAsrSocket(this.websocket);
+    scheduleRealtimeAsrPreconnect(250);
     return payload;
   }
 
   cancel() {
     this.stopped = true;
+    this.connectionGeneration += 1;
     this.stopInput();
     this.stopPcmWatchdog();
     this.pendingChunks = [];
     this.pendingBytes = 0;
     if (!this.websocket) {
+      scheduleRealtimeAsrPreconnect(1000);
       return;
     }
     if (this.websocket.readyState === WebSocket.OPEN) {
@@ -761,6 +1156,8 @@ export class PCMRealtimeSession {
     } else if (this.websocket.readyState === WebSocket.CONNECTING) {
       this.websocket.close();
     }
+    releaseRealtimeAsrSocket(this.websocket);
+    scheduleRealtimeAsrPreconnect(1000);
   }
 }
 

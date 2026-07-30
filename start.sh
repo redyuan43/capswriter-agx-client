@@ -2,13 +2,15 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$APP_DIR/scripts/lib/asr-runtime-env.sh"
 LOG_DIR="${CAPSWRITER_LOG_DIR:-$HOME/.cache/capswriter-agx-client}"
 LOG_FILE="${CAPSWRITER_LOG_FILE:-$LOG_DIR/amd-latest.log}"
 PID_FILE="$LOG_DIR/dev.pid"
 
-DEFAULT_BACKEND_URL="http://agx.taild500c8.ts.net:8001"
+DEFAULT_BACKEND_URL="http://spark-31d6.taild500c8.ts.net:18011"
 DEFAULT_TTS_BASE_URL="http://ivan-ms-7b17.taild500c8.ts.net:8091"
-DEFAULT_REALTIME_ASR_URL="ws://agx.taild500c8.ts.net:18011/api/asr/realtime"
+DEFAULT_REALTIME_ASR_URL="ws://spark-31d6.taild500c8.ts.net:18011/api/asr/realtime"
+DEFAULT_ASR_ENV_FILE="$HOME/.config/capswriter-agx-client/asr-public.env"
 
 usage() {
   cat <<'EOF'
@@ -25,6 +27,11 @@ Environment overrides:
   VITE_TTS_BASE_URL
   VITE_REALTIME_ASR_URL
   VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS
+  VITE_REALTIME_ASR_PRECONNECT_ENABLED (default: 1; set 0 for legacy gateway rollback)
+  CAPSWRITER_ASR_ENV_FILE (default: ~/.config/capswriter-agx-client/asr-public.env)
+  CAPSWRITER_REALTIME_ASR_URL
+  CAPSWRITER_REALTIME_ASR_TOKEN
+  CAPSWRITER_REALTIME_ASR_FALLBACK_URL
   CAPS_LISTENER_BACKEND
   M5_VOICE_BRIDGE_PORT
   START_REBUILD_NATIVE=1  Force electron native dependency rebuild
@@ -151,12 +158,18 @@ ensure_native_deps() {
 }
 
 export_runtime_env() {
+  load_asr_env
   export ELECTRON_DISABLE_SANDBOX="${ELECTRON_DISABLE_SANDBOX:-1}"
   export VITE_BACKEND_URL="${VITE_BACKEND_URL:-$DEFAULT_BACKEND_URL}"
   export VITE_TTS_BASE_URL="${VITE_TTS_BASE_URL:-$DEFAULT_TTS_BASE_URL}"
   export VITE_REALTIME_ASR_URL="${VITE_REALTIME_ASR_URL:-$DEFAULT_REALTIME_ASR_URL}"
   export VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS="${VITE_REALTIME_ASR_CONNECT_TIMEOUT_MS:-30000}"
   export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-auto}"
+}
+
+load_asr_env() {
+  local env_file="${CAPSWRITER_ASR_ENV_FILE:-$DEFAULT_ASR_ENV_FILE}"
+  load_capswriter_asr_runtime_env "$env_file"
 }
 
 prepare() {
