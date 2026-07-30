@@ -25,7 +25,7 @@ const ENDPOINTS = {
 };
 
 // 基础配置
-const DEFAULT_BACKEND_URL = 'http://agx.taild500c8.ts.net:8001';
+const DEFAULT_BACKEND_URL = 'http://spark-31d6.taild500c8.ts.net:18011';
 
 const config = {
   baseURL: (import.meta.env.VITE_BACKEND_URL || DEFAULT_BACKEND_URL).trim(),
