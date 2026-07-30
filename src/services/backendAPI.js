@@ -45,7 +45,11 @@ async function getRealtimeAsrConnection() {
   const getSetting = typeof window !== 'undefined' && window.electronAPI?.getSetting
     ? (key, fallback) => window.electronAPI.getSetting(key, fallback)
     : null;
+  const getActiveConnection = typeof window !== 'undefined' && window.electronAPI?.getActiveAsrConnection
+    ? () => window.electronAPI.getActiveAsrConnection()
+    : null;
   return resolveRealtimeAsrConnection({
+    getActiveConnection,
     getSetting,
     defaultUrl: REALTIME_ASR_URL,
     defaultFallbackUrl: REALTIME_ASR_FALLBACK_URL,
@@ -222,7 +226,7 @@ function scheduleRealtimeAsrPreconnect(delayMs = 1000) {
   }, delayMs);
 }
 
-export function resetRealtimeAsrPreconnection() {
+export function resetRealtimeAsrPreconnection({ closeActive = true } = {}) {
   realtimeAsrCoordinatorGeneration += 1;
   if (
     realtimeAsrPreconnectIdleCallback !== null
@@ -234,10 +238,14 @@ export function resetRealtimeAsrPreconnection() {
   realtimeAsrPreconnectIdleCallback = null;
   clearPreconnectSchedule();
   if (realtimeAsrIdleEntry?.socket) realtimeAsrNoRefreshSockets.add(realtimeAsrIdleEntry.socket);
-  if (realtimeAsrActiveEntry?.socket) realtimeAsrNoRefreshSockets.add(realtimeAsrActiveEntry.socket);
+  if (closeActive && realtimeAsrActiveEntry?.socket) realtimeAsrNoRefreshSockets.add(realtimeAsrActiveEntry.socket);
   closeSocketEntry(realtimeAsrIdleEntry);
-  closeSocketEntry(realtimeAsrActiveEntry);
+  if (closeActive) closeSocketEntry(realtimeAsrActiveEntry);
   realtimeAsrWarmOperation = null;
+}
+
+export function invalidateRealtimeAsrPreconnection() {
+  resetRealtimeAsrPreconnection({ closeActive: false });
 }
 
 function releaseRealtimeAsrSocket(socket) {

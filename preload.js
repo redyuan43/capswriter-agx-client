@@ -67,6 +67,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
   saveSetting: (key, value) => ipcRenderer.invoke("save-setting", key, value),
   resetSettings: () => ipcRenderer.invoke("reset-settings"),
 
+  // 实时 ASR 服务端配置；列表响应不包含令牌明文。
+  listAsrConnectionProfiles: () => ipcRenderer.invoke("list-asr-connection-profiles"),
+  saveAsrConnectionProfile: (profile, options) =>
+    ipcRenderer.invoke("save-asr-connection-profile", profile, options),
+  deleteAsrConnectionProfile: (profileId) =>
+    ipcRenderer.invoke("delete-asr-connection-profile", profileId),
+  activateAsrConnectionProfile: (profileId) =>
+    ipcRenderer.invoke("activate-asr-connection-profile", profileId),
+  getActiveAsrConnection: () => ipcRenderer.invoke("get-active-asr-connection"),
+  resolveAsrConnectionProfile: (profile, options) =>
+    ipcRenderer.invoke("resolve-asr-connection-profile", profile, options),
+
   // 热键管理
   registerHotkey: (hotkey) => ipcRenderer.invoke("register-hotkey", hotkey),
   unregisterHotkey: (hotkey) => ipcRenderer.invoke("unregister-hotkey", hotkey),

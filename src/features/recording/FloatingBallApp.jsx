@@ -17,6 +17,7 @@ import {
   unloadService,
   isHttpBackendConfigured,
   learnHotwords,
+  invalidateRealtimeAsrPreconnection,
 } from "../../services/backendAPI.js";
 import { isExactSilentASRArtifactText } from "../../helpers/silentAsrArtifacts.js";
 import {
@@ -2513,6 +2514,11 @@ export default function FloatingBallApp() {
         : eventOrPayload;
 
       if (!payload || typeof payload !== "object") return;
+
+      if (payload.key === "asr_connection_profiles_v1") {
+        invalidateRealtimeAsrPreconnection();
+        return;
+      }
 
       if (payload.reset) {
         setTranslateMode("transcribe");

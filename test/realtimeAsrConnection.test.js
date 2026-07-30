@@ -28,6 +28,20 @@ test('runtime ASR settings create authenticated primary and unauthenticated fall
   assert.equal(result.candidates.some((candidate) => candidate.url.includes('shared-secret-token')), false);
 });
 
+test('active GUI ASR profile takes precedence over legacy settings', async () => {
+  const { resolveRealtimeAsrConnection } = await import('../src/helpers/realtimeAsrConnection.mjs');
+  const result = await resolveRealtimeAsrConnection({
+    getActiveConnection: () => ({ id: 'spark', url: 'ws://spark.example/api/asr/realtime', token: '' }),
+    getSetting: () => 'wss://legacy.example/realtime',
+    defaultUrl: 'ws://default.example/realtime',
+    defaultFallbackUrl: 'ws://fallback.example/realtime',
+  });
+  assert.deepEqual(result.candidates, [
+    { route: 'primary', url: 'ws://spark.example/api/asr/realtime', protocols: [] },
+  ]);
+  assert.equal(result.fallbackUrl, '');
+});
+
 test('invalid runtime URLs fall back without duplicating the same route', async () => {
   const { resolveRealtimeAsrConnection } = await import('../src/helpers/realtimeAsrConnection.mjs');
   const result = await resolveRealtimeAsrConnection({
