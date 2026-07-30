@@ -14,6 +14,7 @@ const LINUX_YDOTOOL_KEY_DELAY_MS = 25;
 const LINUX_XDOTOOL_KEY_DELAY_MS = 35;
 const LINUX_PASTE_AFTER_KEY_SETTLE_MS = 80;
 const LINUX_CLIPBOARD_RESTORE_DELAY_MS = 1200;
+const WAYLAND_CLIPBOARD_READY_MS = 80;
 
 class ClipboardManager {
   constructor(logger) {
@@ -344,11 +345,11 @@ class ClipboardManager {
   getWtypeKeySequence(method) {
     switch (method) {
       case LINUX_PASTE_METHOD.CTRL_SHIFT_V:
-        return ["-M", "ctrl", "-M", "shift", "v", "-m", "shift", "-m", "ctrl"];
+        return ["-M", "ctrl", "-M", "shift", "-s", "80", "-k", "v", "-s", "80", "-m", "shift", "-m", "ctrl"];
       case LINUX_PASTE_METHOD.SHIFT_INSERT:
-        return ["-M", "shift", "Insert", "-m", "shift"];
+        return ["-M", "shift", "-s", "80", "-k", "Insert", "-s", "80", "-m", "shift"];
       case LINUX_PASTE_METHOD.CTRL_V:
-        return ["-M", "ctrl", "v", "-m", "ctrl"];
+        return ["-M", "ctrl", "-s", "80", "-k", "v", "-s", "80", "-m", "ctrl"];
       default:
         return null;
     }
@@ -420,22 +421,46 @@ class ClipboardManager {
     };
   }
 
-  async writeLinuxPrimarySelection(text) {
-    if (process.platform !== "linux") {
-      return;
-    }
+  async startWaylandClipboardOwner(args, text) {
+    return new Promise((resolve) => {
+      let stderr = "";
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      let processHandle;
+      try {
+        processHandle = spawn("wl-copy", args, {
+          stdio: ["pipe", "ignore", "pipe"],
+        });
+      } catch (error) {
+        finish({ ok: false, stderr: error?.message || String(error) });
+        return;
+      }
+      processHandle.stderr?.on("data", (data) => { stderr += data.toString(); });
+      processHandle.once("error", (error) => {
+        finish({ ok: false, stderr: error?.message || String(error) });
+      });
+      processHandle.stdin.once("error", (error) => {
+        finish({ ok: false, stderr: error?.message || String(error) });
+      });
+      processHandle.stdin.end(String(text || ""));
+      setTimeout(() => {
+        processHandle.unref?.();
+        finish({ ok: true, stderr: stderr.trim() });
+      }, WAYLAND_CLIPBOARD_READY_MS).unref?.();
+    });
+  }
 
-    const result = await this.spawnWithInput(
-      "wl-copy",
-      ["--primary"],
-      String(text || ""),
-      150
-    );
-    this.safeLog("📌 Linux PRIMARY selection 写入结果", {
-      ok: result.ok,
-      code: result.code,
-      timeout: result.timeout,
-      stderr: result.stderr,
+  async writeWaylandClipboardSelections(text) {
+    if (!this.isWaylandSession()) return;
+    const clipboardResult = await this.startWaylandClipboardOwner([], text);
+    const primaryResult = await this.startWaylandClipboardOwner(["--primary"], text);
+    this.safeLog("📌 Wayland clipboard selection 写入结果", {
+      clipboard: clipboardResult,
+      primary: primaryResult,
     });
   }
 
@@ -557,9 +582,7 @@ class ClipboardManager {
         "📋 文本已复制到剪贴板",
         text.substring(0, 50) + "..."
       );
-      this.writeLinuxPrimarySelection(text).catch((error) => {
-        this.safeLog("⚠️ Linux PRIMARY selection 后台写入失败", error?.message || String(error));
-      });
+      await this.writeWaylandClipboardSelections(text);
 
       if (process.platform === "darwin") {
         // 简化权限检查，直接尝试粘贴
