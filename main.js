@@ -416,7 +416,6 @@ const m5VoiceBridge = new M5VoiceBridge({
 });
 let rendererRecoveryActive = false;
 let lastRendererHeartbeatAt = Date.now();
-let rendererHeartbeatWatchdog = null;
 
 async function recoverMainRenderer(reason, details = {}) {
   if (rendererRecoveryActive || app.isQuitting) return;
@@ -1000,18 +999,6 @@ async function startApp() {
 
   m5VoiceBridge.start();
 
-  if (!rendererHeartbeatWatchdog) {
-    rendererHeartbeatWatchdog = setInterval(() => {
-      if (!windowManager.mainWindow || rendererRecoveryActive) return;
-      if (Date.now() - lastRendererHeartbeatAt > 6000) {
-        recoverMainRenderer("renderer_heartbeat_timeout", {
-          silentForMs: Date.now() - lastRendererHeartbeatAt,
-        }).catch(() => {});
-      }
-    }, 2000);
-    rendererHeartbeatWatchdog.unref?.();
-  }
-
   logger.info('Application startup complete');
 }
 
@@ -1058,7 +1045,6 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
   app.isQuitting = true;
-  if (rendererHeartbeatWatchdog) clearInterval(rendererHeartbeatWatchdog);
   stopClipboardWatch();
   m5VoiceBridge.stop();
   globalShortcut.unregisterAll();

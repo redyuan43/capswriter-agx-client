@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import "./index.css";
 import { toast, Toaster } from "sonner";
-import { Settings, X, Loader2, Play, Circle, History, Link2, Radio } from "lucide-react";
+import { Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server } from "lucide-react";
 import { usePermissions } from "./hooks/usePermissions";
 import ProcessMonitorPanel from "./components/ProcessMonitorPanel";
 import TranslatedHistory from "./components/TranslatedHistory";
@@ -28,7 +28,7 @@ const VOICE_TRANSLATE_ZH = "zh";
 
 function initialSettingsTab() {
   const tab = new URLSearchParams(window.location.search).get("tab");
-  return tab === "bridge" ? "bridge" : "settings";
+  return ["bridge", "asr"].includes(tab) ? tab : "settings";
 }
 
 const SettingsPage = () => {
@@ -384,6 +384,13 @@ const SettingsPage = () => {
               M5 Bridge
             </button>
             <button
+              onClick={() => setActiveTab('asr')}
+              className={`px-3 py-1.5 text-sm flex items-center gap-1.5 rounded-lg transition-colors ${activeTab === 'asr' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
+            >
+              <Server className="w-4 h-4" />
+              ASR 服务端
+            </button>
+            <button
               onClick={() => setActiveTab('history')}
               className="px-3 py-1.5 text-sm flex items-center gap-1.5 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
             >
@@ -405,6 +412,12 @@ const SettingsPage = () => {
       )}
 
       {activeTab === 'bridge' && <M5BridgePanel />}
+
+      {activeTab === 'asr' && <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="max-w-md mx-auto p-4 pb-6">
+          <AsrConnectionPanel />
+        </div>
+      </div>}
 
       {activeTab === 'settings' && <div className="flex-1 overflow-y-auto min-h-0">
         <div className="max-w-md mx-auto p-6 pb-8">
@@ -428,9 +441,6 @@ const SettingsPage = () => {
               </button>
             </div>
           </div>
-
-          <AsrConnectionPanel />
-
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-6">
             <div className="p-6">
               <div className="mb-4">

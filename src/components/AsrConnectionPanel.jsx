@@ -150,26 +150,23 @@ export default function AsrConnectionPanel() {
   const unchangedActive = active && sameDraft(selected, draft) && !token && !clearToken;
 
   return (
-    <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-6">
-      <div className="p-6">
-        <div className="mb-4">
+    <div className="bg-white rounded-lg border border-gray-200">
+      <div className="p-4">
+        <div className="mb-3">
           <h2 className="text-lg font-semibold text-gray-900 chinese-title">ASR 服务端</h2>
-          <p className="text-xs text-gray-600 mt-1">测试会显示连接、服务准备、处理 1 秒音频和总耗时。</p>
+          <p className="text-xs text-gray-600 mt-1">选择路由，测试通过后启用。结果显示连接、准备、处理和总耗时。</p>
         </div>
 
-        <div className="space-y-2 mb-4">
+        <div className="grid grid-cols-3 gap-2 mb-3">
           {state.profiles.map((profile) => (
             <button
               key={profile.id}
               type="button"
               onClick={() => selectProfile(profile)}
-              className={`w-full flex items-center justify-between p-3 rounded-lg text-left border transition-colors ${profile.id === selectedId ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:bg-gray-50"}`}
+              className={`min-w-0 p-2 rounded-md text-left border transition-colors ${profile.id === selectedId ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:bg-gray-50"}`}
             >
-              <span>
-                <span className="text-sm font-medium text-gray-900">{profile.name}</span>
-                <span className="block text-xs text-gray-500 mt-1 break-all">{profile.url}</span>
-              </span>
-              <span className="flex items-center gap-1 text-xs">
+              <span className="block truncate text-sm font-medium text-gray-900">{profile.name}</span>
+              <span className="mt-1 flex items-center gap-1 text-xs">
                 {profile.id === state.activeProfileId && <span className="text-green-700">使用中</span>}
                 {profile.auth === "token" && <span className="text-gray-500">令牌</span>}
               </span>
@@ -181,12 +178,12 @@ export default function AsrConnectionPanel() {
           type="button"
           onClick={() => selectProfile(emptyCustomProfile())}
           disabled={busy}
-          className="mb-4 w-full py-2 text-sm border border-dashed border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 flex items-center justify-center gap-2"
+          className="mb-3 w-full py-2 text-sm border border-dashed border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 flex items-center justify-center gap-2"
         >
           <Plus className="w-4 h-4" /> 新增自定义 ASR 配置
         </button>
 
-        <div className="space-y-3 border-t pt-4">
+        <div className="space-y-3 border-t pt-3">
           <label className="block text-xs text-gray-600">名称
             <input value={draft.name} disabled={draft.preset || busy} onChange={(event) => changeDraft("name", event.target.value)} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md disabled:bg-gray-100" />
           </label>
