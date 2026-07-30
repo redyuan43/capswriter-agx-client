@@ -1,4 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from "react";
+import { createRoot } from "react-dom/client";
 import "./index.css";
 import { toast, Toaster } from "sonner";
 import { Activity, Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server } from "lucide-react";
@@ -817,3 +818,8 @@ const SettingsPage = () => {
 };
 
 export { SettingsPage };
+
+const settingsRoot = document.getElementById("settings-root");
+if (settingsRoot) {
+  createRoot(settingsRoot).render(<SettingsPage />);
+}

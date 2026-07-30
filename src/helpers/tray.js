@@ -89,15 +89,16 @@ class TrayManager {
   }
 
   getTrayIconPaths() {
-    const isDev = process.env.NODE_ENV === "development";
-    const assetsDir = isDev
-      ? path.join(__dirname, "..", "..", "assets")
-      : path.join(process.resourcesPath, "assets");
+    const assetsDirs = [
+      path.join(app.getAppPath(), "assets"),
+      path.join(process.resourcesPath, "assets"),
+      path.join(__dirname, "..", "..", "assets"),
+    ];
 
-    return [
+    return [...new Set(assetsDirs)].flatMap((assetsDir) => [
       path.join(assetsDir, "tray-icon.png"),
       path.join(assetsDir, "icon.png"),
-    ];
+    ]);
   }
 
   updateContextMenu() {

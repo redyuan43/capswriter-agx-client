@@ -210,7 +210,7 @@ const environmentManager = new EnvironmentManager();
 const windowManager = new WindowManager();
 const databaseManager = new DatabaseManager();
 const clipboardManager = new ClipboardManager(logger);
-const trayManager = new TrayManager();
+const trayManager = new TrayManager(logger);
 const hotkeyManager = new HotkeyManager();
 const capsLockListener = new CapsLockListener(logger);
 const processMonitorManager = new ProcessMonitorManager(logger);
@@ -876,8 +876,12 @@ async function startApp() {
   trayManager.setCreateSettingsWindowCallback(() =>
     windowManager.showSettingsWindow({ tab: "monitor" })
   );
-  await trayManager.createTray();
-  logger.info('System tray created successfully');
+  const trayCreated = await trayManager.createTray();
+  if (trayCreated) {
+    logger.info('System tray created successfully');
+  } else {
+    logger.error('System tray creation failed');
+  }
 
   // Setup dictation hold-key listener
   logger.info('Setting up dictation hold-key listener...');
