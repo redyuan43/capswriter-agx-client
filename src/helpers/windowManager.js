@@ -352,7 +352,7 @@ class WindowManager {
     return this.historyWindow;
   }
 
-  async createSettingsWindow() {
+  async createSettingsWindow(options = {}) {
     if (this.settingsWindow) {
       this.settingsWindow.focus();
       return this.settingsWindow;
@@ -374,11 +374,13 @@ class WindowManager {
 
     const isDev = process.env.NODE_ENV === "development";
 
+    const tab = ["asr", "bridge", "monitor"].includes(options.tab) ? options.tab : "settings";
     if (isDev) {
-      await this.settingsWindow.loadURL(`${devServerUrl}?page=settings`);
+      await this.settingsWindow.loadURL(`${devServerUrl}?page=settings&tab=${tab}`);
     } else {
       await this.settingsWindow.loadFile(
-        path.join(__dirname, "..", "dist", "settings.html")
+        path.join(__dirname, "..", "dist", "settings.html"),
+        { query: { tab } }
       );
     }
 
@@ -474,13 +476,25 @@ class WindowManager {
     }
   }
 
-  showSettingsWindow() {
+  showSettingsWindow(options = {}) {
     if (this.settingsWindow) {
+      const tab = ["asr", "bridge", "monitor"].includes(options.tab) ? options.tab : "";
+      if (tab) {
+        const isDev = process.env.NODE_ENV === "development";
+        if (isDev) {
+          this.settingsWindow.loadURL(`${devServerUrl}?page=settings&tab=${tab}`).catch(() => {});
+        } else {
+          this.settingsWindow.loadFile(
+            path.join(__dirname, "..", "dist", "settings.html"),
+            { query: { tab } }
+          ).catch(() => {});
+        }
+      }
       this.settingsWindow.show();
       this.settingsWindow.focus();
       this.settingsWindow.setAlwaysOnTop(true);
     } else {
-      this.createSettingsWindow().then(() => {
+      this.createSettingsWindow(options).then(() => {
         this.settingsWindow.show();
         this.settingsWindow.focus();
         this.settingsWindow.setAlwaysOnTop(true);

@@ -1,13 +1,14 @@
-import { useState, useEffect, useCallback } from "react";
+import { lazy, Suspense, useState, useEffect, useCallback } from "react";
 import "./index.css";
 import { toast, Toaster } from "sonner";
-import { Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server } from "lucide-react";
+import { Activity, Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server } from "lucide-react";
 import { usePermissions } from "./hooks/usePermissions";
-import ProcessMonitorPanel from "./components/ProcessMonitorPanel";
-import TranslatedHistory from "./components/TranslatedHistory";
-import M5BridgePanel from "./components/M5BridgePanel";
-import AsrConnectionPanel from "./components/AsrConnectionPanel";
 import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
+
+const ProcessMonitorPanel = lazy(() => import("./components/ProcessMonitorPanel"));
+const TranslatedHistory = lazy(() => import("./components/TranslatedHistory"));
+const M5BridgePanel = lazy(() => import("./components/M5BridgePanel"));
+const AsrConnectionPanel = lazy(() => import("./components/AsrConnectionPanel"));
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
 const SETTING_VOICE_TRANSLATE_TARGET = "voice_translate_target";
@@ -28,7 +29,11 @@ const VOICE_TRANSLATE_ZH = "zh";
 
 function initialSettingsTab() {
   const tab = new URLSearchParams(window.location.search).get("tab");
-  return ["bridge", "asr"].includes(tab) ? tab : "settings";
+  return ["bridge", "asr", "monitor"].includes(tab) ? tab : "settings";
+}
+
+function PanelLoading() {
+  return <div className="flex flex-1 items-center justify-center py-10"><Loader2 className="h-5 w-5 animate-spin text-blue-600" /></div>;
 }
 
 const SettingsPage = () => {
@@ -105,6 +110,23 @@ const SettingsPage = () => {
     };
   }, []);
 
+  const refreshTtsCapabilities = useCallback(async (savedSpeaker) => {
+    const [ttsHealth, backendStatus] = await Promise.allSettled([
+      getTtsHealth(),
+      getBackendStatus(),
+    ]);
+    const ttsStatus = ttsHealth.status === "fulfilled"
+      ? ttsHealth.value
+      : backendStatus.status === "fulfilled"
+        ? backendStatus.value
+        : null;
+    if (!ttsStatus) return;
+
+    const { speakerOptions } = resolveTtsSpeakerState(savedSpeaker, ttsStatus);
+    setAvailableTtsSpeakers(speakerOptions.length ? speakerOptions : [DEFAULT_TTS_SPEAKER]);
+    setTtsSupportsInstruction(Boolean(ttsStatus.tts_supports_instruction));
+  }, [resolveTtsSpeakerState]);
+
   const loadVoiceSettings = useCallback(async () => {
     if (!window.electronAPI?.getSetting) {
       setLoading(false);
@@ -112,7 +134,7 @@ const SettingsPage = () => {
     }
 
     try {
-      const [mode, target, ttsEnabled, ttsSpeed, ttsSpeaker, ttsInstruction, releaseGraceMs, savedCapsMinHoldMs, backendStatus, ttsHealth] = await Promise.all([
+      const [mode, target, ttsEnabled, ttsSpeed, ttsSpeaker, ttsInstruction, releaseGraceMs, savedCapsMinHoldMs] = await Promise.all([
         window.electronAPI.getSetting(SETTING_VOICE_TRANSLATE_MODE, "transcribe"),
         window.electronAPI.getSetting(SETTING_VOICE_TRANSLATE_TARGET, "zh"),
         window.electronAPI.getSetting(SETTING_VOICE_TTS_ENABLED, false),
@@ -121,10 +143,7 @@ const SettingsPage = () => {
         window.electronAPI.getSetting(SETTING_VOICE_TTS_INSTRUCTION, DEFAULT_TTS_INSTRUCTION),
         window.electronAPI.getSetting(SETTING_VOICE_RELEASE_GRACE_MS, DEFAULT_VOICE_RELEASE_GRACE_MS),
         window.electronAPI.getSetting(SETTING_CAPS_MIN_HOLD_MS, DEFAULT_CAPS_MIN_HOLD_MS),
-        getBackendStatus().catch(() => null),
-        getTtsHealth().catch(() => null),
       ]);
-      const ttsStatus = ttsHealth || backendStatus;
       const nextTarget =
         mode === "translate" && (target === VOICE_TRANSLATE_EN || target === VOICE_TRANSLATE_ZH)
           ? target
@@ -136,21 +155,18 @@ const SettingsPage = () => {
       const {
         resolvedSpeaker,
         speakerOptions,
-        shouldPersistResolvedSpeaker,
-      } = resolveTtsSpeakerState(nextSpeaker, ttsStatus);
+      } = resolveTtsSpeakerState(nextSpeaker, null);
       setVoiceTtsSpeaker(resolvedSpeaker);
       setVoiceTtsInstruction(String(ttsInstruction || DEFAULT_TTS_INSTRUCTION).trim());
       setAvailableTtsSpeakers(speakerOptions.length ? speakerOptions : [DEFAULT_TTS_SPEAKER]);
-      setTtsSupportsInstruction(Boolean(ttsStatus?.tts_supports_instruction));
-      if (shouldPersistResolvedSpeaker && window.electronAPI?.setSetting) {
-        window.electronAPI.setSetting(SETTING_VOICE_TTS_SPEAKER, resolvedSpeaker).catch(() => { });
-      }
+      setTtsSupportsInstruction(false);
       setVoiceReleaseGraceMs(normalizeReleaseGraceMs(releaseGraceMs));
       setCapsMinHoldMs(
         Number.isFinite(Number(savedCapsMinHoldMs))
           ? Math.max(0, Number(savedCapsMinHoldMs))
           : DEFAULT_CAPS_MIN_HOLD_MS
       );
+      refreshTtsCapabilities(nextSpeaker).catch(() => {});
     } catch (error) {
       toast.error("加载语音设置失败", {
         description: error?.message || String(error),
@@ -158,7 +174,7 @@ const SettingsPage = () => {
     } finally {
       setLoading(false);
     }
-  }, [normalizeReleaseGraceMs, normalizeTtsSpeed, resolveTtsSpeakerState]);
+  }, [normalizeReleaseGraceMs, normalizeTtsSpeed, refreshTtsCapabilities, resolveTtsSpeakerState]);
 
   useEffect(() => {
     loadVoiceSettings();
@@ -391,6 +407,13 @@ const SettingsPage = () => {
               ASR 服务端
             </button>
             <button
+              onClick={() => setActiveTab('monitor')}
+              className={`px-3 py-1.5 text-sm flex items-center gap-1.5 rounded-lg transition-colors ${activeTab === 'monitor' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
+            >
+              <Activity className="w-4 h-4" />
+              进程监控
+            </button>
+            <button
               onClick={() => setActiveTab('history')}
               className="px-3 py-1.5 text-sm flex items-center gap-1.5 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
             >
@@ -408,14 +431,22 @@ const SettingsPage = () => {
       </div>
 
       {activeTab === 'history' && (
-        <TranslatedHistory onClose={() => setActiveTab('settings')} />
+        <Suspense fallback={<PanelLoading />}>
+          <TranslatedHistory onClose={() => setActiveTab('settings')} />
+        </Suspense>
       )}
 
-      {activeTab === 'bridge' && <M5BridgePanel />}
+      {activeTab === 'bridge' && <Suspense fallback={<PanelLoading />}><M5BridgePanel /></Suspense>}
 
       {activeTab === 'asr' && <div className="flex-1 overflow-y-auto min-h-0">
         <div className="max-w-md mx-auto p-4 pb-6">
-          <AsrConnectionPanel />
+          <Suspense fallback={<PanelLoading />}><AsrConnectionPanel /></Suspense>
+        </div>
+      </div>}
+
+      {activeTab === 'monitor' && <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="max-w-4xl mx-auto p-4 pb-6">
+          <Suspense fallback={<PanelLoading />}><ProcessMonitorPanel /></Suspense>
         </div>
       </div>}
 
@@ -764,12 +795,6 @@ const SettingsPage = () => {
                   </button>
                 </div>
               </div>
-            </div>
-          </div>
-
-          <div className="bg-white rounded-lg shadow-sm border border-gray-200">
-            <div className="p-6">
-              <ProcessMonitorPanel />
             </div>
           </div>
 

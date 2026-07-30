@@ -874,7 +874,7 @@ async function startApp() {
     windowManager.createControlPanelWindow()
   );
   trayManager.setCreateSettingsWindowCallback(() =>
-    windowManager.showSettingsWindow()
+    windowManager.showSettingsWindow({ tab: "monitor" })
   );
   await trayManager.createTray();
   logger.info('System tray created successfully');

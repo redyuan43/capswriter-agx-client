@@ -4,12 +4,13 @@ import { toast } from "sonner";
 import { formatProbeMetrics, probeAsrConnection } from "../helpers/asrConnectionProbe.mjs";
 
 const emptyCustomProfile = () => ({
-  id: `custom-${Date.now()}`,
+  id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   name: "自定义 ASR",
   url: "",
   auth: "none",
   preset: false,
   hasToken: false,
+  isDraft: true,
 });
 
 function sameDraft(left, right) {
@@ -70,6 +71,16 @@ export default function AsrConnectionPanel() {
     setProbeMetrics("");
   };
 
+  const createCustomProfile = () => {
+    if (busy || !state) return;
+    const profile = emptyCustomProfile();
+    setState((current) => ({
+      ...current,
+      profiles: [...current.profiles, profile],
+    }));
+    selectProfile(profile);
+  };
+
   const changeDraft = (key, value) => {
     setDraft((current) => ({ ...current, [key]: value }));
     setTestedDraft(null);
@@ -80,7 +91,9 @@ export default function AsrConnectionPanel() {
     if (!draft || busy) return;
     setBusy(true);
     try {
-      await window.electronAPI.saveAsrConnectionProfile(draft, { token, clearToken });
+      const result = await window.electronAPI.saveAsrConnectionProfile(draft, { token, clearToken });
+      selectedIdRef.current = draft.id;
+      setState(result);
       toast.success("ASR 配置已保存");
       await load();
     } catch (error) {
@@ -119,8 +132,9 @@ export default function AsrConnectionPanel() {
     if (!passed && !(await test())) return;
     setBusy(true);
     try {
-      const result = await window.electronAPI.saveAsrConnectionProfile(draft, { token, clearToken });
-      await window.electronAPI.activateAsrConnectionProfile(draft.id);
+      await window.electronAPI.saveAsrConnectionProfile(draft, { token, clearToken });
+      const result = await window.electronAPI.activateAsrConnectionProfile(draft.id);
+      selectedIdRef.current = draft.id;
       setState(result);
       toast.success(`已启用 ${draft.name}；下一次录音将使用新路由`);
       await load();
@@ -133,6 +147,15 @@ export default function AsrConnectionPanel() {
 
   const remove = async () => {
     if (!selected || selected.preset || busy) return;
+    if (selected.isDraft) {
+      const fallback = state.profiles.find((item) => item.id === state.activeProfileId);
+      setState((current) => ({
+        ...current,
+        profiles: current.profiles.filter((item) => item.id !== selected.id),
+      }));
+      if (fallback) selectProfile(fallback);
+      return;
+    }
     setBusy(true);
     try {
       await window.electronAPI.deleteAsrConnectionProfile(selected.id);
@@ -171,6 +194,7 @@ export default function AsrConnectionPanel() {
               <span className="block truncate text-sm font-medium text-gray-900">{profile.name}</span>
               <span className="mt-1 flex items-center gap-1 text-xs">
                 {profile.id === state.activeProfileId && <span className="text-green-700">使用中</span>}
+                {profile.isDraft && <span className="text-amber-700">未保存</span>}
                 {profile.auth === "token" && <span className="text-gray-500">令牌</span>}
               </span>
             </button>
@@ -179,7 +203,7 @@ export default function AsrConnectionPanel() {
 
         <button
           type="button"
-          onClick={() => selectProfile(emptyCustomProfile())}
+          onClick={createCustomProfile}
           disabled={busy}
           className="mb-3 w-full py-2 text-sm border border-dashed border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 flex items-center justify-center gap-2"
         >
