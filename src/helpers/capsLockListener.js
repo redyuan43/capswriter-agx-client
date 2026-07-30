@@ -4,6 +4,7 @@ const { execFileSync } = require('child_process');
 
 const EV_KEY = 0x01;
 const KEY_CAPSLOCK = 58;
+const KEY_LEFTSHIFT = 42;
 const KEY_RIGHTSHIFT = 54;
 const KEY_ESC = 1;
 const KEY_ENTER = 28;
@@ -21,11 +22,20 @@ const EXTRA_KEYBOARD_DEVICE_NAMES = [
   'VibeStick MiniJoy Keyboard',
   'VibeStick MiniJoy Mouse'
 ];
+const POCKETTERM_KEYBOARD_NAME = 'My Company My Custom Pico Keyboard';
 const MINIJOY_MIDDLE_BUTTON_CONFIG = {
   normalizedName: 'minijoy middle button',
   displayName: 'MiniJoy Middle Button',
   uiohookName: '',
   evdevCode: BTN_MIDDLE,
+  restoresCapsLock: false
+};
+
+const POCKETTERM_SHIFT_CONFIG = {
+  normalizedName: 'pocketterm shift',
+  displayName: 'PocketTerm Shift',
+  uiohookName: '',
+  evdevCode: KEY_LEFTSHIFT,
   restoresCapsLock: false
 };
 
@@ -902,6 +912,13 @@ class CapsLockListener {
   _findHoldKeyByEvdevCode(code, source = {}) {
     if (isMiniJoyTriggerId(source.trigger_id) && code === BTN_MIDDLE) {
       return { role: 'dictation', config: MINIJOY_MIDDLE_BUTTON_CONFIG };
+    }
+    if (
+      source.device_name === POCKETTERM_KEYBOARD_NAME
+      && this.dictationKeyConfig.normalizedName === 'right shift'
+      && code === KEY_LEFTSHIFT
+    ) {
+      return { role: 'dictation', config: POCKETTERM_SHIFT_CONFIG };
     }
     if (code === this.dictationKeyConfig.evdevCode) {
       return { role: 'dictation', config: this.dictationKeyConfig };

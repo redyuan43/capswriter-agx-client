@@ -127,6 +127,37 @@ test('routes MiniJoy Right Shift exactly like the physical dictation key', () =>
   ]);
 });
 
+test('routes the PocketTerm35 physical Shift key as dictation without changing other keyboards', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  const devicePath = '/dev/input/event0';
+  listener._inputBuffers.set(devicePath, Buffer.alloc(0));
+  listener._inputDeviceInfo.set(devicePath, {
+    trigger_id: 'keyboard',
+    device_path: devicePath,
+    device_name: 'My Company My Custom Pico Keyboard',
+    backend: 'evdev',
+  });
+  const events = [];
+  listener.setOnCapsLockDown((payload) => events.push(['down', payload.trigger_id]));
+  listener.setOnCapsLockUp((payload) => events.push(['up', payload.trigger_id]));
+  const inputEvent = (value) => {
+    const event = Buffer.alloc(24);
+    event.writeUInt16LE(1, 16);
+    event.writeUInt16LE(42, 18);
+    event.writeInt32LE(value, 20);
+    return event;
+  };
+
+  listener._onInputEventData(devicePath, inputEvent(1));
+  listener._onInputEventData(devicePath, inputEvent(0));
+
+  assert.deepEqual(events, [
+    ['down', 'keyboard'],
+    ['up', 'keyboard'],
+  ]);
+});
+
 test('ignores close events from a replaced input stream generation', () => {
   const listener = new CapsLockListener();
   const devicePath = '/dev/input/event257';
