@@ -341,7 +341,42 @@ class ClipboardManager {
     }
   }
 
+  getWtypeKeySequence(method) {
+    switch (method) {
+      case LINUX_PASTE_METHOD.CTRL_SHIFT_V:
+        return ["-M", "ctrl", "-M", "shift", "v", "-m", "shift", "-m", "ctrl"];
+      case LINUX_PASTE_METHOD.SHIFT_INSERT:
+        return ["-M", "shift", "Insert", "-m", "shift"];
+      case LINUX_PASTE_METHOD.CTRL_V:
+        return ["-M", "ctrl", "v", "-m", "ctrl"];
+      default:
+        return null;
+    }
+  }
+
+  isWaylandSession() {
+    return process.platform === "linux"
+      && String(process.env.XDG_SESSION_TYPE || "").toLowerCase() === "wayland";
+  }
+
   async runLinuxPasteCommand(method, keyCombo) {
+    const fallbackErrors = [];
+    const wtypeKeys = this.getWtypeKeySequence(method);
+    if (this.isWaylandSession() && wtypeKeys) {
+      const wtypeResult = await this.spawnWithResult(
+        "wtype",
+        wtypeKeys,
+        LINUX_PASTE_COMMAND_TIMEOUT_MS
+      );
+      if (wtypeResult.ok) {
+        return {
+          ...wtypeResult,
+          backend: "wtype",
+        };
+      }
+      fallbackErrors.push(`wtype: ${wtypeResult.stderr}`);
+    }
+
     const ydotoolKeys = this.getYdotoolKeySequence(method);
     if (ydotoolKeys) {
       const ydotoolResult = await this.spawnWithResult(
@@ -353,8 +388,11 @@ class ClipboardManager {
         return {
           ...ydotoolResult,
           backend: "ydotool",
+          fallbackError: fallbackErrors.join("; "),
         };
       }
+
+      fallbackErrors.push(`ydotool: ${ydotoolResult.stderr}`);
 
       const xdotoolResult = await this.spawnWithResult(
         "xdotool",
@@ -364,8 +402,8 @@ class ClipboardManager {
       return {
         ...xdotoolResult,
         backend: "xdotool",
-        fallbackFrom: "ydotool",
-        fallbackError: ydotoolResult.stderr,
+        fallbackFrom: this.isWaylandSession() ? "wtype,ydotool" : "ydotool",
+        fallbackError: fallbackErrors.join("; "),
       };
     }
 
@@ -377,6 +415,8 @@ class ClipboardManager {
     return {
       ...xdotoolResult,
       backend: "xdotool",
+      fallbackFrom: this.isWaylandSession() ? "wtype" : "",
+      fallbackError: fallbackErrors.join("; "),
     };
   }
 
@@ -843,26 +883,6 @@ class ClipboardManager {
     trace.totalMs = Date.now() - startedAt;
     this.safeLog("📌 Linux 粘贴追踪汇总", trace);
     return trace;
-  }
-
-  // Wayland 备用粘贴方法
-  tryWtypePaste(resolve) {
-    const wtypeProcess = spawn("wtype", ["-M", "ctrl", "v", "-m", "ctrl"]);
-    
-    wtypeProcess.on("close", (code) => {
-      if (code === 0) {
-        this.safeLog("✅ Wayland (wtype) 粘贴成功");
-        resolve();
-      } else {
-        this.safeLog("❌ wtype 也失败了，文本已复制到剪贴板");
-        resolve();
-      }
-    });
-
-    wtypeProcess.on("error", () => {
-      this.safeLog("❌ wtype 不可用，文本已复制到剪贴板");
-      resolve();
-    });
   }
 
   async checkAccessibilityPermissions() {
