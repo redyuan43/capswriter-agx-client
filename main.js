@@ -8,7 +8,8 @@ const {
   shell,
   session,
   systemPreferences,
-  crashReporter
+  crashReporter,
+  safeStorage
 } = require("electron");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
@@ -121,6 +122,7 @@ const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier
 const { LinkBookmarkManager } = require("./src/helpers/linkBookmarkManager");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
+const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles");
 
 // Setup production PATH for Python
 function setupProductionPath() {
@@ -391,6 +393,12 @@ async function warnIfLegacyCoreClientRunning() {
 // Ensure data directory and initialize database
 const dataDirectory = environmentManager.ensureDataDirectory();
 databaseManager.initialize(dataDirectory);
+const asrConnectionProfiles = new AsrConnectionProfiles({
+  databaseManager,
+  dataDirectory,
+  safeStorage,
+  logger,
+});
 clipboardManager.setDatabaseManager(databaseManager);
 const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.getPath("documents"), logger });
 const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory });
@@ -505,6 +513,7 @@ const ipcHandlers = new IPCHandlers({
   processMonitorManager,
   linkBookmarkManager,
   voiceDatasetRecorder,
+  asrConnectionProfiles,
 });
 
 ipcMain.handle("set-clipboard-watch-enabled", (_event, enabled) => {

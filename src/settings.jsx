@@ -6,6 +6,7 @@ import { usePermissions } from "./hooks/usePermissions";
 import ProcessMonitorPanel from "./components/ProcessMonitorPanel";
 import TranslatedHistory from "./components/TranslatedHistory";
 import M5BridgePanel from "./components/M5BridgePanel";
+import AsrConnectionPanel from "./components/AsrConnectionPanel";
 import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -427,6 +428,8 @@ const SettingsPage = () => {
               </button>
             </div>
           </div>
+
+          <AsrConnectionPanel />
 
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-6">
             <div className="p-6">

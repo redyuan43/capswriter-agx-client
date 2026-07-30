@@ -437,6 +437,33 @@ test('resetting an active socket never schedules a replacement', async (t) => {
   assert.equal(FakeWebSocket.instances.length, 1);
 });
 
+test('ASR profile invalidation keeps an active recording socket open', async (t) => {
+  FakeWebSocket.instances = [];
+  global.WebSocket = FakeWebSocket;
+  global.window = runtimeWindow({
+    realtime_asr_url: 'wss://asr.example/realtime',
+    realtime_asr_token: 'runtime-token',
+    realtime_asr_fallback_url: '',
+  });
+  t.after(() => {
+    delete global.WebSocket;
+    delete global.window;
+  });
+  const { PCMRealtimeSession, invalidateRealtimeAsrPreconnection, resetRealtimeAsrPreconnection } = await loadBackendApi(t);
+  const session = new PCMRealtimeSession();
+  const started = session.start();
+  await tick();
+  const socket = FakeWebSocket.instances[0];
+  socket.emitOpen();
+  await tick();
+  socket.emitMessage({ type: 'ready', success: true });
+  await started;
+  invalidateRealtimeAsrPreconnection();
+  assert.equal(socket.readyState, FakeWebSocket.OPEN);
+  session.cancel();
+  resetRealtimeAsrPreconnection();
+});
+
 test('reset cancels and invalidates the module startup idle callback', async (t) => {
   FakeWebSocket.instances = [];
   global.WebSocket = FakeWebSocket;

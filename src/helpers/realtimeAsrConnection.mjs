@@ -22,10 +22,28 @@ export function buildRealtimeAsrProtocols(token) {
 }
 
 export async function resolveRealtimeAsrConnection({
+  getActiveConnection,
   getSetting,
   defaultUrl,
   defaultFallbackUrl,
 } = {}) {
+  if (typeof getActiveConnection === 'function') {
+    try {
+      const active = await getActiveConnection();
+      const activeUrl = cleanWebSocketUrl(active?.url);
+      if (activeUrl) {
+        const token = String(active?.token || '').trim();
+        return {
+          primaryUrl: activeUrl,
+          fallbackUrl: '',
+          token,
+          candidates: [{ route: 'primary', url: activeUrl, protocols: buildRealtimeAsrProtocols(token) }],
+        };
+      }
+    } catch {
+      // Retain legacy setting lookup when the new main-process API is unavailable.
+    }
+  }
   const primaryValue = await readSetting(getSetting, 'realtime_asr_url', defaultUrl);
   const tokenValue = await readSetting(getSetting, 'realtime_asr_token', '');
   const fallbackValue = await readSetting(

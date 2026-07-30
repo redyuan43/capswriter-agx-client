@@ -13,6 +13,7 @@ class IPCHandlers {
     this.processMonitorManager = managers.processMonitorManager;
     this.linkBookmarkManager = managers.linkBookmarkManager;
     this.voiceDatasetRecorder = managers.voiceDatasetRecorder;
+    this.asrConnectionProfiles = managers.asrConnectionProfiles;
     this.f2RegisteredSenders = new Set();
 
     registerIpcHandlers(this);
