@@ -1,7 +1,6 @@
 import { buildRealtimeAsrProtocols } from './realtimeAsrConnection.mjs';
 
 const SAMPLE_RATE = 16000;
-const AUDIO_DURATION_MS = 1000;
 const PCM_BYTES = SAMPLE_RATE * 2;
 
 function now() {
@@ -24,11 +23,10 @@ async function parseMessageData(data) {
 
 export function formatProbeMetrics(metrics = {}) {
   const values = [];
-  if (Number.isFinite(metrics.handshakeMs)) values.push(`握手 ${Math.round(metrics.handshakeMs)} ms`);
-  if (Number.isFinite(metrics.readyMs)) values.push(`服务就绪 ${Math.round(metrics.readyMs)} ms`);
-  if (Number.isFinite(metrics.uploadBytesPerSecond)) values.push(`本地发送排空 ${(metrics.uploadBytesPerSecond / 1024).toFixed(1)} KiB/s`);
-  if (Number.isFinite(metrics.endToEndMs)) values.push(`端到端 ${Math.round(metrics.endToEndMs)} ms`);
-  if (Number.isFinite(metrics.audioRealtimeFactor)) values.push(`实时倍率 ${metrics.audioRealtimeFactor.toFixed(2)}x`);
+  if (Number.isFinite(metrics.handshakeMs)) values.push(`连接 ${Math.round(metrics.handshakeMs)} ms`);
+  if (Number.isFinite(metrics.servicePrepareMs)) values.push(`服务准备 ${Math.round(metrics.servicePrepareMs)} ms`);
+  if (Number.isFinite(metrics.audioProcessingMs)) values.push(`处理 1 秒音频 ${Math.round(metrics.audioProcessingMs)} ms`);
+  if (Number.isFinite(metrics.endToEndMs)) values.push(`总计 ${Math.round(metrics.endToEndMs)} ms`);
   return values.join(' · ');
 }
 
@@ -40,13 +38,10 @@ export function probeAsrConnection(connection, { WebSocketImpl = WebSocket, time
     let handshakeAt = 0;
     let readyAt = 0;
     let uploadStartedAt = 0;
-    let uploadFinishedAt = 0;
-    let drainTimer = null;
     const finish = (result, error = null) => {
       if (done) return;
       done = true;
       clearTimeout(timeout);
-      if (drainTimer !== null) clearInterval(drainTimer);
       try { socket?.close(); } catch { /* best effort */ }
       if (error) reject(error);
       else resolve(result);
@@ -73,19 +68,14 @@ export function probeAsrConnection(connection, { WebSocketImpl = WebSocket, time
         uploadStartedAt = now();
         for (const chunk of silentPcmChunks()) socket.send(chunk);
         socket.send(JSON.stringify({ type: 'finish' }));
-        drainTimer = setInterval(() => {
-          if (!uploadFinishedAt && socket.bufferedAmount === 0) uploadFinishedAt = now();
-        }, 10);
       } else if (payload?.type === 'final') {
         const finalAt = now();
-        if (!uploadFinishedAt) uploadFinishedAt = finalAt;
         const processingMs = Math.max(1, finalAt - uploadStartedAt);
         finish({
           handshakeMs: handshakeAt - startedAt,
-          readyMs: readyAt - startedAt,
-          uploadBytesPerSecond: PCM_BYTES / Math.max(0.001, (uploadFinishedAt - uploadStartedAt) / 1000),
+          servicePrepareMs: readyAt - handshakeAt,
+          audioProcessingMs: processingMs,
           endToEndMs: finalAt - startedAt,
-          audioRealtimeFactor: (AUDIO_DURATION_MS / 1000) / (processingMs / 1000),
         });
       }
     };
