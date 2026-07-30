@@ -154,7 +154,7 @@ export default function AsrConnectionPanel() {
       <div className="p-6">
         <div className="mb-4">
           <h2 className="text-lg font-semibold text-gray-900 chinese-title">ASR 服务端</h2>
-          <p className="text-xs text-gray-600 mt-1">仅影响实时语音识别；切换前必须通过 WebSocket 连接测试。</p>
+          <p className="text-xs text-gray-600 mt-1">测试显示握手、服务就绪、端到端耗时与实时倍率；本地发送排空不等同于网络吞吐。</p>
         </div>
 
         <div className="space-y-2 mb-4">

@@ -26,7 +26,7 @@ export function formatProbeMetrics(metrics = {}) {
   const values = [];
   if (Number.isFinite(metrics.handshakeMs)) values.push(`握手 ${Math.round(metrics.handshakeMs)} ms`);
   if (Number.isFinite(metrics.readyMs)) values.push(`服务就绪 ${Math.round(metrics.readyMs)} ms`);
-  if (Number.isFinite(metrics.uploadBytesPerSecond)) values.push(`上行 ${(metrics.uploadBytesPerSecond / 1024).toFixed(1)} KiB/s`);
+  if (Number.isFinite(metrics.uploadBytesPerSecond)) values.push(`本地发送排空 ${(metrics.uploadBytesPerSecond / 1024).toFixed(1)} KiB/s`);
   if (Number.isFinite(metrics.endToEndMs)) values.push(`端到端 ${Math.round(metrics.endToEndMs)} ms`);
   if (Number.isFinite(metrics.audioRealtimeFactor)) values.push(`实时倍率 ${metrics.audioRealtimeFactor.toFixed(2)}x`);
   return values.join(' · ');
