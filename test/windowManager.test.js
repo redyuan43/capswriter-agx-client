@@ -37,3 +37,21 @@ test("rejects an invalid Windows foreground window handle", () => {
   assert.equal(manager.rememberActiveWindow(), null);
   assert.equal(manager.previousActiveWindow, null);
 });
+
+test("keeps the floating ball non-focusable on Wayland while dictating", () => {
+  const calls = [];
+  const manager = new WindowManager({ platform: "linux", sessionType: "wayland" });
+  manager.mainWindow = {
+    isDestroyed: () => false,
+    setFocusable: (value) => calls.push(["setFocusable", value]),
+    showInactive: () => calls.push(["showInactive"]),
+    blur: () => calls.push(["blur"]),
+  };
+
+  assert.equal(manager.setFloatingBallInputCaptureEnabled(true), true);
+  assert.deepEqual(calls, [
+    ["setFocusable", false],
+    ["showInactive"],
+    ["blur"],
+  ]);
+});

@@ -10,6 +10,7 @@ const appIconPath = path.join(__dirname, "..", "..", "assets", "icon.png");
 class WindowManager {
   constructor(options = {}) {
     this.platform = options.platform || process.platform;
+    this.sessionType = String(options.sessionType || process.env.XDG_SESSION_TYPE || '').toLowerCase();
     this.execFileSync = options.execFileSync || execFileSync;
     this.execSync = options.execSync || execSync;
     this.mainWindow = null;
@@ -197,12 +198,18 @@ class WindowManager {
       return false;
     }
 
-    const shouldCapture = !!enabled;
+    // Wayland cannot restore an arbitrary application's focus after dictation.
+    // Keep the overlay non-focusable so the terminal remains the paste target.
+    const isWayland = this.platform === 'linux' && this.sessionType === 'wayland';
+    const shouldCapture = !!enabled && !isWayland;
     this.mainWindow.setFocusable(shouldCapture);
     if (shouldCapture) {
       this.mainWindow.show();
       this.mainWindow.focus();
-    } else if (process.platform === 'linux') {
+    } else if (isWayland && enabled) {
+      this.mainWindow.showInactive();
+      this.mainWindow.blur();
+    } else if (this.platform === 'linux') {
       this.mainWindow.blur();
     }
     return true;
