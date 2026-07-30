@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Loader2, Plus, Radio, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { formatProbeMetrics, probeAsrConnection } from "../helpers/asrConnectionProbe.mjs";
@@ -23,6 +23,7 @@ function sameDraft(left, right) {
 export default function AsrConnectionPanel() {
   const [state, setState] = useState(null);
   const [selectedId, setSelectedId] = useState("");
+  const selectedIdRef = useRef("");
   const [draft, setDraft] = useState(null);
   const [token, setToken] = useState("");
   const [clearToken, setClearToken] = useState(false);
@@ -41,10 +42,11 @@ export default function AsrConnectionPanel() {
     if (!window.electronAPI?.listAsrConnectionProfiles) return;
     const next = await window.electronAPI.listAsrConnectionProfiles();
     setState(next);
-    const nextSelected = next.profiles.find((item) => item.id === selectedId)
+    const nextSelected = next.profiles.find((item) => item.id === selectedIdRef.current)
       || next.profiles.find((item) => item.id === next.activeProfileId)
       || next.profiles[0];
     if (nextSelected) {
+      selectedIdRef.current = nextSelected.id;
       setSelectedId(nextSelected.id);
       setDraft({ ...nextSelected });
       setToken("");
@@ -52,13 +54,14 @@ export default function AsrConnectionPanel() {
       setTestedDraft(null);
       setProbeMetrics("");
     }
-  }, [selectedId]);
+  }, []);
 
   useEffect(() => {
     load().catch((error) => toast.error("加载 ASR 配置失败", { description: error?.message || String(error) }));
   }, [load]);
 
   const selectProfile = (profile) => {
+    selectedIdRef.current = profile.id;
     setSelectedId(profile.id);
     setDraft({ ...profile });
     setToken("");
