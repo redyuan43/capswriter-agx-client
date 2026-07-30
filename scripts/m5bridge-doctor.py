@@ -146,7 +146,11 @@ def pipewire_source(mac: str) -> dict:
 
 def bridge_state(url: str) -> dict:
     try:
-        with urllib.request.urlopen(url, timeout=3) as response:
+        token = os.environ.get("M5_VOICE_BRIDGE_TOKEN") or \
+            os.environ.get("VIBE_STICK_BRIDGE_TOKEN")
+        headers = {"X-Vibe-Stick-Token": token} if token else {}
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=3) as response:
             state = json.load(response)
             bluetooth = state.get("bluetooth") or {}
             return {
@@ -309,6 +313,19 @@ def connect_bluetooth(mac: str, attempts: int = 3,
     return {"ok": False, "commands": commands, "state": state}
 
 
+def disconnect_bluetooth(mac: str) -> dict:
+    state = bluez_info(mac)
+    if not state["connected"]:
+        return {"ok": True, "command": None, "state": state}
+    command = run("bluetoothctl", "disconnect", mac)
+    state = wait_for_bluez_connection(mac, False, timeout=8)
+    return {
+        "ok": command["ok"] and not state["connected"],
+        "command": command,
+        "state": state,
+    }
+
+
 def restart_audio_stack() -> dict:
     return run(
         "systemctl", "--user", "restart",
@@ -318,19 +335,17 @@ def restart_audio_stack() -> dict:
 
 
 def recover_audio_stack(mac: str) -> dict:
+    disconnect = disconnect_bluetooth(mac)
     audio_stack = restart_audio_stack()
-    source = wait_for_pipewire_source(mac, timeout=15) if audio_stack["ok"] else {
+    bluetooth = connect_bluetooth(mac, always_attempt=True) if audio_stack["ok"] else None
+    source = wait_for_pipewire_source(mac, timeout=15) if bluetooth and bluetooth["ok"] else {
         "available": False, "enumerated": False, "state": "MISSING",
     }
-    bluetooth = None
-    if audio_stack["ok"] and not source["available"]:
-        state = bluez_info(mac)
-        bluetooth = connect_bluetooth(mac, always_attempt=state["connected"])
-        source = wait_for_pipewire_source(mac, timeout=15)
     state = bluez_info(mac)
     ok = audio_stack["ok"] and state["connected"] and source["available"]
     return {
         "ok": ok,
+        "disconnect": disconnect,
         "audio_stack": audio_stack,
         "bluetooth": bluetooth,
         "bluez": state,

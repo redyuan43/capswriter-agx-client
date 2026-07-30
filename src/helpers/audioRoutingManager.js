@@ -4,6 +4,7 @@ const ROUTING_SETTING_KEY = "audio_input_routes_v2";
 const LEGACY_ROUTING_SETTING_KEY = "audio_input_routes_v1";
 const DEFAULT_USB_DESCRIPTION = "MI Speakphone Mono";
 const UNIFIED_SOURCE_NAME = "capswriter_input_bus.monitor";
+const CAPTURE_HEALTH_TTL_MS = 60 * 1000;
 
 function cleanId(value) {
   return String(value || "").trim();
@@ -78,11 +79,23 @@ class AudioRoutingManager {
   }
 
   captureHealthFor(sourceId) {
-    return this.captureHealth.get(cleanId(sourceId)) || {
+    const health = this.captureHealth.get(cleanId(sourceId));
+    if (health?.status === "healthy" && health.last_success_at) {
+      const ageMs = this.now() - Date.parse(health.last_success_at);
+      if (!Number.isFinite(ageMs) || ageMs > CAPTURE_HEALTH_TTL_MS) {
+        return {
+          ...health,
+          status: "unknown",
+          stale: true,
+        };
+      }
+    }
+    return health || {
       status: "unknown",
       last_success_at: null,
       last_failure_at: null,
       failure_reason: "",
+      stale: false,
     };
   }
 
@@ -96,6 +109,7 @@ class AudioRoutingManager {
       last_success_at: new Date(this.now()).toISOString(),
       failure_reason: "",
       last_success_bytes: Math.max(0, Number(details.bytes || 0)),
+      stale: false,
     };
     this.captureHealth.set(id, health);
     return health;
@@ -111,6 +125,7 @@ class AudioRoutingManager {
       last_failure_at: new Date(this.now()).toISOString(),
       failure_reason: cleanId(reason) || "audio_capture_failed",
       failure_details: details && typeof details === "object" ? details : {},
+      stale: false,
     };
     this.captureHealth.set(id, health);
     return health;
@@ -244,22 +259,41 @@ class AudioRoutingManager {
     )?.source_id || "";
   }
 
-  resolveRoute(triggerId, sources = this.listSources(), saved = this.routesForSources(sources)) {
+  resolveRoute(
+    triggerId,
+    sources = this.listSources(),
+    saved = this.routesForSources(sources),
+    { fallbackToAvailable = false } = {}
+  ) {
     const cleanTriggerId = cleanId(triggerId) || "keyboard";
-    const sourceId = cleanId(saved.routes[cleanTriggerId]?.source_id) ||
+    const configuredSourceId = cleanId(saved.routes[cleanTriggerId]?.source_id);
+    let sourceId = configuredSourceId ||
       this.defaultSourceForTrigger(cleanTriggerId, sources);
-    const source = sources.find((candidate) => candidate.source_id === sourceId) || {
+    let source = sources.find((candidate) => candidate.source_id === sourceId) || {
       source_id: sourceId,
       kind: sourceId.startsWith("wifi:") ? "wifi" : "pipewire",
       name: sourceId,
       online: false,
     };
+    let available = Boolean(sourceId && (source.transport_available ?? source.online));
+    if (!available && fallbackToAvailable) {
+      const fallbackSourceId = this.defaultSourceForTrigger(cleanTriggerId, sources);
+      const fallbackSource = sources.find((candidate) => candidate.source_id === fallbackSourceId);
+      if (fallbackSource && (fallbackSource.transport_available ?? fallbackSource.online)) {
+        sourceId = fallbackSourceId;
+        source = fallbackSource;
+        available = true;
+      }
+    }
     return {
       trigger_id: cleanTriggerId,
       source_id: sourceId,
       source,
       trigger_name: miniJoyTriggerLabel(cleanTriggerId),
-      available: Boolean(sourceId && (source.transport_available ?? source.online)),
+      available,
+      ...(configuredSourceId && configuredSourceId !== sourceId
+        ? { configured_source_id: configuredSourceId }
+        : {}),
     };
   }
 
@@ -285,16 +319,26 @@ class AudioRoutingManager {
     const bluetoothTriggerIds = sources
       .filter((source) => source.bluetooth && source.bluetooth_address)
       .map((source) => miniJoyTriggerId(source.bluetooth_address));
-    const triggerIds = new Set([
+    const liveTriggerIds = new Set([
       "keyboard",
       ...bluetoothTriggerIds,
       ...(bluetoothTriggerIds.length ? [] : ["minijoy_bt"]),
       ...this.listWifiSources().map((source) => source.source_id),
-      ...Object.keys(saved.routes),
     ]);
     const routes = {};
-    for (const triggerId of triggerIds) {
-      routes[triggerId] = this.resolveRoute(triggerId, sources, saved);
+    for (const triggerId of liveTriggerIds) {
+      const route = this.resolveRoute(triggerId, sources, saved, {
+        fallbackToAvailable: true,
+      });
+      if (route.available) routes[triggerId] = route;
+    }
+    const inactiveRoutes = {};
+    for (const triggerId of Object.keys(saved.routes)) {
+      const configured = this.resolveRoute(triggerId, sources, saved);
+      const live = routes[triggerId];
+      if (!configured.available || !live || configured.source_id !== live.source_id) {
+        inactiveRoutes[triggerId] = configured;
+      }
     }
     return {
       version: 2,
@@ -305,6 +349,7 @@ class AudioRoutingManager {
       },
       sources,
       routes,
+      inactive_routes: inactiveRoutes,
       active_route: [...this.activeRoutes.values()].at(-1) || null,
       active_routes: [...this.activeRoutes.values()],
     };

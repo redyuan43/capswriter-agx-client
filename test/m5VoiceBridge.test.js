@@ -4,7 +4,17 @@ const test = require("node:test");
 const { once } = require("node:events");
 
 const M5VoiceBridge = require("../src/helpers/m5VoiceBridge");
-const { crc32Hex, withoutNestedBridgeState } = M5VoiceBridge;
+const {
+  crc32Hex,
+  diagnosticMatchesTarget,
+  pcm16HasSignal,
+  withoutNestedBridgeState,
+} = M5VoiceBridge;
+
+test("PCM signal detection rejects silence without hiding real samples", () => {
+  assert.equal(pcm16HasSignal(Buffer.alloc(640)), false);
+  assert.equal(pcm16HasSignal(Buffer.from([0, 0, 1, 0])), true);
+});
 
 test("diagnostic state strips nested bridge snapshots", () => {
   assert.deepEqual(withoutNestedBridgeState({
@@ -17,6 +27,18 @@ test("diagnostic state strips nested bridge snapshots", () => {
     before: { audio_status: "failed" },
     after: [{}, { audio_status: "unknown" }],
   });
+});
+
+test("diagnostic state belongs only to its current Bluetooth target", () => {
+  const diagnostic = {
+    before: {
+      bridge: { state: { bluetooth: { target_mac: "14:08:08:52:F9:62" } } },
+    },
+  };
+
+  assert.equal(diagnosticMatchesTarget(diagnostic, "14:08:08:52:F9:62"), true);
+  assert.equal(diagnosticMatchesTarget(diagnostic, "C8:85:41:68:39:0A"), false);
+  assert.equal(diagnosticMatchesTarget({}, "14:08:08:52:F9:62"), false);
 });
 
 function request(port, headers = {}) {
@@ -297,7 +319,10 @@ test("dashboard inline script remains valid after server-side rendering", () => 
   assert.equal(scripts.length, 1);
   assert.doesNotThrow(() => new Function(scripts[0]));
   assert.match(html, /音频输入路由/);
-  assert.match(html, /MiniJoy 蓝牙设备/);
+  assert.match(html, /实时 MiniJoy 蓝牙设备/);
+  assert.match(html, /实时在线设备/);
+  assert.match(html, /历史\/不可用路由/);
+  assert.match(html, /已知但未连接的 MiniJoy/);
 });
 
 test("M5 audio chunks are idempotent by chunk_id", async (t) => {
@@ -529,6 +554,12 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   };
 
   const started = await bridge.handleHostTriggerDown("minijoy_bt", "42");
+  emitChunk(Buffer.alloc(640));
+  assert.equal(
+    bridge.audioRouting.captureHealthFor("pipewire:bluez_input.C8_85_41_68_39_0A").status,
+    "unknown"
+  );
+  assert.deepEqual(rendererEvents, []);
   emitChunk(Buffer.from([1, 2, 3, 4]));
   assert.equal(
     bridge.audioRouting.captureHealthFor("pipewire:bluez_input.C8_85_41_68_39_0A").status,
@@ -547,6 +578,7 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   ]);
   assert.equal(rendererEvents[2].payload.bytes, 4);
   assert.equal(rendererEvents[2].payload.chunks, 1);
+  assert.equal(bridge.sessions.get(started.session_id).silentBytes, 640);
 });
 
 test("MiniJoy host capture with no PCM records an audio failure but remains retryable", async (t) => {

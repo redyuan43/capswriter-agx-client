@@ -64,3 +64,33 @@ test("device registry prunes stale devices and ignores ordinary clients", () => 
   now = 1501;
   assert.deepEqual(registry.list(), []);
 });
+
+test("device registry separates realtime devices from retained history", () => {
+  let now = 1000;
+  const registry = new M5DeviceRegistry({
+    onlineMs: 30000,
+    retentionMs: 24 * 60 * 60 * 1000,
+    now: () => now,
+  });
+  registry.remember(request({
+    "x-vibe-stick-device-id": "live-device",
+    "x-vibe-stick-firmware-name": "vibestick",
+  }), "/state");
+
+  now = 30999;
+  assert.deepEqual(registry.listOnline().map((device) => device.device_id), ["live-device"]);
+  assert.deepEqual(registry.listOffline(), []);
+
+  now = 31001;
+  assert.deepEqual(registry.listOnline(), []);
+  assert.deepEqual(registry.listOffline().map((device) => ({
+    device_id: device.device_id,
+    online: device.online,
+    age_ms: device.age_ms,
+  })), [{
+    device_id: "live-device",
+    online: false,
+    age_ms: 30001,
+  }]);
+  assert.equal(registry.list().length, 1);
+});

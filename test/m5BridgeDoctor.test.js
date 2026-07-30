@@ -22,6 +22,32 @@ ${body}
   return JSON.parse(result.stdout);
 }
 
+test("doctor authenticates bridge diagnostics with the runtime token", () => {
+  const result = runPython(`
+class Response:
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+    def read(self, *args):
+        return b'{"bluetooth":{"target_mac":"C8:85:41:68:39:0A","audio_status":"failed"}}'
+
+captured = {}
+doctor.os.environ["M5_VOICE_BRIDGE_TOKEN"] = "runtime-secret"
+doctor.urllib.request.urlopen = lambda request, timeout: (
+    captured.update({"headers": dict(request.header_items()), "timeout": timeout}) or Response())
+value = doctor.bridge_state("http://127.0.0.1:8765/state")
+print(json.dumps({"value": value, "captured": captured}))
+`);
+  const tokenHeader = Object.entries(result.captured.headers).find(
+    ([name]) => name.toLowerCase() === "x-vibe-stick-token"
+  );
+  assert.equal(tokenHeader?.[1], "runtime-secret");
+  assert.equal(result.captured.timeout, 3);
+  assert.equal(result.value.available, true);
+  assert.equal(result.value.state.bluetooth.audio_status, "failed");
+});
+
 test("doctor classifies residual PipeWire nodes by recent capture health", () => {
   const result = runPython(`
 m5 = {"ok": True}
@@ -100,34 +126,14 @@ print(json.dumps(value))
   assert.equal(result.recovery.action, "audio_stack_restart_and_bluetooth_reconnect");
 });
 
-test("doctor lets PipeWire re-enumerate before disrupting Bluetooth", () => {
+test("doctor cycles Bluetooth before rebuilding a stale PipeWire route", () => {
   const result = runPython(`
 calls = []
+doctor.disconnect_bluetooth = lambda mac: calls.append(["disconnect", mac]) or {"ok": True}
 doctor.restart_audio_stack = lambda: calls.append("restart") or {"ok": True}
 doctor.wait_for_pipewire_source = lambda mac, timeout: calls.append(["source", timeout]) or {
     "available": True, "enumerated": True, "state": "SUSPENDED",
 }
-doctor.connect_bluetooth = lambda *args, **kwargs: (_ for _ in ()).throw(
-    RuntimeError("must not reconnect a recovered link"))
-doctor.bluez_info = lambda mac: {"connected": True}
-value = doctor.recover_audio_stack("14:08:08:52:F9:62")
-print(json.dumps({"value": value, "calls": calls}))
-`);
-  assert.equal(result.value.ok, true);
-  assert.equal(result.value.bluetooth, null);
-  assert.deepEqual(result.calls, ["restart", ["source", 15]]);
-});
-
-test("doctor reconnects only after PipeWire fails to re-enumerate", () => {
-  const result = runPython(`
-calls = []
-sources = [
-    {"available": False, "enumerated": False, "state": "MISSING"},
-    {"available": True, "enumerated": True, "state": "SUSPENDED"},
-]
-doctor.restart_audio_stack = lambda: {"ok": True}
-doctor.wait_for_pipewire_source = lambda mac, timeout: calls.append(
-    ["source", timeout]) or sources.pop(0)
 doctor.connect_bluetooth = lambda mac, **kwargs: calls.append(
     ["connect", mac, kwargs.get("always_attempt")]) or {"ok": True}
 doctor.bluez_info = lambda mac: {"connected": True}
@@ -136,9 +142,30 @@ print(json.dumps({"value": value, "calls": calls}))
 `);
   assert.equal(result.value.ok, true);
   assert.deepEqual(result.calls, [
-    ["source", 15],
+    ["disconnect", "14:08:08:52:F9:62"],
+    "restart",
     ["connect", "14:08:08:52:F9:62", true],
     ["source", 15],
+  ]);
+});
+
+test("doctor reports a missing route after a failed reconnect", () => {
+  const result = runPython(`
+calls = []
+doctor.disconnect_bluetooth = lambda mac: {"ok": True}
+doctor.restart_audio_stack = lambda: {"ok": True}
+doctor.connect_bluetooth = lambda mac, **kwargs: calls.append(
+    ["connect", mac, kwargs.get("always_attempt")]) or {"ok": False}
+doctor.wait_for_pipewire_source = lambda *args, **kwargs: (_ for _ in ()).throw(
+    RuntimeError("must not accept a stale source after connect fails"))
+doctor.bluez_info = lambda mac: {"connected": False}
+value = doctor.recover_audio_stack("14:08:08:52:F9:62")
+print(json.dumps({"value": value, "calls": calls}))
+`);
+  assert.equal(result.value.ok, false);
+  assert.equal(result.value.pipewire.state, "MISSING");
+  assert.deepEqual(result.calls, [
+    ["connect", "14:08:08:52:F9:62", true],
   ]);
 });
 

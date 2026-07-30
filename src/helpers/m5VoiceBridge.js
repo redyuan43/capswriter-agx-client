@@ -28,6 +28,7 @@ const RECORDING_FIRST_CHUNK_TIMEOUT_MS = 12000;
 const RECORDING_STALL_TIMEOUT_MS = 10000;
 const RECORDING_MAX_DURATION_MS = 180000;
 const DEFAULT_MINIJOY_BLUETOOTH_MAC = "14:08:08:52:F9:62";
+const MAX_DIAGNOSTIC_AGE_MS = 5 * 60 * 1000;
 const BLUETOOTH_RECOVERY_COOLDOWN_MS = 60000;
 const BLUETOOTH_RECOVERY_TIMEOUT_MS = 180000;
 const HOST_AUDIO_FAILURE_REASONS = new Set([
@@ -36,6 +37,15 @@ const HOST_AUDIO_FAILURE_REASONS = new Set([
   "audio_input_stalled",
   "first_audio_chunk_timeout",
 ]);
+
+function pcm16HasSignal(value) {
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value || []);
+  for (let offset = 0; offset + 1 < buffer.length; offset += 2) {
+    if (buffer.readInt16LE(offset) !== 0) return true;
+  }
+  return buffer.length % 2 === 1 && buffer[buffer.length - 1] !== 0;
+}
+
 function cleanToken(value) {
   const token = String(value || "").trim();
   if (!token || [
@@ -56,6 +66,20 @@ function withoutNestedBridgeState(value) {
   return Object.fromEntries(Object.entries(value)
     .filter(([key]) => key !== "bridge")
     .map(([key, item]) => [key, withoutNestedBridgeState(item)]));
+}
+
+function normalizeBluetoothMac(value) {
+  return String(value || "").toUpperCase().replace(/[^0-9A-F]/g, "");
+}
+
+function diagnosticMatchesTarget(value, targetMac) {
+  const target = normalizeBluetoothMac(targetMac);
+  if (!target || !value || typeof value !== "object") return false;
+  const snapshots = [value.before, value.after, value];
+  return snapshots.some((snapshot) => {
+    const bluetooth = snapshot?.bridge?.state?.bluetooth || snapshot?.bluetooth;
+    return normalizeBluetoothMac(bluetooth?.target_mac) === target;
+  });
 }
 
 function cleanBridgeIdentity(value, fallback) {
@@ -368,13 +392,15 @@ class M5VoiceBridge {
   }
 
   listDevices() {
-    return this.deviceRegistry.list();
+    return this.deviceRegistry.listOnline();
   }
 
   buildDashboardHtml() {
     const devices = this.listDevices();
+    const historicalDevices = this.deviceRegistry.listOffline();
     const rows = devices.map((device) => this.deviceRowHtml(device)).join("");
     const bodyRows = rows || '<tr><td colspan="9" class="empty">No M5Stack devices seen yet.</td></tr>';
+    const historicalRows = historicalDevices.map((device) => this.deviceRowHtml(device)).join("");
     const updatedAt = escapeHtml(new Date().toLocaleString());
     const routingState = JSON.stringify(this.audioRouting.getState()).replace(/</g, "\\u003c");
     return `<!doctype html>
@@ -402,6 +428,10 @@ th { color: #344054; background: #f9fafb; font-weight: 600; }
 .bluetooth-device button { margin-top: 0; }
 .bluetooth-status { color: #475467; font-size: 13px; }
 .route-grid { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(260px, 2fr); gap: 10px 16px; align-items: center; }
+details { margin-top: 14px; border: 1px solid #d0d5dd; background: #fff; padding: 10px 12px; }
+summary { cursor: pointer; color: #475467; font-weight: 600; }
+.history-list { display: grid; gap: 8px; margin-top: 10px; }
+.history-item { color: #667085; font-size: 13px; overflow-wrap: anywhere; }
 select { width: 100%; min-height: 38px; border: 1px solid #98a2b3; background: #fff; padding: 6px 9px; }
 button { margin-top: 14px; min-height: 38px; border: 0; background: #175cd3; color: #fff; padding: 8px 15px; cursor: pointer; }
 #save-status { margin-left: 12px; color: #475467; }
@@ -415,15 +445,18 @@ button { margin-top: 14px; min-height: 38px; border: 0; background: #175cd3; col
 <h2>音频输入路由</h2>
 <div id="routes" class="route-grid"></div>
 <button id="save-routes" type="button">保存路由</button><span id="save-status"></span>
-<h2>MiniJoy 蓝牙设备</h2>
+<details id="inactive-routes-section" hidden><summary>历史/不可用路由</summary><div id="inactive-routes" class="history-list"></div></details>
+<h2>实时 MiniJoy 蓝牙设备</h2>
 <div id="bluetooth-devices" class="bluetooth-list"><div class="muted">正在读取蓝牙状态...</div></div>
-<h2>在线设备</h2>
+<details id="known-bluetooth-section" hidden><summary>已知但未连接的 MiniJoy</summary><div id="known-bluetooth-devices" class="history-list"></div></details>
+<h2>实时在线设备</h2>
 <table>
 <thead>
 <tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>Wake</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr>
 </thead>
 <tbody>${bodyRows}</tbody>
 </table>
+${historicalRows ? `<details><summary>最近 24 小时的离线设备</summary><table><thead><tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>Wake</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Path</th></tr></thead><tbody>${historicalRows}</tbody></table></details>` : ""}
 </main>
 <script>
 const state = ${routingState};
@@ -440,7 +473,7 @@ for (const [triggerId, route] of Object.entries(state.routes)) {
   const select = document.createElement("select");
   select.id = "route-" + triggerId;
   select.dataset.triggerId = triggerId;
-  for (const source of state.sources) {
+  for (const source of state.sources.filter((item) => item.online && item.transport_available !== false)) {
     const option = document.createElement("option");
     option.value = source.source_id;
     const audioStatus = source.audio_health?.status || "unknown";
@@ -456,6 +489,19 @@ for (const [triggerId, route] of Object.entries(state.routes)) {
     select.appendChild(option);
   }
   routeRoot.append(label, select);
+}
+const inactiveRoutes = Object.values(state.inactive_routes || {});
+if (inactiveRoutes.length) {
+  const section = document.getElementById("inactive-routes-section");
+  const root = document.getElementById("inactive-routes");
+  section.hidden = false;
+  for (const route of inactiveRoutes) {
+    const item = document.createElement("div");
+    item.className = "history-item";
+    item.textContent = triggerLabel(route.trigger_id, route) + " → " +
+      (route.source?.name || route.source_id || "未配置") + "（不可用）";
+    root.appendChild(item);
+  }
 }
 document.getElementById("save-routes").addEventListener("click", async () => {
   const status = document.getElementById("save-status");
@@ -477,6 +523,8 @@ document.getElementById("save-routes").addEventListener("click", async () => {
   }
 });
 const bluetoothRoot = document.getElementById("bluetooth-devices");
+const knownBluetoothSection = document.getElementById("known-bluetooth-section");
+const knownBluetoothRoot = document.getElementById("known-bluetooth-devices");
 const bluetoothStatusText = (device) => {
   if (device.connected) return "已连接（HID / 音频通道可继续验证）";
   if (device.paired) return "已配对，当前未连接";
@@ -509,11 +557,13 @@ async function loadBluetoothDevices() {
     if (!response.ok) throw new Error("HTTP " + response.status);
     const payload = await response.json();
     bluetoothRoot.replaceChildren();
-    if (!payload.devices.length) {
-      bluetoothRoot.innerHTML = '<div class="muted">未发现 MiniJoy 蓝牙设备。请让设备进入配对模式后刷新。</div>';
-      return;
+    knownBluetoothRoot.replaceChildren();
+    const connected = payload.devices.filter((device) => device.connected);
+    const known = payload.devices.filter((device) => !device.connected);
+    if (!connected.length) {
+      bluetoothRoot.innerHTML = '<div class="muted">当前没有实时连接的 MiniJoy。</div>';
     }
-    for (const device of payload.devices) {
+    for (const device of connected) {
       const row = document.createElement("div");
       row.className = "bluetooth-device";
       const text = document.createElement("div");
@@ -539,6 +589,13 @@ async function loadBluetoothDevices() {
       });
       row.append(text, button);
       bluetoothRoot.appendChild(row);
+    }
+    knownBluetoothSection.hidden = known.length === 0;
+    for (const device of known) {
+      const item = document.createElement("div");
+      item.className = "history-item";
+      item.textContent = device.label + " · " + device.mac + " · " + bluetoothStatusText(device);
+      knownBluetoothRoot.appendChild(item);
     }
   } catch (error) {
     bluetoothRoot.textContent = "蓝牙状态读取失败：" + error.message;
@@ -694,7 +751,7 @@ loadBluetoothDevices();
   bluetoothDiagnosticState() {
     const targetMac = String(process.env.M5_MINIJOY_BLUETOOTH_MAC ||
       DEFAULT_MINIJOY_BLUETOOTH_MAC).trim().toUpperCase();
-    const normalizedTargetMac = targetMac.replace(/[^0-9A-F]/g, "");
+    const normalizedTargetMac = normalizeBluetoothMac(targetMac);
     const routing = this.getAudioRoutingState();
     const sources = (routing.sources || []).filter((source) => source.bluetooth).map((source) => ({
       source_id: source.source_id,
@@ -711,9 +768,12 @@ loadBluetoothDevices();
       path.join(os.homedir(), ".cache", "capswriter-agx-client", "m5bridge-doctor.json");
     let diagnostic = null;
     try {
-      diagnostic = withoutNestedBridgeState(
-        JSON.parse(fs.readFileSync(diagnosticFile, "utf8"))
-      );
+      const stat = fs.statSync(diagnosticFile);
+      const rawDiagnostic = JSON.parse(fs.readFileSync(diagnosticFile, "utf8"));
+      const recent = Date.now() - stat.mtimeMs <= MAX_DIAGNOSTIC_AGE_MS;
+      if (recent && diagnosticMatchesTarget(rawDiagnostic, targetMac)) {
+        diagnostic = withoutNestedBridgeState(rawDiagnostic);
+      }
     } catch {
       // The diagnostic command is optional; absence is itself represented below.
     }
@@ -1091,6 +1151,13 @@ loadBluetoothDevices();
   }
 
   appendRecordingAudio(session, body) {
+    const bluetoothHostCapture = session.captureMode === "host_capture" &&
+      String(session.sourceId || "").startsWith("pipewire:bluez_input.");
+    if (bluetoothHostCapture && !pcm16HasSignal(body)) {
+      session.silentBytes = Math.max(0, Number(session.silentBytes || 0)) + body.length;
+      session.silentChunks = Math.max(0, Number(session.silentChunks || 0)) + 1;
+      return false;
+    }
     if (!this.recordingSessions.appendAudio(session, body)) {
       return false;
     }
@@ -2185,4 +2252,6 @@ module.exports.selectCyberAgentCommand = selectCyberAgentCommand;
 module.exports.crc32 = crc32;
 module.exports.crc32Hex = crc32Hex;
 module.exports.createPcmWavBuffer = createPcmWavBuffer;
+module.exports.pcm16HasSignal = pcm16HasSignal;
 module.exports.withoutNestedBridgeState = withoutNestedBridgeState;
+module.exports.diagnosticMatchesTarget = diagnosticMatchesTarget;

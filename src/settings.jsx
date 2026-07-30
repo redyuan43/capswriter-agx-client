@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
 import "./index.css";
 import { toast, Toaster } from "sonner";
-import { Settings, X, Loader2, Play, Circle, History, Link2 } from "lucide-react";
+import { Settings, X, Loader2, Play, Circle, History, Link2, Radio } from "lucide-react";
 import { usePermissions } from "./hooks/usePermissions";
 import ProcessMonitorPanel from "./components/ProcessMonitorPanel";
 import TranslatedHistory from "./components/TranslatedHistory";
+import M5BridgePanel from "./components/M5BridgePanel";
 import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -24,6 +25,11 @@ const VOICE_TRANSLATE_NONE = "none";
 const VOICE_TRANSLATE_EN = "en";
 const VOICE_TRANSLATE_ZH = "zh";
 
+function initialSettingsTab() {
+  const tab = new URLSearchParams(window.location.search).get("tab");
+  return tab === "bridge" ? "bridge" : "settings";
+}
+
 const SettingsPage = () => {
   const [loading, setLoading] = useState(true);
   const [voiceTranslateTarget, setVoiceTranslateTarget] = useState(VOICE_TRANSLATE_NONE);
@@ -36,7 +42,7 @@ const SettingsPage = () => {
   const [voiceReleaseGraceMs, setVoiceReleaseGraceMs] = useState(DEFAULT_VOICE_RELEASE_GRACE_MS);
   const [capsMinHoldMs, setCapsMinHoldMs] = useState(DEFAULT_CAPS_MIN_HOLD_MS);
   const [savingVoiceSettings, setSavingVoiceSettings] = useState(false);
-  const [activeTab, setActiveTab] = useState('settings');
+  const [activeTab, setActiveTab] = useState(initialSettingsTab);
   const [appVersion, setAppVersion] = useState('');
 
   const showAlert = (alert) => {
@@ -370,6 +376,13 @@ const SettingsPage = () => {
               语音链接表
             </button>
             <button
+              onClick={() => setActiveTab(activeTab === 'bridge' ? 'settings' : 'bridge')}
+              className={`px-3 py-1.5 text-sm flex items-center gap-1.5 rounded-lg transition-colors ${activeTab === 'bridge' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
+            >
+              <Radio className="w-4 h-4" />
+              M5 Bridge
+            </button>
+            <button
               onClick={() => setActiveTab('history')}
               className="px-3 py-1.5 text-sm flex items-center gap-1.5 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
             >
@@ -390,7 +403,9 @@ const SettingsPage = () => {
         <TranslatedHistory onClose={() => setActiveTab('settings')} />
       )}
 
-      <div className="flex-1 overflow-y-auto min-h-0">
+      {activeTab === 'bridge' && <M5BridgePanel />}
+
+      {activeTab === 'settings' && <div className="flex-1 overflow-y-auto min-h-0">
         <div className="max-w-md mx-auto p-6 pb-8">
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-6">
             <div className="p-6">
@@ -756,7 +771,7 @@ const SettingsPage = () => {
             )}
           </div>
         </div>
-      </div>
+      </div>}
 
       <Toaster position="top-center" />
     </div>

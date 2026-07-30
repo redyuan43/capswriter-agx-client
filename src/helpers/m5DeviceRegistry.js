@@ -1,4 +1,5 @@
 const DEFAULT_DEVICE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_DEVICE_ONLINE_MS = 30 * 1000;
 
 function normalizeRemoteAddress(value) {
   return String(value || "").replace(/^::ffff:/, "");
@@ -10,8 +11,13 @@ function parseInteger(value, fallback) {
 }
 
 class M5DeviceRegistry {
-  constructor({ retentionMs = DEFAULT_DEVICE_RETENTION_MS, now = Date.now } = {}) {
+  constructor({
+    retentionMs = DEFAULT_DEVICE_RETENTION_MS,
+    onlineMs = DEFAULT_DEVICE_ONLINE_MS,
+    now = Date.now,
+  } = {}) {
     this.retentionMs = retentionMs;
+    this.onlineMs = onlineMs;
     this.now = now;
     this.devices = new Map();
   }
@@ -70,9 +76,34 @@ class M5DeviceRegistry {
     this.prune();
     return [...this.devices.values()].sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0));
   }
+
+  listOnline(now = this.now()) {
+    this.prune(now);
+    return [...this.devices.values()]
+      .filter((device) => now - Number(device.last_seen || 0) <= this.onlineMs)
+      .map((device) => ({
+        ...device,
+        online: true,
+        age_ms: Math.max(0, now - Number(device.last_seen || 0)),
+      }))
+      .sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0));
+  }
+
+  listOffline(now = this.now()) {
+    this.prune(now);
+    return [...this.devices.values()]
+      .filter((device) => now - Number(device.last_seen || 0) > this.onlineMs)
+      .map((device) => ({
+        ...device,
+        online: false,
+        age_ms: Math.max(0, now - Number(device.last_seen || 0)),
+      }))
+      .sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0));
+  }
 }
 
 module.exports = M5DeviceRegistry;
 module.exports.DEFAULT_DEVICE_RETENTION_MS = DEFAULT_DEVICE_RETENTION_MS;
+module.exports.DEFAULT_DEVICE_ONLINE_MS = DEFAULT_DEVICE_ONLINE_MS;
 module.exports.normalizeRemoteAddress = normalizeRemoteAddress;
 module.exports.parseInteger = parseInteger;

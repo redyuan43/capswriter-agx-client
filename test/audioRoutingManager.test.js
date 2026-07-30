@@ -168,4 +168,39 @@ test("audio routing distinguishes enumeration from verified capture health", () 
   assert.equal(source.audio_health.last_success_bytes, 640);
   assert.equal(source.audio_health.failure_reason, "");
   assert.equal(source.audio_health.last_success_at, "2026-07-28T10:00:01.000Z");
+
+  now += 60001;
+  source = manager.listPipeWireSources().find((item) => item.source_id === sourceId);
+  assert.equal(source.audio_health.status, "unknown");
+  assert.equal(source.audio_health.stale, true);
+  assert.equal(source.audio_health.last_success_bytes, 640);
+});
+
+test("audio routing keeps stale saved routes out of realtime routes", () => {
+  const database = createDatabase({
+    version: 2,
+    routes: {
+      keyboard: { source_id: "pipewire:bluez_input.14_08_08_52_F9_62" },
+      "minijoy_bt:14080852f962": {
+        source_id: "pipewire:bluez_input.14_08_08_52_F9_62",
+      },
+    },
+  });
+  const state = createManager(database).getState();
+
+  assert.equal("minijoy_bt:14080852f962" in state.routes, false);
+  assert.equal(state.routes["minijoy_bt:c8854168390a"].available, true);
+  assert.equal(state.routes.keyboard.available, true);
+  assert.notEqual(
+    state.routes.keyboard.source_id,
+    "pipewire:bluez_input.14_08_08_52_F9_62"
+  );
+  assert.equal(
+    state.inactive_routes.keyboard.source_id,
+    "pipewire:bluez_input.14_08_08_52_F9_62"
+  );
+  assert.equal(
+    state.inactive_routes["minijoy_bt:14080852f962"].available,
+    false
+  );
 });
