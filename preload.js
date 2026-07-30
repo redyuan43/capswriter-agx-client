@@ -76,8 +76,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   activateAsrConnectionProfile: (profileId) =>
     ipcRenderer.invoke("activate-asr-connection-profile", profileId),
   getActiveAsrConnection: () => ipcRenderer.invoke("get-active-asr-connection"),
-  testAsrConnectionProfile: (profile, options) =>
-    ipcRenderer.invoke("test-asr-connection-profile", profile, options),
+  resolveAsrConnectionProfile: (profile, options) =>
+    ipcRenderer.invoke("resolve-asr-connection-profile", profile, options),
 
   // 热键管理
   registerHotkey: (hotkey) => ipcRenderer.invoke("register-hotkey", hotkey),

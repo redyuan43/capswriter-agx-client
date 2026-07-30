@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CheckCircle2, Loader2, Plus, Radio, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { formatProbeMetrics, probeAsrConnection } from "../helpers/asrConnectionProbe.mjs";
 
 const emptyCustomProfile = () => ({
   id: `custom-${Date.now()}`,
@@ -27,6 +28,7 @@ export default function AsrConnectionPanel() {
   const [clearToken, setClearToken] = useState(false);
   const [busy, setBusy] = useState(false);
   const [testedDraft, setTestedDraft] = useState(null);
+  const [probeMetrics, setProbeMetrics] = useState("");
 
   const selected = useMemo(
     () => state?.profiles?.find((item) => item.id === selectedId) || null,
@@ -48,6 +50,7 @@ export default function AsrConnectionPanel() {
       setToken("");
       setClearToken(false);
       setTestedDraft(null);
+      setProbeMetrics("");
     }
   }, [selectedId]);
 
@@ -61,11 +64,13 @@ export default function AsrConnectionPanel() {
     setToken("");
     setClearToken(false);
     setTestedDraft(null);
+    setProbeMetrics("");
   };
 
   const changeDraft = (key, value) => {
     setDraft((current) => ({ ...current, [key]: value }));
     setTestedDraft(null);
+    setProbeMetrics("");
   };
 
   const save = async () => {
@@ -90,9 +95,12 @@ export default function AsrConnectionPanel() {
     }
     setBusy(true);
     try {
-      await window.electronAPI.testAsrConnectionProfile(draft, { token, clearToken });
+      const connection = await window.electronAPI.resolveAsrConnectionProfile(draft, { token, clearToken });
+      const metrics = await probeAsrConnection(connection);
       setTestedDraft({ ...draft, token });
-      toast.success("ASR 连接与认证测试通过");
+      const summary = formatProbeMetrics(metrics);
+      setProbeMetrics(summary);
+      toast.success("ASR 协议与音频吞吐测试通过", { description: summary });
       return true;
     } catch (error) {
       toast.error("ASR 连接测试失败", { description: error?.message || String(error) });
@@ -194,9 +202,11 @@ export default function AsrConnectionPanel() {
             <label className="block text-xs text-gray-600">访问令牌
               <input type="password" value={token} disabled={busy || secureStorageUnavailable} onChange={(event) => { setToken(event.target.value); setClearToken(false); setTestedDraft(null); }} placeholder={draft.hasToken ? "已配置；留空保持不变" : "输入 ASR 访问令牌"} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md disabled:bg-gray-100" />
             </label>
-            {secureStorageUnavailable ? <p className="mt-2 text-xs text-red-600">{state.secureStorage.message}</p> : <button type="button" disabled={busy || !draft.hasToken} onClick={() => { setToken(""); setClearToken(true); setTestedDraft(null); }} className="mt-2 text-xs text-red-600 hover:underline">清除已保存令牌</button>}
+            {secureStorageUnavailable ? <p className="mt-2 text-xs text-red-600">{state.secureStorage.message}</p> : <><p className="mt-2 text-xs text-green-700">{draft.hasToken ? "令牌已安全保存；输入新值可替换。" : "尚未保存令牌。"}</p><button type="button" disabled={busy || !draft.hasToken} onClick={() => { setToken(""); setClearToken(true); setTestedDraft(null); setProbeMetrics(""); }} className="mt-2 text-xs text-red-600 hover:underline">删除已保存令牌</button></>}
           </div>}
         </div>
+
+        {probeMetrics && <p className="mt-3 rounded-md bg-green-50 px-3 py-2 text-xs text-green-800">测试指标：{probeMetrics}</p>}
 
         <div className="mt-4 flex flex-wrap gap-2">
           {!active && <button type="button" onClick={save} disabled={busy} className="px-3 py-2 text-xs rounded-md bg-gray-100 text-gray-800 hover:bg-gray-200 disabled:opacity-60">保存配置</button>}
