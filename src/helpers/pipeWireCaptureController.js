@@ -6,9 +6,16 @@ function nodeNameFromSourceId(sourceId) {
 }
 
 class PipeWireCaptureController {
-  constructor({ logger = null, spawnProcess = spawn } = {}) {
+  constructor({
+    logger = null,
+    spawnProcess = spawn,
+    firstChunkRetryMs = 300,
+    maxStartAttempts = 3,
+  } = {}) {
     this.logger = logger;
     this.spawnProcess = spawnProcess;
+    this.firstChunkRetryMs = firstChunkRetryMs;
+    this.maxStartAttempts = maxStartAttempts;
     this.captures = new Map();
   }
 
@@ -18,68 +25,136 @@ class PipeWireCaptureController {
     if (!id || !nodeName) {
       throw new Error("session_id and PipeWire source are required");
     }
+    const runtimeDir = String(
+      process.env.PIPEWIRE_RUNTIME_DIR ||
+      process.env.XDG_RUNTIME_DIR ||
+      (typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : "")
+    ).trim();
     this.stop(id);
-    const child = this.spawnProcess("parec", [
-      "--raw",
-      `--device=${nodeName}`,
-      "--rate=16000",
-      "--channels=1",
-      "--format=s16le",
-      "--latency-msec=40",
-    ], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => {
-      if (chunk?.length) onChunk?.(Buffer.from(chunk));
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    const capture = { child, stopping: false };
-    child.on("close", (code, signal) => {
-      if (this.captures.get(id) === capture) {
-        this.captures.delete(id);
+    const capture = {
+      child: null,
+      stopping: false,
+      retryTimer: null,
+      attempt: 0,
+      receivedAudio: false,
+    };
+    this.captures.set(id, capture);
+
+    const clearRetryTimer = () => {
+      if (capture.retryTimer) {
+        clearTimeout(capture.retryTimer);
+        capture.retryTimer = null;
       }
-      if (code && code !== 0) {
-        this.logger?.warn?.("PipeWire capture exited", {
-          sessionId: id,
-          sourceId,
-          code,
-          signal,
-          stderr: stderr.trim(),
-        });
-      }
-      if (!capture.stopping) {
-        options.onUnexpectedExit?.({
-          sessionId: id,
-          sourceId,
-          code,
-          signal,
-          stderr: stderr.trim(),
-        });
-      }
-    });
-    child.on("error", (error) => {
-      if (this.captures.get(id) === capture) {
-        this.captures.delete(id);
-      }
-      this.logger?.warn?.("PipeWire capture failed", {
-        sessionId: id,
-        sourceId,
-        error: error?.message || String(error),
+    };
+
+    const launch = () => {
+      clearRetryTimer();
+      capture.attempt += 1;
+      let stderr = "";
+      const child = this.spawnProcess("pw-record", [
+        "--target",
+        nodeName,
+        "--rate",
+        "16000",
+        "--channels",
+        "1",
+        "--format",
+        "s16",
+        "--latency",
+        "40ms",
+        "-",
+      ], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...(runtimeDir ? {
+            PIPEWIRE_RUNTIME_DIR: runtimeDir,
+            PULSE_SERVER: process.env.PULSE_SERVER || `unix:${runtimeDir}/pulse/native`,
+          } : {}),
+          PIPEWIRE_REMOTE: process.env.PIPEWIRE_REMOTE || "pipewire-0",
+        },
       });
-      if (!capture.stopping) {
+      capture.child = child;
+
+      child.stdout?.on("data", (chunk) => {
+        if (capture.child !== child || !chunk?.length) return;
+        capture.receivedAudio = true;
+        clearRetryTimer();
+        onChunk?.(Buffer.from(chunk));
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on("close", (code, signal) => {
+        if (capture.child !== child || this.captures.get(id) !== capture) return;
+        clearRetryTimer();
+        if (capture.stopping) {
+          this.captures.delete(id);
+          return;
+        }
+        if (!capture.receivedAudio && capture.attempt < this.maxStartAttempts) {
+          launch();
+          return;
+        }
+        this.captures.delete(id);
+        if (code && code !== 0) {
+          this.logger?.warn?.("PipeWire capture exited", {
+            sessionId: id,
+            sourceId,
+            code,
+            signal,
+            stderr: stderr.trim(),
+          });
+        }
         options.onUnexpectedExit?.({
+          sessionId: id,
+          sourceId,
+          code,
+          signal,
+          stderr: stderr.trim(),
+        });
+      });
+      child.on("error", (error) => {
+        if (capture.child !== child || this.captures.get(id) !== capture) return;
+        clearRetryTimer();
+        if (!capture.stopping && !capture.receivedAudio &&
+            capture.attempt < this.maxStartAttempts) {
+          launch();
+          return;
+        }
+        this.captures.delete(id);
+        this.logger?.warn?.("PipeWire capture failed", {
           sessionId: id,
           sourceId,
           error: error?.message || String(error),
-          stderr: stderr.trim(),
         });
-      }
-    });
-    this.captures.set(id, capture);
-    return { session_id: id, source_id: sourceId, pid: child.pid || null };
+        if (!capture.stopping) {
+          options.onUnexpectedExit?.({
+            sessionId: id,
+            sourceId,
+            error: error?.message || String(error),
+            stderr: stderr.trim(),
+          });
+        }
+      });
+
+      capture.retryTimer = setTimeout(() => {
+        capture.retryTimer = null;
+        if (capture.stopping || capture.child !== child || capture.receivedAudio) return;
+        if (capture.attempt >= this.maxStartAttempts) return;
+        this.logger?.warn?.("PipeWire capture produced no audio, retrying", {
+          sessionId: id,
+          sourceId,
+          attempt: capture.attempt,
+        });
+        launch();
+        child.kill?.("SIGTERM");
+      }, this.firstChunkRetryMs);
+      capture.retryTimer.unref?.();
+    };
+
+    launch();
+    return { session_id: id, source_id: sourceId, pid: capture.child?.pid || null };
   }
 
   stop(sessionId) {
@@ -88,6 +163,8 @@ class PipeWireCaptureController {
     if (!capture) return false;
     this.captures.delete(id);
     capture.stopping = true;
+    if (capture.retryTimer) clearTimeout(capture.retryTimer);
+    capture.retryTimer = null;
     capture.child.kill?.("SIGTERM");
     return true;
   }
