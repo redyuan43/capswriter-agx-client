@@ -114,6 +114,14 @@ async function startBridge(t, sendToRenderer = () => {}) {
     commands.push({ command, args });
     return { success: true };
   };
+  bridge.pipeWireUnifiedSource.activate = () => ({
+    source_node_name: "test-source",
+    unified_source_name: "capswriter_input_bus.monitor",
+  });
+  bridge.pipeWireUnifiedSource.deactivate = () => ({
+    previous_source_node_name: "test-source",
+    unified_source_name: "capswriter_input_bus.monitor",
+  });
   bridge.start();
   await once(bridge.server, "listening");
   t.after(() => bridge.stop());
