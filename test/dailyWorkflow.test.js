@@ -1,0 +1,22 @@
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+const test = require('node:test')
+const YAML = require('yaml')
+
+const workflowPath = path.resolve(__dirname, '../.github/workflows/daily.yml')
+const workflow = fs.readFileSync(workflowPath, 'utf8')
+
+test('daily workflow builds both Linux architectures and publishes a prerelease', () => {
+  assert.doesNotThrow(() => YAML.parse(workflow), 'daily workflow must remain valid YAML')
+  assert.match(workflow, /cron: "23 18 \* \* \*"/)
+  assert.match(workflow, /runner: ubuntu-24\.04\n/)
+  assert.match(workflow, /runner: ubuntu-24\.04-arm\n/)
+  assert.match(workflow, /pnpm test/)
+  assert.match(workflow, /retention-days: 14/)
+  assert.match(workflow, /tag=daily-\$\{release_date\}-\$\{short_sha\}/)
+  assert.match(workflow, /gh release create "\$\{RELEASE_TAG\}"/)
+  assert.match(workflow, /--target "\$\{GITHUB_SHA\}"/)
+  assert.match(workflow, /--prerelease/)
+  assert.match(workflow, /install-capswriter-agx-client\.sh/)
+})

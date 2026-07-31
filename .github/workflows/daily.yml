@@ -1,0 +1,162 @@
+name: Daily AppImages
+
+on:
+  schedule:
+    - cron: "23 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-appimages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build daily Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Linux native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 pkg-config libx11-dev libxrandr-dev libxtst-dev libxt-dev
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm test
+
+      - run: pnpm run build:linux:agx-client
+
+      - run: pnpm run verify:appimage:native
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daily-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/CapsWriter-GUI-*-linux-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish daily prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare release metadata
+        id: release
+        shell: bash
+        run: |
+          release_date="$(date -u +%Y%m%d)"
+          short_sha="${GITHUB_SHA:0:7}"
+          echo "tag=daily-${release_date}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "title=CapsWriter AGX Client Daily ${release_date} (${short_sha})" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Linux installation assets
+        run: |
+          cp assets/tray-icon.png release-assets/capswriter-agx-client.png
+          cp scripts/m5bridge-doctor.py release-assets/m5bridge-doctor.py
+          cp scripts/capswriter-m5-recover-bluetooth release-assets/capswriter-m5-recover-bluetooth
+          cp scripts/com.speechtranscription.m5-recover.policy release-assets/com.speechtranscription.m5-recover.policy
+          cp scripts/49-capswriter-m5-recover.rules release-assets/49-capswriter-m5-recover.rules
+
+      - name: Generate checksums
+        working-directory: release-assets
+        run: |
+          sha256sum \
+            CapsWriter-GUI-*.AppImage \
+            capswriter-agx-client.png \
+            m5bridge-doctor.py \
+            capswriter-m5-recover-bluetooth \
+            com.speechtranscription.m5-recover.policy \
+            49-capswriter-m5-recover.rules \
+            > SHA256SUMS.txt
+
+      - name: Prepare Linux installer
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          sed "s/@RELEASE_TAG@/${RELEASE_TAG}/g" scripts/install-linux-client.sh \
+            > release-assets/install-capswriter-agx-client.sh
+          chmod +x release-assets/install-capswriter-agx-client.sh
+
+      - name: Prepare release notes
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          cat > release-assets/release-notes.md <<EOF
+          Automated daily build from \`${GITHUB_SHA}\`.
+
+          This is a prerelease build from the latest default-branch commit. Use the stable
+          \`v*-agx-client\` release for normal installations.
+
+          Install this daily build with:
+
+          \`\`\`bash
+          gh release download "${RELEASE_TAG}" \\
+            --repo "${GITHUB_REPOSITORY}" \\
+            --pattern "install-capswriter-agx-client.sh" \\
+            --dir "\$HOME/.cache/capswriter-installer" \\
+            --clobber
+          bash "\$HOME/.cache/capswriter-installer/install-capswriter-agx-client.sh"
+          \`\`\`
+          EOF
+
+      - name: Create or refresh daily prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              release-assets/CapsWriter-GUI-*.AppImage \
+              release-assets/capswriter-agx-client.png \
+              release-assets/m5bridge-doctor.py \
+              release-assets/capswriter-m5-recover-bluetooth \
+              release-assets/com.speechtranscription.m5-recover.policy \
+              release-assets/49-capswriter-m5-recover.rules \
+              release-assets/SHA256SUMS.txt \
+              release-assets/install-capswriter-agx-client.sh \
+              --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              release-assets/CapsWriter-GUI-*.AppImage \
+              release-assets/capswriter-agx-client.png \
+              release-assets/m5bridge-doctor.py \
+              release-assets/capswriter-m5-recover-bluetooth \
+              release-assets/com.speechtranscription.m5-recover.policy \
+              release-assets/49-capswriter-m5-recover.rules \
+              release-assets/SHA256SUMS.txt \
+              release-assets/install-capswriter-agx-client.sh \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file release-assets/release-notes.md \
+              --prerelease
+          fi
