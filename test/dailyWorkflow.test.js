@@ -6,6 +6,8 @@ const YAML = require('yaml')
 
 const workflowPath = path.resolve(__dirname, '../.github/workflows/daily.yml')
 const workflow = fs.readFileSync(workflowPath, 'utf8')
+const triggerScriptPath = path.resolve(__dirname, '../scripts/trigger-daily-build.sh')
+const triggerScript = fs.readFileSync(triggerScriptPath, 'utf8')
 
 test('daily workflow builds both Linux architectures and publishes a prerelease', () => {
   assert.doesNotThrow(() => YAML.parse(workflow), 'daily workflow must remain valid YAML')
@@ -19,4 +21,13 @@ test('daily workflow builds both Linux architectures and publishes a prerelease'
   assert.match(workflow, /--target "\$\{GITHUB_SHA\}"/)
   assert.match(workflow, /--prerelease/)
   assert.match(workflow, /install-capswriter-agx-client\.sh/)
+})
+
+test('daily trigger script validates, dispatches, waits, and reports the prerelease', () => {
+  assert.ok(fs.statSync(triggerScriptPath).mode & 0o111, 'trigger script must be executable')
+  assert.match(triggerScript, /--dry-run/)
+  assert.match(triggerScript, /gh workflow run "\$WORKFLOW"/)
+  assert.match(triggerScript, /gh run watch "\$RUN_ID"/)
+  assert.match(triggerScript, /gh release list/)
+  assert.match(triggerScript, /Daily build completed successfully/)
 })
