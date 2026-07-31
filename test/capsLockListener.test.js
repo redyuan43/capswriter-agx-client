@@ -8,6 +8,31 @@ const {
   discoverNamedLinuxInputDevicePaths,
 } = CapsLockListener;
 
+test('prefers evdev for automatic Linux input monitoring on X11', () => {
+  const previousBackend = process.env.CAPS_LISTENER_BACKEND;
+  const previousSessionType = process.env.XDG_SESSION_TYPE;
+  delete process.env.CAPS_LISTENER_BACKEND;
+  process.env.XDG_SESSION_TYPE = 'x11';
+
+  try {
+    const listener = new CapsLockListener();
+    let uiohookStarted = false;
+    listener._startLinuxEvdevBackend = () => true;
+    listener._startUiohookBackend = () => {
+      uiohookStarted = true;
+    };
+
+    assert.equal(listener.start(), true);
+    assert.equal(listener._backend, 'wayland-input');
+    assert.equal(uiohookStarted, false);
+  } finally {
+    if (previousBackend === undefined) delete process.env.CAPS_LISTENER_BACKEND;
+    else process.env.CAPS_LISTENER_BACKEND = previousBackend;
+    if (previousSessionType === undefined) delete process.env.XDG_SESSION_TYPE;
+    else process.env.XDG_SESSION_TYPE = previousSessionType;
+  }
+});
+
 test('treats Caps as a non-locking Right Shift hold key when configured', () => {
   const previous = process.env.CAPS_DICTATION_HOLD_KEY;
   process.env.CAPS_DICTATION_HOLD_KEY = 'caps as right shift';

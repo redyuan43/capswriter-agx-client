@@ -199,7 +199,7 @@ class CapsLockListener {
         const shouldUseEvdev =
           requestedBackend === 'wayland-input' ||
           requestedBackend === 'evdev' ||
-          (requestedBackend === 'auto' && sessionType === 'wayland');
+          requestedBackend === 'auto';
 
         if (shouldUseEvdev) {
           const started = this._startLinuxEvdevBackend();
@@ -217,7 +217,7 @@ class CapsLockListener {
             return false;
           }
 
-          this._logWarn('Wayland input listener 初始化失败，回退到 uiohook（可能不稳定）');
+          this._logWarn('Linux evdev input listener 初始化失败，回退到 uiohook（可能不稳定）');
         }
       }
 
