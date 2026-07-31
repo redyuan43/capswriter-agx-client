@@ -545,8 +545,10 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   };
   let emitChunk = null;
   let stoppedSessionId = "";
-  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk) => {
+  let captureNodeName = "";
+  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk, nodeName) => {
     emitChunk = onChunk;
+    captureNodeName = nodeName;
   };
   bridge.pipeWireCapture.stop = (sessionId) => {
     stoppedSessionId = sessionId;
@@ -568,6 +570,7 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   const stopped = await bridge.handleHostTriggerUp("minijoy_bt");
 
   assert.equal(started.handled, true);
+  assert.equal(captureNodeName, "capswriter_input_bus.monitor");
   assert.equal(stopped.session_id, started.session_id);
   assert.equal(stoppedSessionId, started.session_id);
   assert.equal(restoredDefaultSource, true);
@@ -655,8 +658,10 @@ test("keyboard host trigger captures native USB PCM without browser recording", 
     restoredDefaultSource = true;
   };
   let emitChunk = null;
-  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk) => {
+  let captureNodeName = "";
+  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk, nodeName) => {
     emitChunk = onChunk;
+    captureNodeName = nodeName;
   };
   bridge.pipeWireCapture.stop = () => true;
 
@@ -665,6 +670,7 @@ test("keyboard host trigger captures native USB PCM without browser recording", 
   await bridge.handleHostTriggerUp("keyboard");
 
   assert.equal(started.handled, true);
+  assert.equal(captureNodeName, "capswriter_input_bus.monitor");
   assert.equal(restoredDefaultSource, true);
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-start",

@@ -1118,7 +1118,7 @@ loadBluetoothDevices();
         sessionId,
         sourceId,
         (chunk) => this.appendRecordingAudio(session, chunk),
-        route.source.node_name,
+        PipeWireUnifiedSourceController.UNIFIED_SOURCE_NAME,
         { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
       session.capturePid = capture?.pid || null;
@@ -1513,7 +1513,7 @@ loadBluetoothDevices();
         sessionId,
         route.source_id,
         (chunk) => this.appendRecordingAudio(session, chunk),
-        route.source.node_name,
+        PipeWireUnifiedSourceController.UNIFIED_SOURCE_NAME,
         { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
       session.capturePid = capture?.pid || null;
