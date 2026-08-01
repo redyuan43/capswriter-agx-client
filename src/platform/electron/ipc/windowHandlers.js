@@ -48,6 +48,7 @@ function registerWindowHandlers(ctx) {
   ipcMain.handle("open-settings-window", () => (ctx.windowManager.showSettingsWindow(), true));
   ipcMain.handle("close-settings-window", () => (ctx.windowManager.closeSettingsWindow(), true));
   ipcMain.handle("hide-settings-window", () => (ctx.windowManager.hideSettingsWindow(), true));
+  ipcMain.handle("open-asr-admin-window", () => ctx.windowManager.showAsrAdminWindow());
   ipcMain.handle("close-app", () => app.quit());
 
   ipcMain.handle("show-item-in-folder", (_event, fullPath) => shell.showItemInFolder(fullPath));

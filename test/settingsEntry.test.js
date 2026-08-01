@@ -18,3 +18,8 @@ test("production settings entry mounts the settings page", () => {
   assert.match(settingsEntry, /document\.getElementById\(["']settings-root["']\)/);
   assert.match(settingsEntry, /createRoot\(settingsRoot\)\.render\(<SettingsPage \/>\)/);
 });
+
+test("settings page exposes the ASR administration entry", () => {
+  assert.match(settingsEntry, /openAsrAdminWindow/);
+  assert.match(settingsEntry, />\s*ASR 管理\s*</);
+});

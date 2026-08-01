@@ -2,7 +2,7 @@ import { lazy, Suspense, useState, useEffect, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import { toast, Toaster } from "sonner";
-import { Activity, Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server } from "lucide-react";
+import { Activity, Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server, BookOpenCheck } from "lucide-react";
 import { usePermissions } from "./hooks/usePermissions";
 import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
 
@@ -210,6 +210,18 @@ const SettingsPage = () => {
     }
   };
 
+  const handleOpenAsrAdmin = async () => {
+    if (!window.electronAPI?.openAsrAdminWindow) return;
+
+    try {
+      await window.electronAPI.openAsrAdminWindow();
+    } catch (error) {
+      toast.error("ASR 管理后台打开失败", {
+        description: error?.message || String(error),
+      });
+    }
+  };
+
   const handleToggleTranslateTarget = async (target) => {
     if (!window.electronAPI?.setSetting || savingVoiceSettings) return;
     if (target !== VOICE_TRANSLATE_EN && target !== VOICE_TRANSLATE_ZH) return;
@@ -406,6 +418,13 @@ const SettingsPage = () => {
             >
               <Server className="w-4 h-4" />
               ASR 服务端
+            </button>
+            <button
+              onClick={handleOpenAsrAdmin}
+              className="px-3 py-1.5 text-sm flex items-center gap-1.5 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+            >
+              <BookOpenCheck className="w-4 h-4" />
+              ASR 管理
             </button>
             <button
               onClick={() => setActiveTab('monitor')}

@@ -6,6 +6,24 @@ const isHeadless = process.env.SPEECH_TRANSCRIPTION_HEADLESS === '1';
 const devServerPort = process.env.VITE_DEV_PORT || '5175';
 const devServerUrl = `http://localhost:${devServerPort}`;
 const appIconPath = path.join(__dirname, "..", "..", "assets", "icon.png");
+const DEFAULT_ASR_ADMIN_URL = "http://ai-x10drg.taild500c8.ts.net:18016/admin";
+
+function resolveAsrAdminUrl(env = process.env) {
+  const configuredUrl = String(env.CAPSWRITER_ASR_ADMIN_URL || DEFAULT_ASR_ADMIN_URL).trim();
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(configuredUrl);
+  } catch {
+    throw new Error("ASR 管理后台地址无效");
+  }
+
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    throw new Error("ASR 管理后台地址仅支持 HTTP 或 HTTPS");
+  }
+
+  return parsedUrl.toString();
+}
 
 class WindowManager {
   constructor(options = {}) {
@@ -18,6 +36,9 @@ class WindowManager {
     this.historyWindow = null;
     this.settingsWindow = null;
     this.linkDirectoryWindow = null;
+    this.asrAdminWindow = null;
+    this.browserWindowFactory = options.browserWindowFactory || ((windowOptions) => new BrowserWindow(windowOptions));
+    this.env = options.env || process.env;
     this.isHeadless = isHeadless;
     this.lastPosition = null;
     this.previousActiveWindow = null;
@@ -366,8 +387,10 @@ class WindowManager {
     }
 
     this.settingsWindow = new BrowserWindow({
-      width: 700,
-      height: 600,
+      width: 1100,
+      height: 720,
+      minWidth: 860,
+      minHeight: 600,
       show: false,
       title: "设置 - 语音转写",
       alwaysOnTop: true,
@@ -396,6 +419,68 @@ class WindowManager {
     });
 
     return this.settingsWindow;
+  }
+
+  async createAsrAdminWindow() {
+    if (this.isHeadless) {
+      return null;
+    }
+
+    if (this.asrAdminWindow && !this.asrAdminWindow.isDestroyed()) {
+      return this.asrAdminWindow;
+    }
+
+    this.asrAdminWindow = null;
+    const adminUrl = resolveAsrAdminUrl(this.env);
+    const allowedOrigin = new URL(adminUrl).origin;
+    const adminWindow = this.browserWindowFactory({
+      width: 1280,
+      height: 800,
+      minWidth: 960,
+      minHeight: 640,
+      show: false,
+      title: "ASR 统一学习管理后台",
+      alwaysOnTop: false,
+      icon: appIconPath,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+      },
+    });
+
+    this.asrAdminWindow = adminWindow;
+    adminWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    adminWindow.webContents.on("will-navigate", (event, navigationUrl) => {
+      try {
+        if (new URL(navigationUrl).origin === allowedOrigin) {
+          return;
+        }
+      } catch {
+        // Invalid navigation targets are denied below.
+      }
+      event.preventDefault();
+    });
+    adminWindow.on("closed", () => {
+      if (this.asrAdminWindow === adminWindow) {
+        this.asrAdminWindow = null;
+      }
+    });
+
+    try {
+      await adminWindow.loadURL(adminUrl);
+    } catch (error) {
+      if (this.asrAdminWindow === adminWindow) {
+        this.asrAdminWindow = null;
+      }
+      if (!adminWindow.isDestroyed()) {
+        adminWindow.destroy();
+      }
+      throw new Error(`无法加载 ASR 管理后台: ${error?.message || String(error)}`);
+    }
+
+    return adminWindow;
   }
 
   async createLinkDirectoryWindow() {
@@ -537,6 +622,19 @@ class WindowManager {
     if (this.settingsWindow) {
       this.settingsWindow.close();
     }
+    if (this.asrAdminWindow) {
+      this.asrAdminWindow.close();
+    }
+  }
+
+  async showAsrAdminWindow() {
+    const adminWindow = await this.createAsrAdminWindow();
+    if (!adminWindow) {
+      return false;
+    }
+    adminWindow.show();
+    adminWindow.focus();
+    return true;
   }
 
   showLinkDirectoryWindow() {
@@ -554,3 +652,5 @@ class WindowManager {
 }
 
 module.exports = WindowManager;
+module.exports.DEFAULT_ASR_ADMIN_URL = DEFAULT_ASR_ADMIN_URL;
+module.exports.resolveAsrAdminUrl = resolveAsrAdminUrl;

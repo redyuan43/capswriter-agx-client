@@ -249,6 +249,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   openSettingsWindow: () => ipcRenderer.invoke("open-settings-window"),
   closeSettingsWindow: () => ipcRenderer.invoke("close-settings-window"),
   hideSettingsWindow: () => ipcRenderer.invoke("hide-settings-window"),
+  openAsrAdminWindow: () => ipcRenderer.invoke("open-asr-admin-window"),
 
   // 中文特定功能
   detectLanguage: (text) => ipcRenderer.invoke("detect-language", text),
