@@ -8,6 +8,8 @@ const {
   parseDeviceList,
   bluetoothCommandSucceeded,
   pairingArgs,
+  pipeWireCardName,
+  MINIJOY_HFP_PROFILE,
 } = BluetoothDeviceManager;
 
 const MAC = "C8:85:41:68:39:0A";
@@ -54,6 +56,8 @@ test("Bluetooth command output can report a pairing failure despite a zero exit 
     "pair",
     MAC,
   ]);
+  assert.equal(pipeWireCardName(MAC), "bluez_card.C8_85_41_68_39_0A");
+  assert.equal(MINIJOY_HFP_PROFILE, "headset-head-unit-cvsd");
 });
 
 test("confirmed Bluetooth cleanup removes only the requested MAC before pairing", async () => {
@@ -82,6 +86,12 @@ test("confirmed Bluetooth cleanup removes only the requested MAC before pairing"
   assert.deepEqual(commands.find((command) => command[1] === "remove"), ["bluetoothctl", "remove", MAC]);
   assert.equal(commands.filter((command) => command.includes("scan")).length, 2);
   assert.equal(commands.some((command) => command.includes("14:08:08:52:F9:62")), false);
+  assert.deepEqual(commands.find((command) => command[0] === "pactl"), [
+    "pactl",
+    "set-card-profile",
+    "bluez_card.C8_85_41_68_39_0A",
+    "headset-head-unit-cvsd",
+  ]);
 });
 
 test("forced Bluetooth cleanup re-pairs an already connected MiniJoy by MAC", async () => {
@@ -128,4 +138,35 @@ test("Bluetooth repair rejects a false-success pairing command when BlueZ remain
 
   assert.equal(result.success, false);
   assert.equal(result.stage, "pair_failed");
+});
+
+test("Bluetooth repair accepts a partial BlueZ connect once the CVSD audio profile works", async () => {
+  const commands = [];
+  const runCommand = async (command, args) => {
+    commands.push([command, ...args]);
+    if (args[0] === "info") {
+      return {
+        success: true,
+        stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: yes\n  Bonded: yes\n  Trusted: yes\n  Connected: yes`,
+      };
+    }
+    if (command === "bluetoothctl" && args[0] === "connect") {
+      return {
+        success: false,
+        stdout: "Failed to connect: org.bluez.Error.Failed br-connection-create-socket",
+      };
+    }
+    return { success: true, stdout: "ok" };
+  };
+  const manager = new BluetoothDeviceManager({
+    runCommand,
+    wait: async () => {},
+  });
+
+  const result = await manager.repair(MAC);
+
+  assert.equal(result.success, true);
+  assert.equal(result.stage, "connected");
+  assert.equal(result.audio_profile.profile, "headset-head-unit-cvsd");
+  assert.equal(commands.some((command) => command[0] === "pactl"), true);
 });

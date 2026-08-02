@@ -1097,16 +1097,23 @@ loadBluetoothDevices();
       this.sendJson(res, 429, { success: false, error: "recording capacity reached" });
       return;
     }
-    const route = this.audioRouting.activateTrigger(triggerId);
+    let route = this.audioRouting.activateTrigger(triggerId);
     const requestingSourceId = req.vibeDevice?.device_id
       ? `wifi:${req.vibeDevice.device_id}`
       : triggerId;
-    const sourceId = route.source_id || requestingSourceId || triggerId;
+    let sourceId = route.source_id || requestingSourceId || triggerId;
     const captureMode = sourceId === requestingSourceId
       ? "device_upload"
       : sourceId.startsWith("wifi:")
         ? "remote_device"
         : "host_capture";
+    let bluetoothAudioWake = null;
+    if (captureMode === "host_capture") {
+      const prepared = await this.prepareAudioRoute(route);
+      route = prepared.route;
+      bluetoothAudioWake = prepared.bluetooth_audio_wake;
+      sourceId = route.source_id || sourceId;
+    }
     this.windowManager?.showFloatingBall?.({ rememberActiveWindow: activeCount === 0 });
     const targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
     const session = this.recordingSessions.create({
@@ -1120,6 +1127,7 @@ loadBluetoothDevices();
     session.triggerId = triggerId;
     session.sourceId = sourceId;
     session.captureMode = captureMode;
+    session.bluetoothAudioWake = bluetoothAudioWake;
     session.sourceDeviceId = sourceId.startsWith("wifi:") ? sourceId.slice(5) : "";
     session.source = body.source || "m5stickc_plus";
     session.audioSource = body.audio_source || "stickc_plus_pcm";
@@ -1232,6 +1240,28 @@ loadBluetoothDevices();
       input_applied: inputApplied,
       output_applied: outputApplied,
       ...result,
+    };
+  }
+
+  async prepareAudioRoute(route) {
+    const sourceId = String(route?.source_id || "");
+    const match = sourceId.match(/bluez_input\.([0-9a-f_:-]{17})/i);
+    if (!match) {
+      return { route, bluetooth_audio_wake: null };
+    }
+    const mac = match[1].replace(/_/g, ":").toUpperCase();
+    const wake = await this.bluetoothDevices.activateAudioProfile(mac, 3);
+    if (!wake.success) {
+      this.logger?.warn?.("MiniJoy CVSD wake failed before recording", {
+        triggerId: route.trigger_id,
+        sourceId,
+        mac,
+        detail: wake.detail || "",
+      });
+    }
+    return {
+      route: this.audioRouting.activateTrigger(route.trigger_id),
+      bluetooth_audio_wake: wake,
     };
   }
 
@@ -1550,8 +1580,10 @@ loadBluetoothDevices();
     if (activeCount >= MAX_CONCURRENT_RECORDINGS) {
       return { handled: false, busy: true };
     }
-    const route = this.audioRouting.activateTrigger(triggerId);
+    let route = this.audioRouting.activateTrigger(triggerId);
     if (!route.source_id.startsWith("wifi:")) {
+      const prepared = await this.prepareAudioRoute(route);
+      route = prepared.route;
       if (route.available && route.source.node_name) {
         this.applyAudioRoute(route);
       }
@@ -1567,6 +1599,7 @@ loadBluetoothDevices();
         targetWindowId,
         captureMode: "host_capture",
       });
+      session.bluetoothAudioWake = prepared.bluetooth_audio_wake;
       const capture = this.pipeWireCapture.start(
         sessionId,
         route.source_id,

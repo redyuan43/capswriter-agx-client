@@ -122,6 +122,11 @@ async function startBridge(t, sendToRenderer = () => {}) {
     previous_source_node_name: "test-source",
     unified_source_name: "capswriter_input_bus.monitor",
   });
+  bridge.bluetoothDevices.activateAudioProfile = async (mac) => ({
+    success: true,
+    card_name: `bluez_card.${mac.replace(/:/g, "_")}`,
+    profile: "headset-head-unit-cvsd",
+  });
   bridge.start();
   await once(bridge.server, "listening");
   t.after(() => bridge.stop());
@@ -586,6 +591,78 @@ test("audio routes apply input and output independently", async (t) => {
   assert.equal(localResult.output_applied, true);
   assert.equal(remoteResult.input_applied, false);
   assert.equal(remoteResult.output_applied, true);
+});
+
+test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capture", async (t) => {
+  const { bridge } = await startBridge(t);
+  const calls = [];
+  let activation = 0;
+  bridge.audioRouting.activateTrigger = () => {
+    activation += 1;
+    return {
+      trigger_id: "minijoy_bt:14080852f962",
+      source_id: "pipewire:bluez_input.14_08_08_52_F9_62",
+      source: {
+        kind: "pipewire",
+        node_name: `bluez_input.14_08_08_52_F9_62.${activation - 1}`,
+        online: true,
+      },
+      sink: { node_name: "alsa_output.usb-mi-speaker" },
+      available: true,
+      output_available: true,
+    };
+  };
+  bridge.bluetoothDevices.activateAudioProfile = async (mac, attempts) => {
+    calls.push({ type: "wake", mac, attempts });
+    return { success: true, profile: "headset-head-unit-cvsd" };
+  };
+  bridge.pipeWireUnifiedSource.activate = (sourceNodeName) => {
+    calls.push({ type: "route", sourceNodeName });
+    return {};
+  };
+  bridge.pipeWireCapture.start = (_sessionId, _sourceId, _onChunk, nodeName) => {
+    calls.push({ type: "capture", nodeName });
+    return {};
+  };
+
+  const result = await bridge.handleHostTriggerDown("minijoy_bt:14080852f962", "42");
+
+  assert.equal(result.handled, true);
+  assert.equal(result.route.source.node_name, "bluez_input.14_08_08_52_F9_62.1");
+  assert.deepEqual(calls, [
+    {
+      type: "wake",
+      mac: "14:08:08:52:F9:62",
+      attempts: 3,
+    },
+    {
+      type: "route",
+      sourceNodeName: "bluez_input.14_08_08_52_F9_62.1",
+    },
+    {
+      type: "capture",
+      nodeName: "capswriter_input_bus.monitor",
+    },
+  ]);
+});
+
+test("non-Bluetooth audio routes do not run the MiniJoy wake path", async (t) => {
+  const { bridge } = await startBridge(t);
+  let wakeCalls = 0;
+  bridge.bluetoothDevices.activateAudioProfile = async () => {
+    wakeCalls += 1;
+    return { success: true };
+  };
+  const route = {
+    trigger_id: "keyboard",
+    source_id: "pipewire:alsa_input.usb-mi-speakphone",
+  };
+
+  const prepared = await bridge.prepareAudioRoute(route);
+
+  assert.equal(prepared.route, route);
+  assert.equal(prepared.bluetooth_audio_wake, null);
+  assert.equal(wakeCalls, 0);
 });
 
 test("MiniJoy host trigger captures native HFP PCM without browser recording", async (t) => {

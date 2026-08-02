@@ -25,6 +25,7 @@ SERIAL_GLOB = "/dev/serial/by-id/usb-Hades2001_M5stack_*-if00-port0"
 DEFAULT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".cache",
                                   "capswriter-agx-client", "m5bridge-doctor.json")
 RECOVERY_HELPER = "/usr/libexec/capswriter-m5-recover-bluetooth"
+MINIJOY_HFP_PROFILE = "headset-head-unit-cvsd"
 
 
 def run(*args: str, timeout: int = 20) -> dict:
@@ -296,21 +297,65 @@ def wait_for_pipewire_source(mac: str, timeout: float = 8.0) -> dict:
     return source
 
 
+def activate_minijoy_audio_profile(mac: str, attempts: int = 8) -> dict:
+    card_name = f"bluez_card.{mac.upper().replace(':', '_')}"
+    commands = []
+    for _ in range(max(1, attempts)):
+        command = run(
+            "pactl", "set-card-profile", card_name, MINIJOY_HFP_PROFILE,
+            timeout=5,
+        )
+        commands.append(command)
+        if command["ok"]:
+            return {
+                "ok": True,
+                "card_name": card_name,
+                "profile": MINIJOY_HFP_PROFILE,
+                "commands": commands,
+            }
+        time.sleep(0.5)
+    return {
+        "ok": False,
+        "card_name": card_name,
+        "profile": MINIJOY_HFP_PROFILE,
+        "commands": commands,
+    }
+
+
 def connect_bluetooth(mac: str, attempts: int = 3,
                       always_attempt: bool = False) -> dict:
     commands = []
     state = bluez_info(mac)
     for _ in range(max(1, attempts)):
         if state["connected"] and not always_attempt:
-            return {"ok": True, "commands": commands, "state": state}
+            profile = activate_minijoy_audio_profile(mac)
+            return {
+                "ok": profile["ok"],
+                "commands": commands,
+                "state": state,
+                "audio_profile": profile,
+            }
         command = run("bluetoothctl", "connect", mac)
         commands.append(command)
         state = wait_for_bluez_connection(mac, True, timeout=6)
-        if command["ok"] and state["connected"]:
-            return {"ok": True, "commands": commands, "state": state}
+        if state["connected"]:
+            profile = activate_minijoy_audio_profile(mac)
+            if profile["ok"]:
+                return {
+                    "ok": True,
+                    "commands": commands,
+                    "state": state,
+                    "audio_profile": profile,
+                }
         always_attempt = True
         time.sleep(1)
-    return {"ok": False, "commands": commands, "state": state}
+    return {
+        "ok": False,
+        "commands": commands,
+        "state": state,
+        "audio_profile": activate_minijoy_audio_profile(mac, attempts=1)
+        if state["connected"] else None,
+    }
 
 
 def disconnect_bluetooth(mac: str) -> dict:

@@ -220,7 +220,7 @@ test("doctor retries Bluetooth connect after a locally aborted attempt", () => {
 states = [{"connected": False}]
 waits = [{"connected": False}, {"connected": True}]
 commands = []
-results = [{"ok": False}, {"ok": True}]
+results = [{"ok": False}, {"ok": True}, {"ok": True}]
 doctor.bluez_info = lambda mac: states.pop(0)
 doctor.wait_for_bluez_connection = lambda mac, connected, timeout: waits.pop(0)
 doctor.run = lambda *args, **kwargs: commands.append(list(args)) or results.pop(0)
@@ -230,7 +230,14 @@ print(json.dumps({"value": value, "commands": commands}))
 `);
   assert.equal(result.value.ok, true);
   assert.equal(result.value.commands.length, 2);
-  assert.equal(result.commands.length, 2);
+  assert.equal(result.value.audio_profile.profile, "headset-head-unit-cvsd");
+  assert.equal(result.commands.length, 3);
+  assert.deepEqual(result.commands[2], [
+    "pactl",
+    "set-card-profile",
+    "bluez_card.14_08_08_52_F9_62",
+    "headset-head-unit-cvsd",
+  ]);
 });
 
 test("doctor reads the target source state from pactl JSON", () => {

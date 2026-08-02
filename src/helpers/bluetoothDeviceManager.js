@@ -1,4 +1,5 @@
 const MAC_PATTERN = /^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$/;
+const MINIJOY_HFP_PROFILE = "headset-head-unit-cvsd";
 
 function normalizeMac(value) {
   const compact = String(value || "").toUpperCase().replace(/[^0-9A-F]/g, "");
@@ -55,10 +56,20 @@ function pairingArgs(mac) {
   ];
 }
 
+function pipeWireCardName(mac) {
+  const normalizedMac = normalizeMac(mac);
+  return normalizedMac ? `bluez_card.${normalizedMac.replace(/:/g, "_")}` : "";
+}
+
 class BluetoothDeviceManager {
-  constructor({ runCommand, knownMacProvider = () => [] }) {
+  constructor({
+    runCommand,
+    knownMacProvider = () => [],
+    wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  }) {
     this.runCommand = runCommand;
     this.knownMacProvider = knownMacProvider;
+    this.wait = wait;
   }
 
   async info(mac) {
@@ -81,6 +92,32 @@ class BluetoothDeviceManager {
       devices.push({ ...state, name: state.name || candidate.name });
     }
     return devices.sort((left, right) => left.mac.localeCompare(right.mac));
+  }
+
+  async activateAudioProfile(mac, attempts = 8) {
+    const cardName = pipeWireCardName(mac);
+    let result = null;
+    for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
+      result = await this.runCommand(
+        "pactl",
+        ["set-card-profile", cardName, MINIJOY_HFP_PROFILE],
+        5000
+      );
+      if (result?.success) {
+        return {
+          success: true,
+          card_name: cardName,
+          profile: MINIJOY_HFP_PROFILE,
+        };
+      }
+      if (attempt + 1 < attempts) await this.wait(500);
+    }
+    return {
+      success: false,
+      card_name: cardName,
+      profile: MINIJOY_HFP_PROFILE,
+      detail: commandText(result),
+    };
   }
 
   async repair(mac, { confirmCleanup = false, forceCleanup = false } = {}) {
@@ -150,10 +187,24 @@ class BluetoothDeviceManager {
     }
     const connected = await this.runCommand("bluetoothctl", ["connect", normalizedMac], 30000);
     const after = await this.info(normalizedMac);
+    const audioProfile = after.connected
+      ? await this.activateAudioProfile(normalizedMac)
+      : null;
+    const connectedSuccessfully = after.paired &&
+      after.bonded &&
+      after.trusted &&
+      after.connected &&
+      audioProfile?.success;
     return {
-      success: bluetoothCommandSucceeded(connected) && after.paired && after.bonded && after.trusted && after.connected,
-      stage: after.connected ? "connected" : "connect_failed",
+      success: Boolean(connectedSuccessfully),
+      stage: !after.connected
+        ? "connect_failed"
+        : audioProfile?.success
+          ? "connected"
+          : "audio_profile_failed",
       device: after,
+      audio_profile: audioProfile,
+      detail: connectedSuccessfully ? "" : commandText(connected),
     };
   }
 }
@@ -164,3 +215,5 @@ module.exports.parseBluetoothInfo = parseBluetoothInfo;
 module.exports.parseDeviceList = parseDeviceList;
 module.exports.bluetoothCommandSucceeded = bluetoothCommandSucceeded;
 module.exports.pairingArgs = pairingArgs;
+module.exports.pipeWireCardName = pipeWireCardName;
+module.exports.MINIJOY_HFP_PROFILE = MINIJOY_HFP_PROFILE;
