@@ -8,6 +8,7 @@ class PipeWireUnifiedSourceController {
     this.logger = logger;
     this.runCommand = runCommand;
     this.activeSource = "";
+    this.activeSink = "";
   }
 
   command(args) {
@@ -46,7 +47,74 @@ class PipeWireUnifiedSourceController {
     }
   }
 
-  activate(sourceNodeName) {
+  listStreams(kind) {
+    try {
+      return JSON.parse(this.command(["-f", "json", "list", kind]) || "[]");
+    } catch (error) {
+      this.logger?.warn?.("Failed to enumerate PipeWire streams", {
+        kind,
+        error: error?.message || String(error),
+      });
+      return [];
+    }
+  }
+
+  shouldMoveStream(stream) {
+    const properties = stream?.properties || {};
+    return !stream?.owner_module &&
+      properties["stream.monitor"] !== "true" &&
+      properties["application.name"] !== "CapsWriter_Native_Capture";
+  }
+
+  moveExistingStreams(kind, targetNodeName) {
+    const command = kind === "sink-inputs" ? "move-sink-input" : "move-source-output";
+    const moved = [];
+    for (const stream of this.listStreams(kind)) {
+      if (!this.shouldMoveStream(stream) || stream?.index === undefined) continue;
+      try {
+        this.command([command, String(stream.index), targetNodeName]);
+        moved.push(stream.index);
+      } catch (error) {
+        this.logger?.warn?.("Failed to move PipeWire stream", {
+          kind,
+          streamIndex: stream.index,
+          targetNodeName,
+          error: error?.message || String(error),
+        });
+      }
+    }
+    return moved;
+  }
+
+  setDefaultSource(sourceNodeName, { moveExisting = true } = {}) {
+    const nodeName = String(sourceNodeName || "").trim();
+    if (!nodeName) throw new Error("PipeWire source node is required");
+    this.command(["set-default-source", nodeName]);
+    const movedSourceOutputs = moveExisting
+      ? this.moveExistingStreams("source-outputs", nodeName)
+      : [];
+    this.activeSource = nodeName;
+    return {
+      default_source_name: nodeName,
+      moved_source_outputs: movedSourceOutputs,
+    };
+  }
+
+  setDefaultSink(sinkNodeName, { moveExisting = true } = {}) {
+    const nodeName = String(sinkNodeName || "").trim();
+    if (!nodeName) throw new Error("PipeWire sink node is required");
+    this.command(["set-default-sink", nodeName]);
+    const movedSinkInputs = moveExisting
+      ? this.moveExistingStreams("sink-inputs", nodeName)
+      : [];
+    this.activeSink = nodeName;
+    return {
+      default_sink_name: nodeName,
+      moved_sink_inputs: movedSinkInputs,
+    };
+  }
+
+  activate(sourceNodeName, sinkNodeName = "") {
     const nodeName = String(sourceNodeName || "").trim();
     if (!nodeName) throw new Error("PipeWire source node is required");
     this.ensureBus();
@@ -60,31 +128,36 @@ class PipeWireUnifiedSourceController {
       "source_dont_move=true",
       "sink_dont_move=true",
     ]);
-    this.command(["set-default-source", UNIFIED_SOURCE_NAME]);
-    this.activeSource = nodeName;
-    this.logger?.info?.("Unified PipeWire input switched", {
+    const sourceResult = this.setDefaultSource(nodeName);
+    const sinkResult = sinkNodeName
+      ? this.setDefaultSink(sinkNodeName)
+      : { default_sink_name: this.activeSink, moved_sink_inputs: [] };
+    this.logger?.info?.("Unified PipeWire route switched", {
       sourceNodeName: nodeName,
+      sinkNodeName: sinkResult.default_sink_name || null,
       unifiedSource: UNIFIED_SOURCE_NAME,
     });
     return {
       source_node_name: nodeName,
       unified_source_name: UNIFIED_SOURCE_NAME,
+      ...sourceResult,
+      ...sinkResult,
     };
   }
 
   deactivate() {
-    this.ensureBus();
     this.unloadExistingLoopbacks();
-    this.command(["set-default-source", UNIFIED_SOURCE_NAME]);
     const previousSource = this.activeSource;
+    const previousSink = this.activeSink;
     this.activeSource = "";
-    this.logger?.info?.("Unified PipeWire input released", {
+    this.activeSink = "";
+    this.logger?.info?.("Unified PipeWire route released", {
       previousSource,
-      unifiedSource: UNIFIED_SOURCE_NAME,
+      previousSink,
     });
     return {
       previous_source_node_name: previousSource,
-      unified_source_name: UNIFIED_SOURCE_NAME,
+      previous_sink_node_name: previousSink,
     };
   }
 }

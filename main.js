@@ -67,6 +67,7 @@ function withTimeout(promise, timeoutMs, message) {
 
 // Initialize log manager
 const LogManager = require("./src/helpers/logManager");
+const { shouldUseRendererCapture } = require("./src/helpers/hostTriggerCapturePolicy");
 
 // Create logger instance
 const logger = new LogManager();
@@ -218,6 +219,7 @@ const minicpmVoiceBridge = new MiniCPMVoiceBridge({ logger });
 let clipboardWatchTimer = null;
 let clipboardWatchEnabled = false;
 let lastClipboardText = "";
+const rendererCaptureTriggers = new Set();
 const CLIPBOARD_WATCH_INTERVAL_MS = 500;
 
 function safeSendToMainWindow(channel, payload) {
@@ -513,6 +515,7 @@ const ipcHandlers = new IPCHandlers({
   linkBookmarkManager,
   voiceDatasetRecorder,
   asrConnectionProfiles,
+  m5VoiceBridge,
 });
 
 ipcMain.handle("set-clipboard-watch-enabled", (_event, enabled) => {
@@ -891,18 +894,33 @@ async function startApp() {
     windowManager.showFloatingBall({
       rememberActiveWindow: !m5VoiceBridge.hasActiveRecordings(),
     });
+    if (shouldUseRendererCapture(
+      triggerId,
+      m5VoiceBridge.usesSystemDefaultAudioCapture(triggerId)
+    )) {
+      rendererCaptureTriggers.add(triggerId);
+      safeSendToMainWindow('caps-lock-down', payload);
+      return;
+    }
     const routed = await m5VoiceBridge.handleHostTriggerDown(
       triggerId,
       windowManager.previousActiveWindow || ''
     );
     if (!routed.handled) {
-      if (routed.busy || triggerId.startsWith('minijoy_bt')) {
+      if (routed.busy) {
         safeSendToMainWindow('external-recording-error', {
           trigger_id: triggerId,
-          error: routed.busy ? '录音任务已满，请稍后重试' : '对应的 MiniJoy 蓝牙麦克风当前不可用',
+          error: '录音任务已满，请稍后重试',
         });
         setTimeout(() => windowManager.hideFloatingBall(), 1600);
         return;
+      }
+      if (triggerId.startsWith('minijoy_bt')) {
+        rendererCaptureTriggers.add(triggerId);
+        logger.warn('MiniJoy 蓝牙音频不可用，回退到电脑本地麦克风', {
+          triggerId,
+          route: routed.route || null,
+        });
       }
       safeSendToMainWindow('caps-lock-down', payload);
     }
@@ -915,6 +933,11 @@ async function startApp() {
     // Restore the window that was active before the floating recorder appeared.
     if (windowManager.previousActiveWindow) {
       clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
+    }
+
+    if (rendererCaptureTriggers.delete(triggerId)) {
+      safeSendToMainWindow('caps-lock-up', payload);
+      return;
     }
     
     // 然后发送停止录音事件
@@ -1001,6 +1024,19 @@ async function startApp() {
     logger.warn('Dictation hold-key listener unavailable, 按住唤醒功能已禁用');
   }
 
+  try {
+    const defaultAudioRoute = m5VoiceBridge.restoreUnifiedDefaultSource();
+    logger.info('Default audio route applied', {
+      sourceId: defaultAudioRoute?.route?.source_id || '',
+      sourceNodeName: defaultAudioRoute?.default_source_name || '',
+      sinkId: defaultAudioRoute?.route?.sink_id || '',
+      sinkNodeName: defaultAudioRoute?.default_sink_name || '',
+    });
+  } catch (error) {
+    logger.warn('Failed to apply default audio route', {
+      error: error?.message || String(error),
+    });
+  }
   m5VoiceBridge.start();
 
   logger.info('Application startup complete');

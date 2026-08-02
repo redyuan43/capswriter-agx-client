@@ -52,6 +52,8 @@ class PipeWireCaptureController {
       capture.attempt += 1;
       let stderr = "";
       const child = this.spawnProcess("pw-record", [
+        "--properties",
+        `application.name=CapsWriter_Native_Capture node.name=capswriter_capture_${id}`,
         "--target",
         nodeName,
         "--rate",

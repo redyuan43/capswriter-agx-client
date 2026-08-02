@@ -4,10 +4,12 @@ import {
   Cable,
   ChevronDown,
   Loader2,
+  Mic,
   Radio,
   RefreshCw,
   Router,
   Save,
+  Volume2,
   Wifi,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -17,8 +19,11 @@ const REFRESH_INTERVAL_MS = 3000;
 
 async function requestJson(path, options) {
   const response = await fetch(`${BRIDGE_BASE_URL}${path}`, options);
-  if (!response.ok) throw new Error(`Bridge HTTP ${response.status}`);
-  return response.json();
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || payload.stage || `Bridge HTTP ${response.status}`);
+  }
+  return payload;
 }
 
 function statusClass(active) {
@@ -51,6 +56,7 @@ export default function M5BridgePanel() {
   const [selections, setSelections] = useState({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [repairingMac, setRepairingMac] = useState("");
   const [error, setError] = useState("");
   const dirtyRef = useRef(false);
 
@@ -71,7 +77,11 @@ export default function M5BridgePanel() {
         setSelections(Object.fromEntries(
           Object.entries(nextRouting.routes || {}).map(([triggerId, route]) => [
             triggerId,
-            route.source_id || "",
+            {
+              source_id: route.configured_source_id || route.source_id || "",
+              sink_id: route.configured_sink_id || route.sink_id || "",
+              pipeline_id: route.pipeline_id || "default",
+            },
           ])
         ));
         dirtyRef.current = false;
@@ -93,14 +103,18 @@ export default function M5BridgePanel() {
   const saveRoutes = async () => {
     setSaving(true);
     try {
-      await requestJson("/audio/routing", {
+      const result = await requestJson("/audio/routing", {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=UTF-8" },
-        body: JSON.stringify({ version: 2, routes: selections }),
+        body: JSON.stringify({ version: 3, routes: selections }),
       });
       dirtyRef.current = false;
       await refresh({ resetSelections: true });
-      toast.success("M5 音频路由已保存");
+      if (result.applied?.input_applied || result.applied?.output_applied) {
+        toast.success("音频路由已保存并应用");
+      } else {
+        toast.warning("路由已保存，所选设备暂不可用");
+      }
     } catch (saveError) {
       toast.error("保存路由失败", { description: saveError?.message || String(saveError) });
     } finally {
@@ -108,14 +122,56 @@ export default function M5BridgePanel() {
     }
   };
 
+  const repairBluetooth = async (device) => {
+    const confirmed = window.confirm(
+      `请先在 MiniJoy 设备端清除旧电脑配置，并让设备进入蓝牙配对模式。\n\n` +
+      `确认后，电脑只会删除 ${device.mac} 的旧配对记录并立即重新配对，不影响其他设备。`
+    );
+    if (!confirmed) return;
+
+    setRepairingMac(device.mac);
+    try {
+      if (!window.electronAPI?.repairM5BluetoothDevice) {
+        throw new Error("当前页面无法调用本机蓝牙配对服务");
+      }
+      const result = await window.electronAPI.repairM5BluetoothDevice(device.mac);
+      if (!result?.success) {
+        throw new Error(result?.error || result?.stage || "蓝牙重新配对失败");
+      }
+      await refresh();
+      toast.success(`${device.label} 已重新配对`);
+    } catch (repairError) {
+      toast.error("重新配对失败", {
+        description: `${repairError?.message || String(repairError)}。请确认 MiniJoy 已清除旧配置并处于配对模式。`,
+      });
+    } finally {
+      setRepairingMac("");
+    }
+  };
+
   const routes = Object.entries(routing?.routes || {});
   const sources = (routing?.sources || []).filter(
     (source) => source.online && source.transport_available !== false
   );
+  const sinks = (routing?.sinks || []).filter(
+    (sink) => sink.online && sink.transport_available !== false
+  );
   const inactiveRoutes = Object.values(routing?.inactive_routes || {});
   const connectedBluetooth = bluetoothDevices.filter((device) => device.connected);
-  const knownBluetooth = bluetoothDevices.filter((device) => !device.connected);
   const bluetooth = bridgeState?.bluetooth;
+  const targetBluetoothMac = String(bluetooth?.target_mac || "").trim().toUpperCase();
+  const knownBluetooth = bluetoothDevices.filter((device) => !device.connected);
+  if (
+    targetBluetoothMac &&
+    !bluetoothDevices.some((device) => device.mac === targetBluetoothMac)
+  ) {
+    knownBluetooth.push({
+      mac: targetBluetoothMac,
+      label: `MiniJoy ${targetBluetoothMac.slice(-5)}`,
+      known: false,
+      connected: false,
+    });
+  }
   const bridgeReady = Boolean(bluetooth?.ready);
 
   return (
@@ -182,21 +238,67 @@ export default function M5BridgePanel() {
           </div>
           <div className="mt-4 space-y-3">
             {routes.map(([triggerId, route]) => (
-              <label key={triggerId} className="grid gap-2 rounded-lg bg-gray-50 p-3 sm:grid-cols-[minmax(150px,1fr)_minmax(220px,2fr)] sm:items-center">
-                <span className="text-sm text-gray-700">{triggerLabel(triggerId, route)}</span>
-                <select
-                  value={selections[triggerId] || ""}
-                  onChange={(event) => {
-                    dirtyRef.current = true;
-                    setSelections((current) => ({ ...current, [triggerId]: event.target.value }));
-                  }}
-                  className="min-h-10 rounded-lg border border-gray-300 bg-white px-3 text-sm text-gray-800"
-                >
-                  {sources.map((source) => (
-                    <option key={source.source_id} value={source.source_id}>{source.name}</option>
-                  ))}
-                </select>
-              </label>
+              <div key={triggerId} className="grid gap-3 rounded-lg bg-gray-50 p-3 lg:grid-cols-[minmax(140px,0.8fr)_minmax(220px,1.6fr)_minmax(220px,1.6fr)] lg:items-end">
+                <span className="pb-2 text-sm font-medium text-gray-700">{triggerLabel(triggerId, route)}</span>
+                <label className="grid gap-1.5">
+                  <span className="flex items-center gap-1.5 text-xs text-gray-500">
+                    <Mic className="h-3.5 w-3.5" />
+                    输入
+                  </span>
+                  <select
+                    value={selections[triggerId]?.source_id || ""}
+                    onChange={(event) => {
+                      dirtyRef.current = true;
+                      setSelections((current) => ({
+                        ...current,
+                        [triggerId]: {
+                          ...(current[triggerId] || {}),
+                          source_id: event.target.value,
+                          pipeline_id: current[triggerId]?.pipeline_id || "default",
+                        },
+                      }));
+                    }}
+                    className="min-h-10 min-w-0 rounded-lg border border-gray-300 bg-white px-3 text-sm text-gray-800"
+                  >
+                    {selections[triggerId]?.source_id &&
+                      !sources.some((source) => source.source_id === selections[triggerId].source_id) && (
+                        <option value={selections[triggerId].source_id}>已配置输入（离线）</option>
+                      )}
+                    {sources.map((source) => (
+                      <option key={source.source_id} value={source.source_id}>{source.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="grid gap-1.5">
+                  <span className="flex items-center gap-1.5 text-xs text-gray-500">
+                    <Volume2 className="h-3.5 w-3.5" />
+                    输出
+                  </span>
+                  <select
+                    value={selections[triggerId]?.sink_id || ""}
+                    onChange={(event) => {
+                      dirtyRef.current = true;
+                      setSelections((current) => ({
+                        ...current,
+                        [triggerId]: {
+                          ...(current[triggerId] || {}),
+                          sink_id: event.target.value,
+                          pipeline_id: current[triggerId]?.pipeline_id || "default",
+                        },
+                      }));
+                    }}
+                    className="min-h-10 min-w-0 rounded-lg border border-gray-300 bg-white px-3 text-sm text-gray-800"
+                  >
+                    {selections[triggerId]?.sink_id &&
+                      !sinks.some((sink) => sink.sink_id === selections[triggerId].sink_id) && (
+                        <option value={selections[triggerId].sink_id}>已配置输出（离线）</option>
+                      )}
+                    {sinks.map((sink) => (
+                      <option key={sink.sink_id} value={sink.sink_id}>{sink.name}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
             ))}
             {!loading && routes.length === 0 && <p className="text-sm text-gray-500">当前没有可用路由。</p>}
           </div>
@@ -208,7 +310,21 @@ export default function M5BridgePanel() {
             <div className="mt-4 space-y-3">
               {connectedBluetooth.map((device) => (
                 <div key={device.mac} className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
-                  <div className="flex items-center justify-between gap-3"><span className="text-sm font-medium text-gray-900">{device.label}</span><StatusBadge active>已连接</StatusBadge></div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium text-gray-900">{device.label}</span>
+                    <div className="flex items-center gap-2">
+                      <StatusBadge active>已连接</StatusBadge>
+                      <button
+                        type="button"
+                        onClick={() => repairBluetooth(device)}
+                        disabled={Boolean(repairingMac)}
+                        title="删除本机旧配对记录并重新配对"
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-emerald-200 bg-white text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                      >
+                        <RefreshCw className={`h-4 w-4 ${repairingMac === device.mac ? "animate-spin" : ""}`} />
+                      </button>
+                    </div>
+                  </div>
                   <p className="mt-1 text-xs text-gray-500">{device.mac}</p>
                 </div>
               ))}
@@ -238,9 +354,27 @@ export default function M5BridgePanel() {
             </summary>
             <div className="mt-4 space-y-2 border-t border-gray-100 pt-4 text-xs text-gray-500">
               {inactiveRoutes.map((route) => (
-                <p key={route.trigger_id}>{triggerLabel(route.trigger_id, route)} → {route.source?.name || route.source_id || "未配置"}（不可用）</p>
+                <p key={route.trigger_id}>
+                  {triggerLabel(route.trigger_id, route)}
+                  {" · 输入："}{route.source?.name || route.source_id || "未配置"}
+                  {" · 输出："}{route.sink?.name || route.sink_id || "未配置"}
+                  （不可用）
+                </p>
               ))}
-              {knownBluetooth.map((device) => <p key={device.mac}>{device.label} · {device.mac}（未连接）</p>)}
+              {knownBluetooth.map((device) => (
+                <div key={device.mac} className="flex items-center justify-between gap-3">
+                  <p>{device.label} · {device.mac}（未连接）</p>
+                  <button
+                    type="button"
+                    onClick={() => repairBluetooth(device)}
+                    disabled={Boolean(repairingMac)}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${repairingMac === device.mac ? "animate-spin" : ""}`} />
+                    重新配对
+                  </button>
+                </div>
+              ))}
             </div>
           </details>
         )}

@@ -28,6 +28,8 @@ test("PipeWire capture uses a normalized 16 kHz mono stream", () => {
 
   assert.equal(calls[0].command, "pw-record");
   assert.deepEqual(calls[0].args, [
+    "--properties",
+    "application.name=CapsWriter_Native_Capture node.name=capswriter_capture_session-a",
     "--target",
     "alsa_input.usb-example",
     "--rate",

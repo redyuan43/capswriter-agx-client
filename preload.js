@@ -129,6 +129,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("external-recording-start", listener);
   },
 
+  onExternalRecordingArmed: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-armed", listener);
+    return () => ipcRenderer.removeListener("external-recording-armed", listener);
+  },
+
   onExternalRecordingChunk: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("external-recording-chunk", listener);
@@ -155,6 +161,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   reportExternalRecordingResult: (payload) =>
     ipcRenderer.invoke("m5-voice-recording-result", payload),
+  repairM5BluetoothDevice: (mac) =>
+    ipcRenderer.invoke("repair-m5-bluetooth-device", mac),
 
   interruptMiniCPMVoice: () => ipcRenderer.invoke("interrupt-minicpm-voice"),
   submitMiniCPMVoicePrompt: (prompt) => ipcRenderer.invoke("submit-minicpm-voice-prompt", prompt),

@@ -291,6 +291,7 @@ test("loopback dashboard can inspect and repair one Bluetooth MAC", async (t) =>
     stage: "connected",
     device: { ...device, mac, connected: true },
     confirmCleanup: options.confirmCleanup,
+    forceCleanup: options.forceCleanup,
   });
 
   const listed = await requestJson(port, "/bluetooth/devices");
@@ -307,11 +308,12 @@ test("loopback dashboard can inspect and repair one Bluetooth MAC", async (t) =>
   const repaired = await requestJson(port, "/bluetooth/repair", {
     method: "POST",
     headers: { Origin: `http://127.0.0.1:${port}` },
-    body: { mac: device.mac, confirm_cleanup: true },
+    body: { mac: device.mac, confirm_cleanup: true, force_cleanup: true },
   });
   assert.equal(repaired.statusCode, 200);
   assert.equal(JSON.parse(repaired.body).device.mac, device.mac);
   assert.equal(JSON.parse(repaired.body).confirmCleanup, true);
+  assert.equal(JSON.parse(repaired.body).forceCleanup, true);
 });
 
 test("dashboard inline script remains valid after server-side rendering", () => {
@@ -531,6 +533,61 @@ test("device command poll returns commands for the requesting device", async (t)
   assert.equal(payload.command.payload.session_id, "remote-session");
 });
 
+test("audio routes apply input and output independently", async (t) => {
+  const { bridge } = await startBridge(t);
+  const calls = [];
+  bridge.pipeWireUnifiedSource.activate = (sourceNodeName, sinkNodeName) => {
+    calls.push({ type: "route", sourceNodeName, sinkNodeName });
+    return {
+      default_source_name: sourceNodeName,
+      default_sink_name: sinkNodeName,
+    };
+  };
+  bridge.pipeWireUnifiedSource.setDefaultSink = (sinkNodeName) => {
+    calls.push({ type: "output", sinkNodeName });
+    return { default_sink_name: sinkNodeName };
+  };
+  const sink = {
+    node_name: "alsa_output.usb-mi-speaker",
+    online: true,
+  };
+
+  const localResult = bridge.applyAudioRoute({
+    available: true,
+    output_available: true,
+    source: {
+      kind: "pipewire",
+      node_name: "bluez_input.C8_85_41_68_39_0A.0",
+    },
+    sink,
+  });
+  const remoteResult = bridge.applyAudioRoute({
+    available: true,
+    output_available: true,
+    source: {
+      kind: "wifi",
+      source_id: "wifi:stick-a",
+    },
+    sink,
+  }, { activateInput: false });
+
+  assert.deepEqual(calls, [
+    {
+      type: "route",
+      sourceNodeName: "bluez_input.C8_85_41_68_39_0A.0",
+      sinkNodeName: "alsa_output.usb-mi-speaker",
+    },
+    {
+      type: "output",
+      sinkNodeName: "alsa_output.usb-mi-speaker",
+    },
+  ]);
+  assert.equal(localResult.input_applied, true);
+  assert.equal(localResult.output_applied, true);
+  assert.equal(remoteResult.input_applied, false);
+  assert.equal(remoteResult.output_applied, true);
+});
+
 test("MiniJoy host trigger captures native HFP PCM without browser recording", async (t) => {
   const rendererEvents = [];
   const { bridge } = await startBridge(t, (eventName, payload) => {
@@ -569,7 +626,9 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
     bridge.audioRouting.captureHealthFor("pipewire:bluez_input.C8_85_41_68_39_0A").status,
     "unknown"
   );
-  assert.deepEqual(rendererEvents, []);
+  assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-armed",
+  ]);
   emitChunk(Buffer.from([1, 2, 3, 4]));
   assert.equal(
     bridge.audioRouting.captureHealthFor("pipewire:bluez_input.C8_85_41_68_39_0A").status,
@@ -583,17 +642,95 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   assert.equal(stoppedSessionId, started.session_id);
   assert.equal(restoredDefaultSource, true);
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-armed",
     "external-recording-start",
     "external-recording-chunk",
     "external-recording-stop",
   ]);
-  assert.equal(rendererEvents[2].payload.bytes, 4);
-  assert.equal(rendererEvents[2].payload.chunks, 1);
+  assert.equal(rendererEvents[3].payload.bytes, 4);
+  assert.equal(rendererEvents[3].payload.chunks, 1);
   assert.equal(bridge.sessions.get(started.session_id).silentBytes, 640);
 });
 
+test("concurrent host triggers arm only the renderer-owned session", async (t) => {
+  const rendererEvents = [];
+  const { bridge } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  const captures = new Map();
+  bridge.audioRouting.activateTrigger = (triggerId) => {
+    const address = triggerId.split(":")[1];
+    return {
+      trigger_id: triggerId,
+      source_id: `pipewire:bluez_input.${address}`,
+      source: {
+        node_name: `bluez_input.${address}.0`,
+        online: true,
+      },
+      available: true,
+    };
+  };
+  bridge.audioRouting.clearActiveRoute = () => {};
+  bridge.pipeWireUnifiedSource.activate = () => {};
+  bridge.restoreUnifiedDefaultSource = () => {};
+  bridge.pipeWireCapture.start = (sessionId, _sourceId, onChunk) => {
+    captures.set(sessionId, onChunk);
+    return { pid: 1234 };
+  };
+  bridge.pipeWireCapture.stop = () => true;
+
+  const first = await bridge.handleHostTriggerDown("minijoy_bt:aaaaaaaaaaaa", "42");
+  const second = await bridge.handleHostTriggerDown("minijoy_bt:bbbbbbbbbbbb", "43");
+
+  assert.deepEqual(
+    rendererEvents
+      .filter((event) => event.eventName === "external-recording-armed")
+      .map((event) => event.payload.session_id),
+    [first.session_id]
+  );
+
+  captures.get(second.session_id)(Buffer.from([2, 2, 2, 2]));
+  assert.equal(
+    rendererEvents.some((event) =>
+      event.eventName === "external-recording-start" &&
+      event.payload.session_id === second.session_id
+    ),
+    false
+  );
+
+  captures.get(first.session_id)(Buffer.from([1, 1, 1, 1]));
+  assert.deepEqual(
+    rendererEvents
+      .filter((event) => event.eventName === "external-recording-start")
+      .map((event) => event.payload.session_id),
+    [first.session_id]
+  );
+
+  await bridge.handleHostTriggerUp("minijoy_bt:bbbbbbbbbbbb");
+  await bridge.handleHostTriggerUp("minijoy_bt:aaaaaaaaaaaa");
+  await bridge.handleRendererResult({
+    session_id: first.session_id,
+    success: true,
+    status: "pasted",
+    text: "first",
+  });
+  await waitFor(() => assert.ok(rendererEvents.some((event) =>
+    event.eventName === "external-recording-start" &&
+    event.payload.session_id === second.session_id
+  )));
+  await bridge.handleRendererResult({
+    session_id: second.session_id,
+    success: true,
+    status: "pasted",
+    text: "second",
+  });
+});
+
 test("MiniJoy host capture with no PCM records an audio failure but remains retryable", async (t) => {
-  const { bridge, commands } = await startBridge(t);
+  const rendererEvents = [];
+  const { bridge, commands } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
   let recoveryTimeoutMs = 0;
   const runCommand = bridge.runCommand;
   bridge.runCommand = (command, args, timeoutMs) => {
@@ -622,6 +759,11 @@ test("MiniJoy host capture with no PCM records an audio failure but remains retr
 
   assert.equal(started.handled, true);
   assert.equal(stopped.error, "recording contains no audio");
+  assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-armed",
+    "external-recording-error",
+  ]);
+  assert.equal(rendererEvents[1].payload.error, "未收到麦克风音频");
   assert.equal(bridge.audioRouting.captureHealthFor(sourceId).status, "failed");
   assert.equal(bridge.audioRouting.captureHealthFor(sourceId).failure_reason, "audio_input_empty");
   assert.equal(commands.length, 0);
@@ -629,7 +771,8 @@ test("MiniJoy host capture with no PCM records an audio failure but remains retr
   await waitFor(() => assert.equal(commands.length, 1));
   assert.equal(commands[0].args.includes("repair"), true);
   assert.equal(commands[0].args.includes("--audio-only"), true);
-  assert.equal(commands[0].args.includes("--recover-bluez"), true);
+  assert.equal(commands[0].args.includes("--reconnect-only"), true);
+  assert.equal(commands[0].args.includes("--recover-bluez"), false);
   assert.equal(recoveryTimeoutMs, 180000);
   assert.deepEqual(commands[0].args.slice(-2), ["--mac", "C8:85:41:68:39:0A"]);
   assert.equal(
@@ -681,11 +824,12 @@ test("keyboard host trigger captures native USB PCM without browser recording", 
   assert.equal(captureNodeName, "capswriter_input_bus.monitor");
   assert.equal(restoredDefaultSource, true);
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-armed",
     "external-recording-start",
     "external-recording-chunk",
     "external-recording-stop",
   ]);
-  assert.equal(rendererEvents[2].payload.bytes, 4);
+  assert.equal(rendererEvents[3].payload.bytes, 4);
 });
 
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {

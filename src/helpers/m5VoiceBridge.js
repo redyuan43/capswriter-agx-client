@@ -284,12 +284,16 @@ class M5VoiceBridge {
     });
     this.bluetoothDevices = new BluetoothDeviceManager({
       runCommand: (...args) => this.runCommand(...args),
-      knownMacProvider: () => (this.audioRouting.getState().sources || [])
-        .filter((source) => source.bluetooth)
-        .map((source) => source.bluetooth_address),
+      knownMacProvider: () => [
+        String(process.env.M5_MINIJOY_BLUETOOTH_MAC || DEFAULT_MINIJOY_BLUETOOTH_MAC),
+        ...(this.audioRouting.getState().sources || [])
+          .filter((source) => source.bluetooth)
+          .map((source) => source.bluetooth_address),
+      ],
     });
     this.hostTriggerSessions = new Map();
     this.rendererSessionId = "";
+    this.rendererPendingSessionId = "";
     this.rendererQueue = [];
     this.bridgeInstanceId = randomUUID();
     this.recordingFirstChunkTimeoutMs = RECORDING_FIRST_CHUNK_TIMEOUT_MS;
@@ -372,6 +376,7 @@ class M5VoiceBridge {
     this.hostTriggerSessions.clear();
     this.rendererQueue = [];
     this.rendererSessionId = "";
+    this.rendererPendingSessionId = "";
     this.rendererRecovery = false;
     this.server.close();
     this.server = null;
@@ -531,19 +536,23 @@ const bluetoothStatusText = (device) => {
   if (device.known) return "已发现，等待配对";
   return "未发现";
 };
-async function repairBluetooth(mac, confirmCleanup = false) {
+async function repairBluetooth(mac, confirmCleanup = false, forceCleanup = false) {
   const response = await fetch("/bluetooth/repair", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ mac, confirm_cleanup: confirmCleanup }),
+    body: JSON.stringify({
+      mac,
+      confirm_cleanup: confirmCleanup,
+      force_cleanup: forceCleanup,
+    }),
   });
   const payload = await response.json();
   if (response.status === 409 && payload.requires_cleanup) {
     const confirmed = window.confirm(
-      "检测到 " + mac + " 的 PC 残留配对记录。" +
-      "只删除这个 MAC 的残留记录并重新绑定，不影响其他 MiniJoy。是否继续？"
+      "请先在 MiniJoy 设备端清除旧电脑配置，并让设备进入蓝牙配对模式。\\n\\n" +
+      "确认后，电脑只会删除 " + mac + " 的旧配对记录并立即重新配对，不影响其他设备。"
     );
-    if (confirmed) return repairBluetooth(mac, true);
+    if (confirmed) return repairBluetooth(mac, true, true);
     return;
   }
   if (!response.ok || !payload.success) {
@@ -659,13 +668,18 @@ loadBluetoothDevices();
     this.sendJson(res, 200, { success: true, devices: await this.bluetoothDevices.list() });
   }
 
+  repairBluetoothDevice(mac, options = {}) {
+    return this.bluetoothDevices.repair(mac, options);
+  }
+
   async handleBluetoothRepair(req, res) {
     if (!this.isLoopbackRequest(req) || !this.isTrustedDashboardOrigin(req)) {
       throw Object.assign(new Error("bluetooth repair is only available on localhost"), { statusCode: 403 });
     }
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
-    const result = await this.bluetoothDevices.repair(body.mac, {
+    const result = await this.repairBluetoothDevice(body.mac, {
       confirmCleanup: body.confirm_cleanup === true,
+      forceCleanup: body.force_cleanup === true,
     });
     this.sendJson(res, result.statusCode || (result.success ? 200 : 502), result);
   }
@@ -1113,7 +1127,7 @@ loadBluetoothDevices();
     session.seenChunkIds = new Set();
     this.armSessionWatchdogs(session);
     if (captureMode === "host_capture") {
-      this.pipeWireUnifiedSource.activate(route.source.node_name);
+      this.applyAudioRoute(route);
       const capture = this.pipeWireCapture.start(
         sessionId,
         sourceId,
@@ -1122,7 +1136,10 @@ loadBluetoothDevices();
         { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
       );
       session.capturePid = capture?.pid || null;
-    } else if (captureMode === "remote_device") {
+    } else {
+      this.applyAudioRoute(route, { activateInput: false });
+    }
+    if (captureMode === "remote_device") {
       this.commandBroker.enqueue(session.sourceDeviceId, {
         type: "recording_start",
         payload: {
@@ -1174,7 +1191,6 @@ loadBluetoothDevices();
     }
     const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
     const dispatchedNow = !session.rendererDispatched &&
-      !this.rendererSessionId &&
       this.dispatchRendererSessionIfIdle(session);
     if (dispatchedNow) {
       return true;
@@ -1189,13 +1205,49 @@ loadBluetoothDevices();
     return true;
   }
 
+  applyAudioRoute(route, { activateInput = true } = {}) {
+    if (!route) return { input_applied: false, output_applied: false };
+    const sinkNodeName = route.output_available ? route.sink?.node_name : "";
+    let result = {};
+    let inputApplied = false;
+    let outputApplied = false;
+    if (
+      activateInput &&
+      route.available &&
+      route.source?.kind === "pipewire" &&
+      route.source?.node_name
+    ) {
+      result = this.pipeWireUnifiedSource.activate(
+        route.source.node_name,
+        sinkNodeName
+      );
+      inputApplied = true;
+      outputApplied = Boolean(sinkNodeName);
+    } else if (sinkNodeName) {
+      result = this.pipeWireUnifiedSource.setDefaultSink(sinkNodeName);
+      outputApplied = true;
+    }
+    return {
+      route,
+      input_applied: inputApplied,
+      output_applied: outputApplied,
+      ...result,
+    };
+  }
+
   restoreUnifiedDefaultSource() {
     const sources = this.audioRouting.listSources();
-    const defaultSourceId = this.audioRouting.defaultSourceForTrigger("keyboard", sources);
-    const defaultSource = sources.find((source) => source.source_id === defaultSourceId);
-    if (defaultSource?.node_name) {
-      this.pipeWireUnifiedSource.activate(defaultSource.node_name);
-      return defaultSource;
+    const sinks = this.audioRouting.listSinks();
+    const saved = this.audioRouting.routesForSources(sources);
+    const triggerId = this.audioRouting.latestActiveRoute()?.trigger_id || "keyboard";
+    const route = this.audioRouting.resolveRoute(triggerId, sources, saved, {
+      fallbackToAvailable: true,
+      sinks,
+    });
+    if (route.available || route.output_available) {
+      return this.applyAudioRoute(route, {
+        activateInput: route.source?.kind === "pipewire",
+      });
     }
     this.pipeWireUnifiedSource.deactivate();
     return null;
@@ -1445,11 +1497,17 @@ loadBluetoothDevices();
     return this.audioRouting.getState();
   }
 
+  usesSystemDefaultAudioCapture(triggerId) {
+    return this.audioRouting.usesSystemDefaultCapture(triggerId);
+  }
+
   async handleAudioRoutingUpdate(req, res) {
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     this.audioRouting.saveRoutes(body);
+    const applied = this.restoreUnifiedDefaultSource();
     this.sendJson(res, 200, {
       success: true,
+      applied,
       routing: this.audioRouting.getState(),
     });
   }
@@ -1495,7 +1553,7 @@ loadBluetoothDevices();
     const route = this.audioRouting.activateTrigger(triggerId);
     if (!route.source_id.startsWith("wifi:")) {
       if (route.available && route.source.node_name) {
-        this.pipeWireUnifiedSource.activate(route.source.node_name);
+        this.applyAudioRoute(route);
       }
       if (!route.available || !route.source.node_name) {
         return { handled: false, route };
@@ -1520,6 +1578,7 @@ loadBluetoothDevices();
       return { handled: true, route, session_id: sessionId };
     }
 
+    this.applyAudioRoute(route, { activateInput: false });
     const sessionId = randomUUID().replace(/-/g, "");
     const sourceDeviceId = route.source_id.slice(5);
     this.createHostRecordingSession({
@@ -1568,6 +1627,7 @@ loadBluetoothDevices();
     this.hostTriggerSessions.set(triggerId, sessionId);
     session.source = "audio_router";
     session.audioSource = route.source_id;
+    this.armRendererSessionIfIdle(session);
     this.armSessionWatchdogs(session);
     return session;
   }
@@ -1576,6 +1636,7 @@ loadBluetoothDevices();
     const sessionId = this.hostTriggerSessions.get(triggerId);
     if (!sessionId) {
       this.audioRouting.clearActiveRoute(triggerId);
+      this.restoreUnifiedDefaultSource();
       return { handled: false };
     }
     this.hostTriggerSessions.delete(triggerId);
@@ -1609,6 +1670,15 @@ loadBluetoothDevices();
       }
     }
     if (session.bytes === 0) {
+      if (this.isRendererVisibleSession(session)) {
+        session.rendererErrorDispatched = true;
+        this.sendToRenderer("external-recording-error", {
+          session_id: session.id,
+          trigger_id: triggerId,
+          reason: "audio_input_empty",
+          error: "未收到麦克风音频",
+        });
+      }
       this.abortSession(session, "audio_input_empty");
       return { handled: true, session_id: sessionId, acknowledgement, error: "recording contains no audio" };
     }
@@ -1691,9 +1761,38 @@ loadBluetoothDevices();
     };
   }
 
+  isRendererVisibleSession(session) {
+    return Boolean(session?.id && (
+      this.rendererSessionId === session.id ||
+      this.rendererPendingSessionId === session.id
+    ));
+  }
+
+  armRendererSessionIfIdle(session) {
+    if (!session || session.done || this.rendererSessionId || this.rendererPendingSessionId) {
+      return false;
+    }
+    this.rendererPendingSessionId = session.id;
+    session.rendererArmed = true;
+    this.sendToRenderer("external-recording-armed", {
+      session_id: session.id,
+      trigger_id: session.triggerId,
+      source_id: session.sourceId,
+      mode: session.mode,
+      intent: session.intent,
+    });
+    return true;
+  }
+
   dispatchRendererSessionIfIdle(session) {
     if (this.rendererSessionId || !session || session.done || session.rendererDispatched || session.bytes <= 0) {
       return false;
+    }
+    if (this.rendererPendingSessionId && this.rendererPendingSessionId !== session.id) {
+      return false;
+    }
+    if (this.rendererPendingSessionId === session.id) {
+      this.rendererPendingSessionId = "";
     }
     this.rendererSessionId = session.id;
     session.rendererDispatched = true;
@@ -1863,8 +1962,8 @@ loadBluetoothDevices();
     const sourceMac = sourceId.match(/bluez_input\.([0-9a-f_:-]{17})/i)?.[1]
       ?.replace(/_/g, ":").toUpperCase() || "";
     const args = fs.existsSync(sourceDoctor)
-      ? [sourceDoctor, "repair", "--audio-only", "--recover-bluez", "--recovery-cooldown", "60"]
-      : ["repair", "--audio-only", "--recover-bluez", "--recovery-cooldown", "60"];
+      ? [sourceDoctor, "repair", "--audio-only", "--reconnect-only", "--recovery-cooldown", "60"]
+      : ["repair", "--audio-only", "--reconnect-only", "--recovery-cooldown", "60"];
     if (sourceMac) args.push("--mac", sourceMac);
     this.logger?.warn?.("Recovering failed MiniJoy Bluetooth audio stack", {
       sourceId,
@@ -1893,16 +1992,28 @@ loadBluetoothDevices();
       if (sessionId === session.id) this.hostTriggerSessions.delete(triggerId);
     }
     this.audioRouting.clearActiveRoute(session.triggerId);
+    const wasRendererPending = this.rendererPendingSessionId === session.id;
+    if (wasRendererPending) {
+      this.rendererPendingSessionId = "";
+    }
     if (session.rendererDispatched) {
+      this.sendToRenderer("external-recording-cancel", {
+        session_id: session.id,
+        reason: result.reason || result.error || result.status,
+      });
+    } else if (wasRendererPending && !session.rendererErrorDispatched) {
       this.sendToRenderer("external-recording-cancel", {
         session_id: session.id,
         reason: result.reason || result.error || result.status,
       });
     }
     this.finishSession(session, result);
+    if (wasRendererPending && !this.rendererRecovery) {
+      this.advanceRendererQueue();
+    }
     const hasActiveSession = [...this.sessions.values()].some((candidate) => !candidate.done);
+    this.restoreUnifiedDefaultSource();
     if (!hasActiveSession) {
-      this.restoreUnifiedDefaultSource();
       this.windowManager?.hideFloatingBall?.();
     }
     return true;
@@ -1915,6 +2026,7 @@ loadBluetoothDevices();
     }
     this.rendererQueue = [];
     this.rendererSessionId = "";
+    this.rendererPendingSessionId = "";
     this.rendererRecovery = false;
     this.windowManager?.hideFloatingBall?.();
   }

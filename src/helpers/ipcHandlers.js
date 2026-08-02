@@ -14,6 +14,7 @@ class IPCHandlers {
     this.linkBookmarkManager = managers.linkBookmarkManager;
     this.voiceDatasetRecorder = managers.voiceDatasetRecorder;
     this.asrConnectionProfiles = managers.asrConnectionProfiles;
+    this.m5VoiceBridge = managers.m5VoiceBridge;
     this.f2RegisteredSenders = new Set();
 
     registerIpcHandlers(this);

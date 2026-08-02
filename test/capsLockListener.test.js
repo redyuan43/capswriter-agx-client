@@ -122,7 +122,7 @@ test('routes the MiniJoy mouse middle button to dictation callbacks', () => {
 
 test('routes MiniJoy Right Shift exactly like the physical dictation key', () => {
   const listener = new CapsLockListener();
-  listener.minHoldMs = 0;
+  listener.minHoldMs = 150;
   const devicePath = '/dev/input/event257';
   listener._inputBuffers.set(devicePath, Buffer.alloc(0));
   listener._inputDeviceInfo.set(devicePath, {
@@ -154,7 +154,7 @@ test('routes MiniJoy Right Shift exactly like the physical dictation key', () =>
 
 test('routes the PocketTerm35 physical Shift key as dictation without changing other keyboards', () => {
   const listener = new CapsLockListener();
-  listener.minHoldMs = 0;
+  listener.minHoldMs = 150;
   const devicePath = '/dev/input/event0';
   listener._inputBuffers.set(devicePath, Buffer.alloc(0));
   listener._inputDeviceInfo.set(devicePath, {

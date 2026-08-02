@@ -2748,6 +2748,14 @@ export default function FloatingBallApp() {
     if (!window.electronAPI) {
       return undefined;
     }
+    const unsubscribeArmed = window.electronAPI.onExternalRecordingArmed?.((payload) => {
+      recordingModeRef.current = "dictation";
+      setAnimatedRealtimeTarget("", { immediate: true });
+      setMessage(payload?.message || "正在采集音频");
+      setColdStartLoading(false);
+      stopInitialLoadingTimer();
+      transitionStatus("recording");
+    });
     const unsubscribeStart = window.electronAPI.onExternalRecordingStart?.((payload) => {
       startExternalRecording(payload).catch((error) => {
         reportExternalRecordingResult(payload?.session_id, "start_failed", {
@@ -2775,13 +2783,14 @@ export default function FloatingBallApp() {
     });
 
     return () => {
+      if (unsubscribeArmed) unsubscribeArmed();
       if (unsubscribeStart) unsubscribeStart();
       if (unsubscribeChunk) unsubscribeChunk();
       if (unsubscribeStop) unsubscribeStop();
       if (unsubscribeCancel) unsubscribeCancel();
       if (unsubscribeError) unsubscribeError();
     };
-  }, [cancelExternalRecording, receiveExternalRecordingChunk, reportExternalRecordingResult, startExternalRecording, stopExternalRecording, transitionStatus]);
+  }, [cancelExternalRecording, receiveExternalRecordingChunk, reportExternalRecordingResult, setAnimatedRealtimeTarget, startExternalRecording, stopExternalRecording, stopInitialLoadingTimer, transitionStatus]);
 
   useEffect(() => {
     if (!window.electronAPI?.onCodexVoiceUpdate) return undefined;

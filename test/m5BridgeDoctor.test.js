@@ -126,6 +126,29 @@ print(json.dumps(value))
   assert.equal(result.recovery.action, "audio_stack_restart_and_bluetooth_reconnect");
 });
 
+test("doctor can reconnect Bluetooth audio without restarting the host audio stack", () => {
+  const result = runPython(`
+before = {"ok": False, "stage": "audio_capture_failed", "audio_status": "failed"}
+after = {"ok": True, "stage": "ready", "audio_status": "healthy"}
+diagnoses = [before, after]
+doctor.audio_only_diagnose = lambda *args: diagnoses.pop(0)
+calls = []
+doctor.reconnect_audio_transport = lambda mac: calls.append(mac) or {
+    "ok": True,
+    "bluez": {"connected": True},
+    "pipewire": {"available": True},
+}
+doctor.recover_audio_stack_with_bluez = lambda *_args: (_ for _ in ()).throw(
+    AssertionError("full audio stack restart must not run"))
+value = doctor.repair_audio_only(
+    "14:08:08:52:F9:62", "bridge", now_epoch=100, reconnect_only=True)
+print(json.dumps({"value": value, "calls": calls}))
+`);
+  assert.equal(result.value.ok, true);
+  assert.equal(result.value.recovery.action, "bluetooth_reconnect");
+  assert.deepEqual(result.calls, ["14:08:08:52:F9:62"]);
+});
+
 test("doctor cycles Bluetooth before rebuilding a stale PipeWire route", () => {
   const result = runPython(`
 calls = []

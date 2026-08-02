@@ -38,6 +38,23 @@ function commandText(result) {
   return [result?.stdout, result?.stderr, result?.error].filter(Boolean).join("\n");
 }
 
+function bluetoothCommandSucceeded(result) {
+  if (!result?.success) return false;
+  return !/\b(?:failed|error|not available|not ready|authentication(?:failed| canceled))\b/i
+    .test(commandText(result));
+}
+
+function pairingArgs(mac) {
+  return [
+    "--agent",
+    "NoInputNoOutput",
+    "--timeout",
+    "30",
+    "pair",
+    mac,
+  ];
+}
+
 class BluetoothDeviceManager {
   constructor({ runCommand, knownMacProvider = () => [] }) {
     this.runCommand = runCommand;
@@ -66,7 +83,7 @@ class BluetoothDeviceManager {
     return devices.sort((left, right) => left.mac.localeCompare(right.mac));
   }
 
-  async repair(mac, { confirmCleanup = false } = {}) {
+  async repair(mac, { confirmCleanup = false, forceCleanup = false } = {}) {
     const normalizedMac = normalizeMac(mac);
     if (!normalizedMac) throw Object.assign(new Error("invalid bluetooth MAC"), { statusCode: 400 });
     let before = await this.info(normalizedMac);
@@ -77,8 +94,32 @@ class BluetoothDeviceManager {
       throw Object.assign(new Error("target is not a VibeStick MiniJoy"), { statusCode: 400 });
     }
 
+    if (forceCleanup) {
+      if (!confirmCleanup) {
+        return {
+          success: false,
+          statusCode: 409,
+          stage: "cleanup_confirmation_required",
+          requires_cleanup: true,
+          device: before,
+        };
+      }
+      const removed = await this.runCommand("bluetoothctl", ["remove", normalizedMac], 10000);
+      if (!bluetoothCommandSucceeded(removed)) {
+        return { success: false, stage: "remove_failed", device: before, detail: commandText(removed) };
+      }
+      before = {
+        ...before,
+        paired: false,
+        bonded: false,
+        trusted: false,
+        connected: false,
+      };
+    }
+
     if (!before.paired || !before.bonded) {
-      let pair = await this.runCommand("bluetoothctl", ["pair", normalizedMac], 30000);
+      await this.runCommand("bluetoothctl", ["--timeout", "8", "scan", "on"], 10000);
+      let pair = await this.runCommand("bluetoothctl", pairingArgs(normalizedMac), 35000);
       if (/org\.bluez\.Error\.AlreadyExists/i.test(commandText(pair))) {
         if (!confirmCleanup) {
           return {
@@ -94,18 +135,23 @@ class BluetoothDeviceManager {
           return { success: false, stage: "remove_failed", device: before, detail: commandText(removed) };
         }
         await this.runCommand("bluetoothctl", ["--timeout", "8", "scan", "on"], 10000);
-        pair = await this.runCommand("bluetoothctl", ["pair", normalizedMac], 30000);
+        pair = await this.runCommand("bluetoothctl", pairingArgs(normalizedMac), 35000);
       }
-      if (!pair?.success) {
+      const paired = await this.info(normalizedMac);
+      if (!bluetoothCommandSucceeded(pair) || !paired.paired || !paired.bonded) {
         return { success: false, stage: "pair_failed", device: before, detail: commandText(pair) };
       }
+      before = paired;
     }
 
-    await this.runCommand("bluetoothctl", ["trust", normalizedMac], 10000);
-    await this.runCommand("bluetoothctl", ["connect", normalizedMac], 30000);
+    const trusted = await this.runCommand("bluetoothctl", ["trust", normalizedMac], 10000);
+    if (!bluetoothCommandSucceeded(trusted)) {
+      return { success: false, stage: "trust_failed", device: before, detail: commandText(trusted) };
+    }
+    const connected = await this.runCommand("bluetoothctl", ["connect", normalizedMac], 30000);
     const after = await this.info(normalizedMac);
     return {
-      success: after.paired && after.bonded && after.connected,
+      success: bluetoothCommandSucceeded(connected) && after.paired && after.bonded && after.trusted && after.connected,
       stage: after.connected ? "connected" : "connect_failed",
       device: after,
     };
@@ -116,3 +162,5 @@ module.exports = BluetoothDeviceManager;
 module.exports.normalizeMac = normalizeMac;
 module.exports.parseBluetoothInfo = parseBluetoothInfo;
 module.exports.parseDeviceList = parseDeviceList;
+module.exports.bluetoothCommandSucceeded = bluetoothCommandSucceeded;
+module.exports.pairingArgs = pairingArgs;

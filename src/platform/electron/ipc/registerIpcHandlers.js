@@ -1,6 +1,7 @@
 const { registerClipboardHandlers } = require("./clipboardHandlers");
 const { registerDatabaseHandlers } = require("./databaseHandlers");
 const { registerLinkBookmarkHandlers } = require("./linkBookmarkHandlers");
+const { registerM5BridgeHandlers } = require("./m5BridgeHandlers");
 const { registerMiscHandlers } = require("./miscHandlers");
 const { forwardMonitorEvents, registerProcessMonitorHandlers } = require("./processMonitorHandlers");
 const { registerSettingsHandlers } = require("./settingsHandlers");
@@ -13,6 +14,7 @@ function registerIpcHandlers(ctx) {
   registerAsrConnectionHandlers(ctx);
   registerDatabaseHandlers(ctx);
   registerLinkBookmarkHandlers(ctx);
+  registerM5BridgeHandlers(ctx);
   registerClipboardHandlers(ctx);
   registerWindowHandlers(ctx);
   registerProcessMonitorHandlers(ctx);

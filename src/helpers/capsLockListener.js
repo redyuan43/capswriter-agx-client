@@ -717,7 +717,7 @@ class CapsLockListener {
     this._recordingTriggered = false;
     this._logInfo(`${keyConfig.displayName} 按下, keycode:`, keycode);
 
-    if (this.minHoldMs > 0) {
+    if (this._requiresHoldDelay(keyConfig)) {
       // 短按过滤：超过阈值后才触发录音，确保 <= 阈值的轻按不激活。
       this._holdTimer = setTimeout(() => {
         this._holdTimer = null;
@@ -815,7 +815,7 @@ class CapsLockListener {
       this._emitHoldKeyDown(role, hold.source);
     };
 
-    if (this.minHoldMs > 0) {
+    if (this._requiresHoldDelay(keyConfig)) {
       hold.timer = setTimeout(trigger, this.minHoldMs + 1);
       hold.timer.unref?.();
     } else {
@@ -868,6 +868,10 @@ class CapsLockListener {
     for (const hold of [...this._evdevHolds.values()]) {
       this._finishEvdevHold(hold, hold.keycode, true, reason);
     }
+  }
+
+  _requiresHoldDelay(keyConfig) {
+    return this.minHoldMs > 0 && keyConfig?.restoresCapsLock;
   }
 
   _emitHoldKeyDown(role, source = {}) {

@@ -1,9 +1,12 @@
 const { execFileSync } = require("child_process");
 
-const ROUTING_SETTING_KEY = "audio_input_routes_v2";
+const ROUTING_SETTING_KEY = "audio_routes_v3";
+const LEGACY_ROUTING_SETTING_KEY_V2 = "audio_input_routes_v2";
 const LEGACY_ROUTING_SETTING_KEY = "audio_input_routes_v1";
 const DEFAULT_USB_DESCRIPTION = "MI Speakphone Mono";
+const DEFAULT_OUTPUT_DESCRIPTION = "MI Speakphone";
 const UNIFIED_SOURCE_NAME = "capswriter_input_bus.monitor";
+const INTERNAL_SINK_NAME = "capswriter_input_bus";
 const CAPTURE_HEALTH_TTL_MS = 60 * 1000;
 
 function cleanId(value) {
@@ -15,17 +18,21 @@ function normalizeBluetoothAddress(value) {
   return hex.length === 12 ? hex : "";
 }
 
-function bluetoothAddressFromSource(source) {
-  const properties = source?.properties || {};
+function bluetoothAddressFromNode(node) {
+  const properties = node?.properties || {};
   const explicit = normalizeBluetoothAddress(
-    source?.bluetooth_address ||
+    node?.bluetooth_address ||
     properties["api.bluez5.address"] ||
     properties["device.string"]
   );
   if (explicit) return explicit;
-  const nodeName = cleanId(source?.stable_node_name || source?.name || properties["node.name"]);
-  return normalizeBluetoothAddress(nodeName.match(/bluez_input\.([0-9a-f_:-]{17})/i)?.[1] || "");
+  const nodeName = cleanId(node?.stable_node_name || node?.name || properties["node.name"]);
+  return normalizeBluetoothAddress(
+    nodeName.match(/bluez_(?:input|output)\.([0-9a-f_:-]{17})/i)?.[1] || ""
+  );
 }
+
+const bluetoothAddressFromSource = bluetoothAddressFromNode;
 
 function miniJoyTriggerId(address) {
   const normalized = normalizeBluetoothAddress(address);
@@ -47,18 +54,30 @@ function sourceIdForPipeWire(source) {
   return nodeName ? `pipewire:${nodeName}` : "";
 }
 
+function sinkIdForPipeWire(sink) {
+  const properties = sink?.properties || {};
+  const nodeName = stableNodeName(sink?.name || properties["node.name"]);
+  return nodeName ? `pipewire-sink:${nodeName}` : "";
+}
+
 function normalizeRoutes(value) {
   const routes = value && typeof value === "object" ? value.routes : null;
   const normalized = {};
   if (routes && typeof routes === "object") {
     for (const [triggerId, route] of Object.entries(routes)) {
       const sourceId = cleanId(route?.source_id || route);
+      const sinkId = cleanId(route?.sink_id);
+      const pipelineId = cleanId(route?.pipeline_id) || "default";
       if (cleanId(triggerId) && sourceId) {
-        normalized[cleanId(triggerId)] = { source_id: sourceId };
+        normalized[cleanId(triggerId)] = {
+          source_id: sourceId,
+          ...(sinkId ? { sink_id: sinkId } : {}),
+          pipeline_id: pipelineId,
+        };
       }
     }
   }
-  return { version: 2, routes: normalized };
+  return { version: 3, routes: normalized };
 }
 
 class AudioRoutingManager {
@@ -134,8 +153,31 @@ class AudioRoutingManager {
   loadRoutes() {
     const current = this.databaseManager?.getSetting?.(ROUTING_SETTING_KEY, null);
     if (current) return normalizeRoutes(current);
-    return normalizeRoutes(
-      this.databaseManager?.getSetting?.(LEGACY_ROUTING_SETTING_KEY, { version: 1, routes: {} })
+    const previous = this.databaseManager?.getSetting?.(LEGACY_ROUTING_SETTING_KEY_V2, null);
+    if (previous) return normalizeRoutes(previous);
+    return normalizeRoutes(this.databaseManager?.getSetting?.(
+      LEGACY_ROUTING_SETTING_KEY,
+      { version: 1, routes: {} }
+    ));
+  }
+
+  hasConfiguredRoute(triggerId) {
+    const id = cleanId(triggerId);
+    return Boolean(id && this.loadRoutes().routes[id]?.source_id);
+  }
+
+  usesSystemDefaultCapture(triggerId) {
+    const id = cleanId(triggerId);
+    if (id !== "keyboard") return false;
+    const sources = this.listSources();
+    const route = this.resolveRoute(id, sources, this.routesForSources(sources));
+    const defaultSourceId = this.defaultSourceForTrigger(id, sources);
+    return Boolean(
+      route.available &&
+      route.source_id &&
+      route.source_id === defaultSourceId &&
+      route.source?.kind === "pipewire" &&
+      !route.source?.bluetooth
     );
   }
 
@@ -237,6 +279,64 @@ class AudioRoutingManager {
     return [...this.listPipeWireSources(), ...this.listWifiSources()];
   }
 
+  listPipeWireSinks() {
+    if (process.platform !== "linux") {
+      return [];
+    }
+    try {
+      const output = this.runCommand(
+        "pactl",
+        ["-f", "json", "list", "sinks"],
+        { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "pipe"] }
+      );
+      const sinks = JSON.parse(String(output || "[]"));
+      return sinks
+        .filter((sink) => stableNodeName(sink?.name) !== INTERNAL_SINK_NAME)
+        .map((sink) => {
+          const properties = sink.properties || {};
+          const nodeName = cleanId(sink.name || properties["node.name"]);
+          const stableName = stableNodeName(nodeName);
+          const description = cleanId(
+            sink.description || properties["device.description"] || nodeName
+          );
+          const bluetooth = stableName.startsWith("bluez_output.") ||
+            /VibeStick MiniJoy/i.test(description);
+          const bluetoothAddress = bluetoothAddressFromNode({
+            name: nodeName,
+            stable_node_name: stableName,
+            properties,
+          });
+          const transportAvailable = String(sink.state || "").toUpperCase() !== "UNAVAILABLE";
+          return {
+            sink_id: sinkIdForPipeWire(sink),
+            kind: "pipewire",
+            node_name: nodeName,
+            stable_node_name: stableName,
+            name: bluetooth && bluetoothAddress
+              ? `${description} ${bluetoothAddress.slice(-4, -2).toUpperCase()}:${bluetoothAddress.slice(-2).toUpperCase()}`
+              : description,
+            base_name: description,
+            enumerated: true,
+            transport_available: transportAvailable,
+            online: transportAvailable,
+            bluetooth,
+            bluetooth_address: bluetoothAddress,
+            properties,
+          };
+        })
+        .filter((sink) => sink.sink_id);
+    } catch (error) {
+      this.logger?.warn?.("Failed to enumerate PipeWire sinks", {
+        error: error?.message || String(error),
+      });
+      return [];
+    }
+  }
+
+  listSinks() {
+    return this.listPipeWireSinks();
+  }
+
   defaultSourceForTrigger(triggerId, sources = this.listSources()) {
     if (triggerId.startsWith("minijoy_bt:")) {
       const address = normalizeBluetoothAddress(triggerId.slice("minijoy_bt:".length));
@@ -259,14 +359,26 @@ class AudioRoutingManager {
     )?.source_id || "";
   }
 
+  defaultSinkForTrigger(_triggerId, sinks = this.listSinks()) {
+    return sinks.find((sink) =>
+      sink.kind === "pipewire" &&
+      (sink.base_name || sink.name).includes(DEFAULT_OUTPUT_DESCRIPTION)
+    )?.sink_id || sinks.find((sink) =>
+      sink.kind === "pipewire" && sink.online
+    )?.sink_id || "";
+  }
+
   resolveRoute(
     triggerId,
     sources = this.listSources(),
     saved = this.routesForSources(sources),
-    { fallbackToAvailable = false } = {}
+    { fallbackToAvailable = false, sinks = this.listSinks() } = {}
   ) {
     const cleanTriggerId = cleanId(triggerId) || "keyboard";
-    const configuredSourceId = cleanId(saved.routes[cleanTriggerId]?.source_id);
+    const savedRoute = saved.routes[cleanTriggerId] || {};
+    const configuredSourceId = cleanId(savedRoute.source_id);
+    const configuredSinkId = cleanId(savedRoute.sink_id);
+    const pipelineId = cleanId(savedRoute.pipeline_id) || "default";
     let sourceId = configuredSourceId ||
       this.defaultSourceForTrigger(cleanTriggerId, sources);
     let source = sources.find((candidate) => candidate.source_id === sourceId) || {
@@ -285,26 +397,57 @@ class AudioRoutingManager {
         available = true;
       }
     }
+    let sinkId = configuredSinkId || this.defaultSinkForTrigger(cleanTriggerId, sinks);
+    let sink = sinks.find((candidate) => candidate.sink_id === sinkId) || {
+      sink_id: sinkId,
+      kind: "pipewire",
+      name: sinkId,
+      online: false,
+    };
+    let outputAvailable = Boolean(sinkId && (sink.transport_available ?? sink.online));
+    if (!outputAvailable && fallbackToAvailable) {
+      const fallbackSinkId = this.defaultSinkForTrigger(cleanTriggerId, sinks);
+      const fallbackSink = sinks.find((candidate) => candidate.sink_id === fallbackSinkId);
+      if (fallbackSink && (fallbackSink.transport_available ?? fallbackSink.online)) {
+        sinkId = fallbackSinkId;
+        sink = fallbackSink;
+        outputAvailable = true;
+      }
+    }
     return {
       trigger_id: cleanTriggerId,
       source_id: sourceId,
       source,
+      sink_id: sinkId,
+      sink,
+      pipeline_id: pipelineId,
       trigger_name: miniJoyTriggerLabel(cleanTriggerId),
       available,
+      output_available: outputAvailable,
       ...(configuredSourceId && configuredSourceId !== sourceId
         ? { configured_source_id: configuredSourceId }
+        : {}),
+      ...(configuredSinkId && configuredSinkId !== sinkId
+        ? { configured_sink_id: configuredSinkId }
         : {}),
     };
   }
 
   activateTrigger(triggerId) {
-    const route = this.resolveRoute(triggerId);
+    const sources = this.listSources();
+    const sinks = this.listSinks();
+    const route = this.resolveRoute(
+      triggerId,
+      sources,
+      this.routesForSources(sources),
+      { fallbackToAvailable: true, sinks }
+    );
     const activeRoute = {
       ...route,
       activated_at: Date.now(),
     };
     this.activeRoutes.set(route.trigger_id, activeRoute);
-    this.logger?.info?.("Audio input route activated", activeRoute);
+    this.logger?.info?.("Audio route activated", activeRoute);
     return activeRoute;
   }
 
@@ -313,8 +456,15 @@ class AudioRoutingManager {
     else this.activeRoutes.delete(triggerId);
   }
 
+  latestActiveRoute() {
+    return [...this.activeRoutes.values()]
+      .sort((left, right) => left.activated_at - right.activated_at)
+      .at(-1) || null;
+  }
+
   getState() {
     const sources = this.listSources();
+    const sinks = this.listSinks();
     const saved = this.routesForSources(sources);
     const bluetoothTriggerIds = sources
       .filter((source) => source.bluetooth && source.bluetooth_address)
@@ -329,28 +479,36 @@ class AudioRoutingManager {
     for (const triggerId of liveTriggerIds) {
       const route = this.resolveRoute(triggerId, sources, saved, {
         fallbackToAvailable: true,
+        sinks,
       });
       if (route.available) routes[triggerId] = route;
     }
     const inactiveRoutes = {};
     for (const triggerId of Object.keys(saved.routes)) {
-      const configured = this.resolveRoute(triggerId, sources, saved);
+      const configured = this.resolveRoute(triggerId, sources, saved, { sinks });
       const live = routes[triggerId];
-      if (!configured.available || !live || configured.source_id !== live.source_id) {
+      if (
+        !configured.available ||
+        !configured.output_available ||
+        !live ||
+        configured.source_id !== live.source_id ||
+        configured.sink_id !== live.sink_id
+      ) {
         inactiveRoutes[triggerId] = configured;
       }
     }
     return {
-      version: 2,
+      version: 3,
       unified_source: {
         source_id: `pipewire:${UNIFIED_SOURCE_NAME}`,
         node_name: UNIFIED_SOURCE_NAME,
         name: "CapsWriter Unified Input",
       },
       sources,
+      sinks,
       routes,
       inactive_routes: inactiveRoutes,
-      active_route: [...this.activeRoutes.values()].at(-1) || null,
+      active_route: this.latestActiveRoute(),
       active_routes: [...this.activeRoutes.values()],
     };
   }
@@ -358,13 +516,17 @@ class AudioRoutingManager {
 
 module.exports = AudioRoutingManager;
 module.exports.ROUTING_SETTING_KEY = ROUTING_SETTING_KEY;
+module.exports.LEGACY_ROUTING_SETTING_KEY_V2 = LEGACY_ROUTING_SETTING_KEY_V2;
 module.exports.LEGACY_ROUTING_SETTING_KEY = LEGACY_ROUTING_SETTING_KEY;
 module.exports.DEFAULT_USB_DESCRIPTION = DEFAULT_USB_DESCRIPTION;
+module.exports.DEFAULT_OUTPUT_DESCRIPTION = DEFAULT_OUTPUT_DESCRIPTION;
 module.exports.UNIFIED_SOURCE_NAME = UNIFIED_SOURCE_NAME;
 module.exports.normalizeRoutes = normalizeRoutes;
 module.exports.sourceIdForPipeWire = sourceIdForPipeWire;
+module.exports.sinkIdForPipeWire = sinkIdForPipeWire;
 module.exports.stableNodeName = stableNodeName;
 module.exports.normalizeBluetoothAddress = normalizeBluetoothAddress;
+module.exports.bluetoothAddressFromNode = bluetoothAddressFromNode;
 module.exports.bluetoothAddressFromSource = bluetoothAddressFromSource;
 module.exports.miniJoyTriggerId = miniJoyTriggerId;
 module.exports.miniJoyTriggerLabel = miniJoyTriggerLabel;

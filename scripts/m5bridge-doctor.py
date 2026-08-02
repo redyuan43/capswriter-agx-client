@@ -353,6 +353,22 @@ def recover_audio_stack(mac: str) -> dict:
     }
 
 
+def reconnect_audio_transport(mac: str) -> dict:
+    disconnect = disconnect_bluetooth(mac)
+    bluetooth = connect_bluetooth(mac, always_attempt=True)
+    source = wait_for_pipewire_source(mac, timeout=15) if bluetooth["ok"] else {
+        "available": False, "enumerated": False, "state": "MISSING",
+    }
+    state = bluez_info(mac)
+    return {
+        "ok": state["connected"] and source["available"],
+        "disconnect": disconnect,
+        "bluetooth": bluetooth,
+        "bluez": state,
+        "pipewire": source,
+    }
+
+
 def recover_audio_stack_with_bluez(mac: str, recover_bluez: bool) -> dict:
     initial = recover_audio_stack(mac)
     if initial["ok"] or not recover_bluez:
@@ -417,7 +433,8 @@ def audio_only_diagnose(mac: str, bridge: str) -> dict:
 def repair_audio_only(mac: str, bridge: str, previous: dict | None = None,
                       cooldown_seconds: int = 60,
                       now_epoch: float | None = None,
-                      recover_bluez: bool = False) -> dict:
+                      recover_bluez: bool = False,
+                      reconnect_only: bool = False) -> dict:
     now_epoch = time.time() if now_epoch is None else now_epoch
     before = audio_only_diagnose(mac, bridge)
     recovery = None
@@ -440,11 +457,14 @@ def repair_audio_only(mac: str, bridge: str, previous: dict | None = None,
                 "cooldown_remaining_seconds": remaining,
             }
         else:
-            recovered = recover_audio_stack_with_bluez(mac, recover_bluez)
+            recovered = reconnect_audio_transport(mac) if reconnect_only else (
+                recover_audio_stack_with_bluez(mac, recover_bluez)
+            )
             recovery = {
                 "attempted": True,
                 "attempted_at_epoch": now_epoch,
-                "action": "audio_stack_restart_and_bluetooth_reconnect",
+                "action": "bluetooth_reconnect" if reconnect_only
+                else "audio_stack_restart_and_bluetooth_reconnect",
                 "pending_audio_verification": recovered["ok"],
                 **recovered,
             }
@@ -529,6 +549,8 @@ def main() -> int:
                         help="BlueZ cannot discover a pairing M5时，调用受限恢复助手")
     parser.add_argument("--audio-only", action="store_true",
                         help="只恢复主机蓝牙音频栈，不访问 M5 串口或修改配对信息")
+    parser.add_argument("--reconnect-only", action="store_true",
+                        help="只重连蓝牙传输，不重启 PipeWire/WirePlumber")
     parser.add_argument("--recovery-cooldown", type=int, default=60,
                         help="重复音频栈恢复的最短间隔秒数（默认 60）")
     args = parser.parse_args()
@@ -544,6 +566,7 @@ def main() -> int:
                 args.mac.upper(), args.bridge, previous=previous,
                 cooldown_seconds=max(0, args.recovery_cooldown),
                 recover_bluez=args.recover_bluez,
+                reconnect_only=args.reconnect_only,
             )
         else:
             port = serial_port(args.port)
