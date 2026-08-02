@@ -34,8 +34,21 @@ const REALTIME_ASR_SOCKET_OPEN_TIMEOUT_MS = Number(import.meta.env.VITE_REALTIME
 const REALTIME_ASR_PRECONNECT_ENABLED = String(import.meta.env.VITE_REALTIME_ASR_PRECONNECT_ENABLED || '1') !== '0';
 const SERVER_LLM_MODEL = import.meta.env.VITE_SERVER_LLM_MODEL || 'caps-voice-edit-qwen3-4b';
 
+function usesMainProcessRealtimeAsr() {
+  return (
+    typeof window !== 'undefined'
+    && window.electronAPI?.getPlatform?.() === 'linux'
+  );
+}
+
 function canStartupPreconnectRealtimeAsr() {
-  if (!REALTIME_ASR_PRECONNECT_ENABLED || typeof window === 'undefined') return false;
+  if (
+    !REALTIME_ASR_PRECONNECT_ENABLED
+    || typeof window === 'undefined'
+    || usesMainProcessRealtimeAsr()
+  ) {
+    return false;
+  }
   const search = String(window.location?.search || '');
   const params = new URLSearchParams(search);
   return !params.has('panel') && !params.has('page');
@@ -182,7 +195,7 @@ function createSocketEntry(candidate, owner) {
 }
 
 export async function warmRealtimeAsrConnection() {
-  if (!REALTIME_ASR_PRECONNECT_ENABLED) return false;
+  if (!REALTIME_ASR_PRECONNECT_ENABLED || usesMainProcessRealtimeAsr()) return false;
   if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return false;
   if (realtimeAsrWarmOperation) return realtimeAsrWarmOperation;
   const generation = realtimeAsrCoordinatorGeneration;
@@ -218,7 +231,13 @@ export async function warmRealtimeAsrConnection() {
 }
 
 function scheduleRealtimeAsrPreconnect(delayMs = 1000) {
-  if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+  if (
+    typeof window === 'undefined'
+    || typeof WebSocket === 'undefined'
+    || usesMainProcessRealtimeAsr()
+  ) {
+    return;
+  }
   clearPreconnectSchedule();
   realtimeAsrPreconnectSchedule = window.setTimeout(() => {
     realtimeAsrPreconnectSchedule = null;

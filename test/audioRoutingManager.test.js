@@ -85,10 +85,15 @@ const pactlSinks = [
   },
 ];
 
-function createManager(databaseManager = createDatabase()) {
+function createManager(
+  databaseManager = createDatabase(),
+  defaultSourceNodeName =
+    "alsa_input.usb-rockchip_MI_Speakphone_0123456789ABCDEF-00.mono-fallback"
+) {
   return new AudioRoutingManager({
     databaseManager,
     runCommand(_command, args) {
+      if (args[0] === "get-default-source") return `${defaultSourceNodeName}\n`;
       return JSON.stringify(args.at(-1) === "sinks" ? pactlSinks : pactlSources);
     },
     wifiDeviceProvider: () => [{
@@ -249,6 +254,9 @@ test("audio routing distinguishes enumeration from verified capture health", () 
   let now = Date.parse("2026-07-28T10:00:00.000Z");
   const manager = new AudioRoutingManager({
     runCommand(_command, args) {
+      if (args[0] === "get-default-source") {
+        return "alsa_input.usb-rockchip_MI_Speakphone_0123456789ABCDEF-00.mono-fallback\n";
+      }
       return JSON.stringify(args.at(-1) === "sinks" ? pactlSinks : pactlSources);
     },
     now: () => now,

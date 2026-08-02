@@ -543,12 +543,22 @@ export default function FloatingBallApp() {
     return !outputControlRef.current.interrupted && outputControlRef.current.generation === generation;
   };
 
-  const playCodexCompletionChime = useCallback(() => {
+  const playCodexCompletionChime = useCallback(async () => {
     const now = Date.now();
     if (now - codexLastChimeAtRef.current < CODEX_COMPLETION_CHIME_COOLDOWN_MS) return;
     codexLastChimeAtRef.current = now;
 
     try {
+      if (window.electronAPI?.getPlatform?.() === "linux" && window.electronAPI?.playPipeWireAudio) {
+        const response = await fetch(codexCompletionChimeUrl);
+        const audio = new Uint8Array(await response.arrayBuffer());
+        await window.electronAPI.playPipeWireAudio({
+          audio,
+          trigger_id: "keyboard",
+          request_id: `codex-chime-${now}`,
+        });
+        return;
+      }
       const audio = codexChimeAudioRef.current || new Audio(codexCompletionChimeUrl);
       codexChimeAudioRef.current = audio;
       audio.src = codexCompletionChimeUrl;
@@ -853,6 +863,7 @@ export default function FloatingBallApp() {
   }, [resizeFloatingBall, setAnimatedRealtimeTarget, stopInitialLoadingTimer]);
 
   const stopCurrentTtsPlayback = useCallback(() => {
+    window.electronAPI?.stopPipeWireAudio?.("tts_cancelled")?.catch(() => { });
     if (ttsPlaybackCancelRef.current) {
       try {
         ttsPlaybackCancelRef.current();
@@ -1165,7 +1176,12 @@ export default function FloatingBallApp() {
 
     const playAudioBlob = async ({ audioBlob, chunkIndex, chunkTotal, chunkText }) => {
       throwIfStaleTtsRequest();
-      const audioDurationSec = await estimateAudioBlobDurationSeconds(audioBlob);
+      const nativePipeWirePlayback =
+        window.electronAPI?.getPlatform?.() === "linux" &&
+        typeof window.electronAPI?.playPipeWireAudio === "function";
+      const audioDurationSec = nativePipeWirePlayback
+        ? 0
+        : await estimateAudioBlobDurationSeconds(audioBlob);
       throwIfStaleTtsRequest();
       const currentChunkText = String(chunkText || "");
       const maxAllowedSec = estimateTtsAllowedSeconds(currentChunkText);
@@ -1184,6 +1200,35 @@ export default function FloatingBallApp() {
       }
 
       throwIfStaleTtsRequest();
+      if (nativePipeWirePlayback) {
+        setMessage(chunkTotal > 1 ? `语音播报中（${chunkIndex + 1}/${chunkTotal}）...` : '语音播报中...');
+        const playStartedAt = performance.now();
+        const audio = new Uint8Array(await audioBlob.arrayBuffer());
+        const nativeRequestId = `${traceId}-play-${chunkIndex + 1}`;
+        ttsPlaybackCancelRef.current = () => {
+          window.electronAPI.stopPipeWireAudio("tts_cancelled").catch(() => { });
+        };
+        try {
+          await window.electronAPI.playPipeWireAudio({
+            audio,
+            trigger_id: "keyboard",
+            request_id: nativeRequestId,
+          });
+          throwIfStaleTtsRequest();
+          logRuntime("info", "TTS audio playback completed through PipeWire", {
+            traceId,
+            source,
+            chunkIndex: chunkIndex + 1,
+            chunkTotal,
+            startupMs: Math.round(performance.now() - playStartedAt),
+            totalMs: Math.round(performance.now() - pipelineStartedAt),
+          });
+        } finally {
+          ttsPlaybackCancelRef.current = null;
+        }
+        return;
+      }
+
       const objectUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(objectUrl);
       ttsObjectUrlRef.current = objectUrl;
@@ -2356,6 +2401,110 @@ export default function FloatingBallApp() {
     }
   }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, reportExternalRecordingResult, resetUI, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
 
+  const startNativeExternalRecording = useCallback(async (payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    if (!sessionId) return;
+    const externalMode = normalizeExternalRecordingMode(payload.intent || payload.mode);
+    externalPCMChunksRef.current = [];
+    externalRealtimeSessionRef.current?.cancel?.();
+    externalRealtimeSessionRef.current = null;
+    externalRecordingRef.current = {
+      sessionId,
+      mode: externalMode,
+      sampleRate: Number(payload.sample_rate || 16000),
+      startedAt: Date.now(),
+      cancelled: false,
+      cancelReported: false,
+      nativePipeline: true,
+    };
+    recordingModeRef.current = externalMode === "codex" ? "codex" : "dictation";
+    outputControlRef.current = {
+      generation: outputControlRef.current.generation + 1,
+      interrupted: false,
+      reason: "",
+    };
+    pendingDictationConfirmRef.current = false;
+    setAnimatedRealtimeTarget("", { immediate: true });
+    setMessage("");
+    setColdStartLoading(false);
+    stopInitialLoadingTimer();
+    await transitionStatus("recording");
+    logRuntime("info", "Native PipeWire recording started", {
+      sessionId,
+      mode: externalMode,
+      sourceId: payload.audio_source || "",
+    });
+  }, [logRuntime, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus]);
+
+  const stopNativeExternalRecording = useCallback(async (payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = externalRecordingRef.current;
+    if (!session || session.sessionId !== sessionId || session.cancelled) return;
+    stopInitialLoadingTimer();
+    setColdStartLoading(false);
+    await transitionStatus("processing");
+    setMessage("正在识别...");
+  }, [stopInitialLoadingTimer, transitionStatus]);
+
+  const handleNativeTranscriptionProgress = useCallback((payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = externalRecordingRef.current;
+    if (!session || session.sessionId !== sessionId || session.cancelled) return;
+    const event = payload.event || {};
+    const type = String(event.type || "").toLowerCase();
+    if (type === "ready") {
+      setMessage("");
+      return;
+    }
+    if (type === "partial") {
+      const text = extractASRText(event);
+      if (text || event.voice_command_applied === true) {
+        setAnimatedRealtimeTarget(text);
+      }
+    }
+  }, [setAnimatedRealtimeTarget]);
+
+  const handleNativeRecordingResult = useCallback(async (payload = {}) => {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = externalRecordingRef.current;
+    if (!session || session.sessionId !== sessionId || session.cancelled) return;
+    const result = normalizeASRPayload(payload.result || {}, null);
+    try {
+      if (!isUsableASRPayload(result)) {
+        throw new Error(payload.error || result.error || "实时语音识别未返回可用结果");
+      }
+      await handleRecordingComplete(result);
+      if (session.cancelled) return;
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: true,
+        status: "pasted",
+        text: result.text || result.asr_text || "",
+        message: "Native PipeWire recording handled by CapsWriter",
+      });
+    } catch (error) {
+      if (session.cancelled) return;
+      const message = error?.message || String(error);
+      await transitionStatus("error");
+      setMessage(`音频处理失败：${message}`);
+      reportExternalRecordingResult({
+        session_id: sessionId,
+        success: false,
+        status: "transcription_failed",
+        error: message,
+      });
+      setTimeout(() => {
+        resetUI();
+        hideFloatingBall();
+      }, 1600);
+    } finally {
+      if (externalRecordingRef.current === session) {
+        externalRecordingRef.current = null;
+        externalPCMChunksRef.current = [];
+      }
+    }
+  }, [handleRecordingComplete, hideFloatingBall, reportExternalRecordingResult, resetUI, transitionStatus]);
+
   const handleAIOptimizationComplete = useCallback(() => {
   }, []);
 
@@ -2751,25 +2900,38 @@ export default function FloatingBallApp() {
     const unsubscribeArmed = window.electronAPI.onExternalRecordingArmed?.((payload) => {
       recordingModeRef.current = "dictation";
       setAnimatedRealtimeTarget("", { immediate: true });
-      setMessage(payload?.message || "正在采集音频");
+      setMessage(payload?.message || "正在准备 PipeWire 音频...");
       setColdStartLoading(false);
       stopInitialLoadingTimer();
-      transitionStatus("recording");
+      transitionStatus("processing");
     });
     const unsubscribeStart = window.electronAPI.onExternalRecordingStart?.((payload) => {
-      startExternalRecording(payload).catch((error) => {
-        reportExternalRecordingResult(payload?.session_id, "start_failed", {
-          message: error?.message || "外部录音启动失败"
+      startNativeExternalRecording(payload).catch((error) => {
+        reportExternalRecordingResult({
+          session_id: payload?.session_id,
+          success: false,
+          status: "start_failed",
+          error: error?.message || "外部录音启动失败",
         });
       });
     });
-    const unsubscribeChunk = window.electronAPI.onExternalRecordingChunk?.((payload) => {
-      receiveExternalRecordingChunk(payload);
-    });
     const unsubscribeStop = window.electronAPI.onExternalRecordingStop?.((payload) => {
-      stopExternalRecording(payload).catch((error) => {
-        reportExternalRecordingResult(payload?.session_id, "failed", {
-          message: error?.message || "外部录音处理失败"
+      stopNativeExternalRecording(payload).catch((error) => {
+        reportExternalRecordingResult({
+          session_id: payload?.session_id,
+          success: false,
+          status: "failed",
+          error: error?.message || "外部录音处理失败",
+        });
+      });
+    });
+    const unsubscribeProgress = window.electronAPI.onExternalTranscriptionProgress?.((payload) => {
+      handleNativeTranscriptionProgress(payload);
+    });
+    const unsubscribeResult = window.electronAPI.onExternalRecordingResult?.((payload) => {
+      handleNativeRecordingResult(payload).catch((error) => {
+        logRuntime("error", "Native recording result handling failed", {
+          error: error?.message || String(error),
         });
       });
     });
@@ -2785,12 +2947,13 @@ export default function FloatingBallApp() {
     return () => {
       if (unsubscribeArmed) unsubscribeArmed();
       if (unsubscribeStart) unsubscribeStart();
-      if (unsubscribeChunk) unsubscribeChunk();
       if (unsubscribeStop) unsubscribeStop();
+      if (unsubscribeProgress) unsubscribeProgress();
+      if (unsubscribeResult) unsubscribeResult();
       if (unsubscribeCancel) unsubscribeCancel();
       if (unsubscribeError) unsubscribeError();
     };
-  }, [cancelExternalRecording, receiveExternalRecordingChunk, reportExternalRecordingResult, setAnimatedRealtimeTarget, startExternalRecording, stopExternalRecording, stopInitialLoadingTimer, transitionStatus]);
+  }, [cancelExternalRecording, handleNativeRecordingResult, handleNativeTranscriptionProgress, logRuntime, reportExternalRecordingResult, setAnimatedRealtimeTarget, startNativeExternalRecording, stopInitialLoadingTimer, stopNativeExternalRecording, transitionStatus]);
 
   useEffect(() => {
     if (!window.electronAPI?.onCodexVoiceUpdate) return undefined;

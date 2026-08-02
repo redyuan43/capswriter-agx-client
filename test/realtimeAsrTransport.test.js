@@ -102,6 +102,41 @@ for (const search of ['?panel=control', '?page=links']) {
   });
 }
 
+test('Linux renderer leaves realtime ASR connections to the main process', async (t) => {
+  FakeWebSocket.instances = [];
+  global.WebSocket = FakeWebSocket;
+  let idleCallbacks = 0;
+  global.window = {
+    ...runtimeWindow({
+      realtime_asr_url: 'wss://asr.example/realtime',
+      realtime_asr_token: 'runtime-token',
+    }),
+    location: { search: '' },
+    electronAPI: {
+      ...runtimeWindow({}).electronAPI,
+      getPlatform: () => 'linux',
+    },
+    requestIdleCallback() {
+      idleCallbacks += 1;
+      return idleCallbacks;
+    },
+    cancelIdleCallback() {},
+  };
+  t.after(() => {
+    delete global.WebSocket;
+    delete global.window;
+  });
+
+  const {
+    resetRealtimeAsrPreconnection,
+    warmRealtimeAsrConnection,
+  } = await loadBackendApi(t);
+  assert.equal(idleCallbacks, 0);
+  assert.equal(await warmRealtimeAsrConnection(), false);
+  assert.equal(FakeWebSocket.instances.length, 0);
+  resetRealtimeAsrPreconnection();
+});
+
 test('late events from a failed primary cannot contaminate the fallback session', async (t) => {
   FakeWebSocket.instances = [];
   global.WebSocket = FakeWebSocket;

@@ -124,6 +124,7 @@ const { LinkBookmarkManager } = require("./src/helpers/linkBookmarkManager");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
 const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles");
+const PipeWirePlaybackController = require("./src/helpers/pipeWirePlaybackController");
 
 // Setup production PATH for Python
 function setupProductionPath() {
@@ -414,8 +415,10 @@ const m5VoiceBridge = new M5VoiceBridge({
   windowManager,
   clipboardManager,
   databaseManager,
+  asrConnectionProfiles,
   sendToRenderer: safeSendToMainWindow,
 });
+const pipeWirePlayback = new PipeWirePlaybackController({ logger });
 let rendererRecoveryActive = false;
 let lastRendererHeartbeatAt = Date.now();
 
@@ -809,6 +812,23 @@ ipcMain.handle("m5-voice-recording-result", async (_event, payload = {}) => {
   return m5VoiceBridge.handleRendererResult(payload);
 });
 
+ipcMain.handle("play-pipewire-audio", async (_event, payload = {}) => {
+  if (process.platform !== "linux") {
+    return { success: false, error: "PipeWire playback is available only on Linux" };
+  }
+  const audio = Buffer.from(payload.audio || []);
+  const triggerId = String(payload.trigger_id || "keyboard");
+  const sinkNodeName = m5VoiceBridge.resolveOutputSinkNodeName(triggerId);
+  return await pipeWirePlayback.play(audio, {
+    sinkNodeName,
+    requestId: String(payload.request_id || `renderer-audio-${Date.now()}`),
+  });
+});
+
+ipcMain.handle("stop-pipewire-audio", (_event, reason = "renderer_cancelled") => ({
+  success: pipeWirePlayback.stop(String(reason || "renderer_cancelled")),
+}));
+
 // Main app startup function
 async function startApp() {
   logger.info('Application starting', {
@@ -891,12 +911,34 @@ async function startApp() {
   capsLockListener.setOnCapsLockDown(async (payload = {}) => {
     const triggerId = payload.trigger_id || 'keyboard';
     logger.info(`${capsLockListener.getDictationKeyDisplayName()} pressed - showing floating ball and starting recording`);
+    for (const activeTriggerId of [...rendererCaptureTriggers]) {
+      if (activeTriggerId === triggerId) continue;
+      rendererCaptureTriggers.delete(activeTriggerId);
+      safeSendToMainWindow('caps-lock-up', {
+        trigger_id: activeTriggerId,
+        forced: true,
+        reason: 'audio_route_handoff',
+      });
+    }
+    const cancelledSessions = m5VoiceBridge.cancelConflictingLocalRecordings(
+      triggerId,
+      'audio_route_handoff'
+    );
+    if (cancelledSessions.length) {
+      logger.info('Conflicting local recordings cancelled for audio route handoff', {
+        triggerId,
+        cancelledSessions,
+      });
+    }
     windowManager.showFloatingBall({
       rememberActiveWindow: !m5VoiceBridge.hasActiveRecordings(),
     });
-    if (shouldUseRendererCapture(
+    const usesSystemDefaultCapture = process.platform === 'linux'
+      ? false
+      : m5VoiceBridge.usesSystemDefaultAudioCapture(triggerId);
+    if (process.platform !== 'linux' && shouldUseRendererCapture(
       triggerId,
-      m5VoiceBridge.usesSystemDefaultAudioCapture(triggerId)
+      usesSystemDefaultCapture
     )) {
       rendererCaptureTriggers.add(triggerId);
       safeSendToMainWindow('caps-lock-down', payload);
@@ -915,12 +957,17 @@ async function startApp() {
         setTimeout(() => windowManager.hideFloatingBall(), 1600);
         return;
       }
-      if (triggerId.startsWith('minijoy_bt')) {
-        rendererCaptureTriggers.add(triggerId);
-        logger.warn('MiniJoy 蓝牙音频不可用，回退到电脑本地麦克风', {
+      if (process.platform === 'linux') {
+        logger.warn('PipeWire audio route is unavailable', {
           triggerId,
           route: routed.route || null,
         });
+        safeSendToMainWindow('external-recording-error', {
+          trigger_id: triggerId,
+          error: 'PipeWire 音频路由不可用',
+        });
+        setTimeout(() => windowManager.hideFloatingBall(), 1600);
+        return;
       }
       safeSendToMainWindow('caps-lock-down', payload);
     }
@@ -961,16 +1008,34 @@ async function startApp() {
     }
   });
 
-  capsLockListener.setOnCodexHoldDown(() => {
+  capsLockListener.setOnCodexHoldDown(async () => {
     logger.info(`${capsLockListener.getCodexKeyDisplayName()} pressed - showing floating ball and starting Codex voice recording`);
     windowManager.showFloatingBall();
+    if (process.platform === 'linux') {
+      const routed = await m5VoiceBridge.handleHostTriggerDown(
+        'keyboard',
+        windowManager.previousActiveWindow || '',
+        { intent: 'codex', mode: 'codex' }
+      );
+      if (!routed.handled) {
+        safeSendToMainWindow('external-recording-error', {
+          trigger_id: 'keyboard',
+          error: routed.busy ? '录音任务已满，请稍后重试' : 'PipeWire 音频路由不可用',
+        });
+      }
+      return;
+    }
     safeSendToMainWindow('codex-hold-down');
   });
 
-  capsLockListener.setOnCodexHoldUp(() => {
+  capsLockListener.setOnCodexHoldUp(async () => {
     logger.info(`${capsLockListener.getCodexKeyDisplayName()} released - stopping Codex voice recording`);
     if (windowManager.previousActiveWindow) {
       clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
+    }
+    if (process.platform === 'linux') {
+      await m5VoiceBridge.handleHostTriggerUp('keyboard');
+      return;
     }
     safeSendToMainWindow('codex-hold-up');
 
@@ -1086,6 +1151,7 @@ app.on("activate", () => {
 app.on("will-quit", () => {
   app.isQuitting = true;
   stopClipboardWatch();
+  pipeWirePlayback.stop("app_quit");
   m5VoiceBridge.stop();
   globalShortcut.unregisterAll();
   processMonitorManager.destroy();

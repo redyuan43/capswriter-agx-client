@@ -433,14 +433,14 @@ class AudioRoutingManager {
     };
   }
 
-  activateTrigger(triggerId) {
+  activateTrigger(triggerId, { fallbackToAvailable = true } = {}) {
     const sources = this.listSources();
     const sinks = this.listSinks();
     const route = this.resolveRoute(
       triggerId,
       sources,
       this.routesForSources(sources),
-      { fallbackToAvailable: true, sinks }
+      { fallbackToAvailable, sinks }
     );
     const activeRoute = {
       ...route,

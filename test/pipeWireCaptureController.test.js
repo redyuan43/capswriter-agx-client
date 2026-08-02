@@ -134,3 +134,35 @@ test("PipeWire capture retries when the first process produces no audio", async 
   assert.deepEqual(chunks, ["pcm"]);
   assert.equal(controller.stop("retry"), true);
 });
+
+test("PipeWire capture waits for asynchronous retry preparation before relaunching", async () => {
+  const children = [];
+  let finishPreparation;
+  const preparation = new Promise((resolve) => {
+    finishPreparation = resolve;
+  });
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.pid = children.length + 1;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      children.push(child);
+      return child;
+    },
+  });
+
+  controller.start("prepared-retry", "pipewire:source", () => {}, "", {
+    firstChunkRetryMs: 10,
+    maxStartAttempts: 2,
+    beforeRetry: () => preparation,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(children.length, 1);
+
+  finishPreparation();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(children.length, 2);
+  assert.equal(controller.stop("prepared-retry"), true);
+});

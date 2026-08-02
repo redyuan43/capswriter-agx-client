@@ -14,6 +14,11 @@ const M5DeviceCommandBroker = require("./m5DeviceCommandBroker");
 const PipeWireCaptureController = require("./pipeWireCaptureController");
 const PipeWireUnifiedSourceController = require("./pipeWireUnifiedSourceController");
 const BluetoothDeviceManager = require("./bluetoothDeviceManager");
+const {
+  MainRealtimeAsrSession,
+  extractText: extractMainAsrText,
+  usablePayload: isUsableMainAsrPayload,
+} = require("./mainRealtimeAsrSession");
 const { ENTER_FOLLOWUP } = require("./m5FollowupKeyDispatcher");
 
 const DEFAULT_HOST = "0.0.0.0";
@@ -37,14 +42,6 @@ const HOST_AUDIO_FAILURE_REASONS = new Set([
   "audio_input_stalled",
   "first_audio_chunk_timeout",
 ]);
-
-function pcm16HasSignal(value) {
-  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value || []);
-  for (let offset = 0; offset + 1 < buffer.length; offset += 2) {
-    if (buffer.readInt16LE(offset) !== 0) return true;
-  }
-  return buffer.length % 2 === 1 && buffer[buffer.length - 1] !== 0;
-}
 
 function cleanToken(value) {
   const token = String(value || "").trim();
@@ -145,6 +142,9 @@ function normalizeRecordingIntent(value, fallback = "dictation") {
   }
   if (["cyber_almanac", "almanac", "huangli", "alm"].includes(normalized)) {
     return "cyber_almanac";
+  }
+  if (normalized === "codex") {
+    return "codex";
   }
   return "dictation";
 }
@@ -257,10 +257,21 @@ function createPcmWavBuffer(chunks, sampleRate = 16000) {
 }
 
 class M5VoiceBridge {
-  constructor({ logger, windowManager, clipboardManager, databaseManager, sendToRenderer }) {
+  constructor({
+    logger,
+    windowManager,
+    clipboardManager,
+    databaseManager,
+    asrConnectionProfiles = null,
+    asrSessionFactory = null,
+    sendToRenderer,
+  }) {
     this.logger = logger;
     this.windowManager = windowManager;
     this.clipboardManager = clipboardManager;
+    this.databaseManager = databaseManager;
+    this.asrConnectionProfiles = asrConnectionProfiles;
+    this.asrSessionFactory = asrSessionFactory;
     this.sendToRenderer = sendToRenderer;
     this.server = null;
     this.recordingSessions = new M5RecordingSessions();
@@ -365,6 +376,7 @@ class M5VoiceBridge {
     }
     this.rendererRecovery = true;
     for (const session of this.sessions.values()) {
+      session.mainAsrSession?.cancel?.();
       this.finishSession(session, {
         success: false,
         status: "bridge_stopped",
@@ -1097,7 +1109,8 @@ loadBluetoothDevices();
       this.sendJson(res, 429, { success: false, error: "recording capacity reached" });
       return;
     }
-    let route = this.audioRouting.activateTrigger(triggerId);
+    const preparedTrigger = await this.activatePreparedTrigger(triggerId);
+    let route = preparedTrigger.route;
     const requestingSourceId = req.vibeDevice?.device_id
       ? `wifi:${req.vibeDevice.device_id}`
       : triggerId;
@@ -1107,12 +1120,26 @@ loadBluetoothDevices();
       : sourceId.startsWith("wifi:")
         ? "remote_device"
         : "host_capture";
-    let bluetoothAudioWake = null;
+    let bluetoothAudioWake = preparedTrigger.bluetooth_audio_wake;
     if (captureMode === "host_capture") {
-      const prepared = await this.prepareAudioRoute(route);
+      const prepared = bluetoothAudioWake
+        ? preparedTrigger
+        : await this.prepareAudioRoute(route);
       route = prepared.route;
       bluetoothAudioWake = prepared.bluetooth_audio_wake;
       sourceId = route.source_id || sourceId;
+      if (!route.available || !route.source?.node_name) {
+        this.audioRouting.clearActiveRoute(triggerId);
+        this.restoreUnifiedDefaultSource();
+        this.sendJson(res, 422, {
+          success: false,
+          recording: { status: "start_failed", session_id: sessionId },
+          error: "configured PipeWire input is unavailable",
+          route,
+          bluetooth_audio_wake: bluetoothAudioWake,
+        });
+        return;
+      }
     }
     this.windowManager?.showFloatingBall?.({ rememberActiveWindow: activeCount === 0 });
     const targetWindowId = String(this.windowManager?.previousActiveWindow || "").trim();
@@ -1128,11 +1155,13 @@ loadBluetoothDevices();
     session.sourceId = sourceId;
     session.captureMode = captureMode;
     session.bluetoothAudioWake = bluetoothAudioWake;
+    session.audioRoute = route;
     session.sourceDeviceId = sourceId.startsWith("wifi:") ? sourceId.slice(5) : "";
     session.source = body.source || "m5stickc_plus";
     session.audioSource = body.audio_source || "stickc_plus_pcm";
     session.protocolVersion = Math.max(1, Number(body.protocol_version || 1));
     session.seenChunkIds = new Set();
+    this.prepareMainAsrSession(session);
     this.armSessionWatchdogs(session);
     if (captureMode === "host_capture") {
       this.applyAudioRoute(route);
@@ -1141,7 +1170,7 @@ loadBluetoothDevices();
         sourceId,
         (chunk) => this.appendRecordingAudio(session, chunk),
         PipeWireUnifiedSourceController.UNIFIED_SOURCE_NAME,
-        { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
+        this.captureOptionsForSession(session)
       );
       session.capturePid = capture?.pid || null;
     } else {
@@ -1176,16 +1205,10 @@ loadBluetoothDevices();
   }
 
   appendRecordingAudio(session, body) {
-    const bluetoothHostCapture = session.captureMode === "host_capture" &&
-      String(session.sourceId || "").startsWith("pipewire:bluez_input.");
-    if (bluetoothHostCapture && !pcm16HasSignal(body)) {
-      session.silentBytes = Math.max(0, Number(session.silentBytes || 0)) + body.length;
-      session.silentChunks = Math.max(0, Number(session.silentChunks || 0)) + 1;
-      return false;
-    }
     if (!this.recordingSessions.appendAudio(session, body)) {
       return false;
     }
+    this.prepareMainAsrSession(session)?.sendPcm(body);
     if (!session.firstAudioAt) {
       session.firstAudioAt = session.lastAudioAt;
       if (session.captureMode === "host_capture") {
@@ -1197,18 +1220,10 @@ loadBluetoothDevices();
         bytes: body.length,
       });
     }
-    const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
     const dispatchedNow = !session.rendererDispatched &&
       this.dispatchRendererSessionIfIdle(session);
     if (dispatchedNow) {
       return true;
-    }
-    if (this.rendererSessionId === session.id) {
-      this.sendToRenderer("external-recording-chunk", {
-        session_id: session.id,
-        chunk,
-        byte_length: body.length,
-      });
     }
     return true;
   }
@@ -1265,15 +1280,224 @@ loadBluetoothDevices();
     };
   }
 
+  async activatePreparedTrigger(triggerId) {
+    const cleanTriggerId = String(triggerId || "").trim();
+    const configuredSourceId = String(
+      this.audioRouting.loadRoutes().routes?.[cleanTriggerId]?.source_id || ""
+    );
+    const wantsBluetoothInput =
+      configuredSourceId.startsWith("pipewire:bluez_input.") ||
+      (!configuredSourceId && cleanTriggerId.startsWith("minijoy_bt"));
+    if (!wantsBluetoothInput) {
+      return {
+        route: this.audioRouting.activateTrigger(cleanTriggerId),
+        bluetooth_audio_wake: null,
+      };
+    }
+    const compactMac = (
+      configuredSourceId.match(/bluez_input\.([0-9a-f_:-]{12,17})/i)?.[1] ||
+      cleanTriggerId.split(":").slice(1).join("")
+    ).replace(/[^0-9a-f]/gi, "").toUpperCase();
+    const defaultMac = normalizeBluetoothMac(
+      process.env.M5_MINIJOY_BLUETOOTH_MAC || DEFAULT_MINIJOY_BLUETOOTH_MAC
+    );
+    const normalizedMac = compactMac.length === 12 ? compactMac : defaultMac;
+    const mac = normalizedMac.match(/.{2}/g)?.join(":") || "";
+    let wake = mac
+      ? await this.bluetoothDevices.activateAudioProfile(mac, 3)
+      : { success: false, detail: "MiniJoy Bluetooth MAC is unavailable" };
+    if (mac && !wake.success) {
+      wake = await this.bluetoothDevices.resetAudioProfile(mac, 8);
+    }
+    const route = this.audioRouting.activateTrigger(cleanTriggerId, {
+      fallbackToAvailable: false,
+    });
+    if (!wake.success || !route.available || !route.source?.node_name) {
+      this.logger?.warn?.("MiniJoy PipeWire source unavailable after HFP wake", {
+        triggerId: cleanTriggerId,
+        mac,
+        wakeSuccess: wake.success,
+        wakeDetail: wake.detail || "",
+        sourceId: route.source_id || "",
+      });
+    }
+    return { route, bluetooth_audio_wake: wake };
+  }
+
+  captureOptionsForSession(session) {
+    const base = {
+      onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details),
+    };
+    const match = String(session?.sourceId || "")
+      .match(/bluez_input\.([0-9a-f_:-]{12,17})/i);
+    if (!match) return base;
+    const compactMac = match[1].replace(/[^0-9a-f]/gi, "").toUpperCase();
+    const mac = compactMac.length === 12 ? compactMac.match(/.{2}/g).join(":") : "";
+    return {
+      ...base,
+      firstChunkRetryMs: 3000,
+      maxStartAttempts: 2,
+      beforeRetry: async () => {
+        const reset = await this.bluetoothDevices.resetAudioProfile(mac, 8);
+        const route = this.audioRouting.activateTrigger(session.triggerId, {
+          fallbackToAvailable: false,
+        });
+        if (reset.success && route.available && route.source?.node_name) {
+          session.audioRoute = route;
+          this.applyAudioRoute(route);
+        }
+        this.logger?.[reset.success ? "info" : "warn"]?.(
+          "MiniJoy HFP profile reset before capture retry",
+          {
+            sessionId: session.id,
+            mac,
+            success: reset.success,
+            recovery: reset.recovery || "",
+            detail: reset.detail || "",
+          }
+        );
+      },
+    };
+  }
+
+  prepareMainAsrSession(session) {
+    if (!session || session.done || session.mainAsrSession || session.mainAsrDisabled) {
+      return session?.mainAsrSession || null;
+    }
+    if (!this.asrSessionFactory && !this.asrConnectionProfiles) {
+      session.mainAsrDisabled = true;
+      return null;
+    }
+    const translateMode = String(
+      this.databaseManager?.getSetting?.("voice_translate_mode", "transcribe") || "transcribe"
+    );
+    const translateTarget = String(
+      this.databaseManager?.getSetting?.("voice_translate_target", "zh") || "zh"
+    );
+    const options = {
+      connectionProvider: async () => this.asrConnectionProfiles?.getActiveConnection?.(),
+      logger: this.logger,
+      sampleRate: session.sampleRate || 16000,
+      optimizeMode: translateMode === "translate" ? "translate" : "none",
+      translateTarget,
+      onEvent: (payload) => {
+        const type = String(payload?.type || "").toLowerCase();
+        if (type === "ready" || type === "final") {
+          this.logger?.info?.(`Main-process realtime ASR ${type}`, {
+            sessionId: session.id,
+            requestId: payload?.request_id || null,
+            textLength: type === "final" ? extractMainAsrText(payload).length : 0,
+          });
+        }
+        if (type === "partial" || type === "ready") {
+          this.sendToRenderer("external-transcription-progress", {
+            session_id: session.id,
+            event: payload,
+          });
+        }
+      },
+    };
+    session.mainAsrSession = this.asrSessionFactory
+      ? this.asrSessionFactory(options, session)
+      : new MainRealtimeAsrSession(options);
+    session.mainAsrStartPromise = Promise.resolve(session.mainAsrSession.start())
+      .catch((error) => {
+        session.mainAsrError = error;
+        this.logger?.warn?.("Main-process realtime ASR failed to start", {
+          sessionId: session.id,
+          error: error?.message || String(error),
+        });
+        return null;
+      });
+    return session.mainAsrSession;
+  }
+
+  finalizeMainAsrSession(session) {
+    if (!session || session.done || session.mainAsrFinalizePromise) {
+      return session?.mainAsrFinalizePromise || null;
+    }
+    const asrSession = this.prepareMainAsrSession(session);
+    if (!asrSession) return null;
+    session.mainAsrFinalizePromise = (async () => {
+      await session.mainAsrStartPromise;
+      if (session.mainAsrError) throw session.mainAsrError;
+      const result = await asrSession.finish();
+      if (!isUsableMainAsrPayload(result)) {
+        throw new Error("Realtime ASR returned no usable result");
+      }
+      const text = extractMainAsrText(result);
+      this.sendToRenderer("external-recording-result", {
+        session_id: session.id,
+        result: {
+          ...result,
+          success: result?.success !== false,
+          text,
+          asr_text: result?.asr_text || result?.text || text,
+          file_size: session.bytes,
+        },
+      });
+      return result;
+    })().catch((error) => {
+      if (session.done || session.terminationStarted) return null;
+      const message = error?.message || String(error);
+      this.logger?.warn?.("Main-process realtime ASR finalization failed", {
+        sessionId: session.id,
+        error: message,
+      });
+      this.sendToRenderer("external-recording-result", {
+        session_id: session.id,
+        error: message,
+        result: {
+          success: false,
+          error: message,
+          text: "",
+          asr_text: "",
+          file_size: session.bytes,
+        },
+      });
+      return null;
+    });
+    return session.mainAsrFinalizePromise;
+  }
+
+  cancelConflictingLocalRecordings(triggerId, reason = "audio_route_handoff") {
+    const cancelled = [];
+    for (const session of [...this.sessions.values()]) {
+      if (
+        session.done ||
+        session.triggerId === triggerId ||
+        session.captureMode !== "host_capture"
+      ) {
+        continue;
+      }
+      if (this.terminateSession(session, {
+        success: true,
+        status: "cancelled",
+        cancelled: true,
+        reason,
+        message: "Recording cancelled because another local audio route took over",
+      })) {
+        cancelled.push(session.id);
+      }
+    }
+    return cancelled;
+  }
+
   restoreUnifiedDefaultSource() {
     const sources = this.audioRouting.listSources();
     const sinks = this.audioRouting.listSinks();
     const saved = this.audioRouting.routesForSources(sources);
-    const triggerId = this.audioRouting.latestActiveRoute()?.trigger_id || "keyboard";
-    const route = this.audioRouting.resolveRoute(triggerId, sources, saved, {
-      fallbackToAvailable: true,
-      sinks,
-    });
+    const activeRoute = this.audioRouting.latestActiveRoute();
+    const triggerId = activeRoute?.trigger_id || "keyboard";
+    const route = this.audioRouting.resolveRoute(
+      triggerId,
+      sources,
+      activeRoute ? saved : { version: 3, routes: {} },
+      {
+        fallbackToAvailable: true,
+        sinks,
+      }
+    );
     if (route.available || route.output_available) {
       return this.applyAudioRoute(route, {
         activateInput: route.source?.kind === "pipewire",
@@ -1531,6 +1755,12 @@ loadBluetoothDevices();
     return this.audioRouting.usesSystemDefaultCapture(triggerId);
   }
 
+  resolveOutputSinkNodeName(triggerId = "keyboard") {
+    const state = this.audioRouting.getState();
+    const route = state.routes?.[triggerId] || state.routes?.keyboard;
+    return String(route?.sink?.node_name || "").trim();
+  }
+
   async handleAudioRoutingUpdate(req, res) {
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     this.audioRouting.saveRoutes(body);
@@ -1571,7 +1801,7 @@ loadBluetoothDevices();
     this.sendJson(res, 200, { success: true, acknowledgement });
   }
 
-  async handleHostTriggerDown(triggerId, targetWindowId = "") {
+  async handleHostTriggerDown(triggerId, targetWindowId = "", options = {}) {
     if (this.hostTriggerSessions.has(triggerId)) {
       const sessionId = this.hostTriggerSessions.get(triggerId);
       return { handled: true, duplicate: true, session_id: sessionId };
@@ -1580,9 +1810,12 @@ loadBluetoothDevices();
     if (activeCount >= MAX_CONCURRENT_RECORDINGS) {
       return { handled: false, busy: true };
     }
-    let route = this.audioRouting.activateTrigger(triggerId);
+    const preparedTrigger = await this.activatePreparedTrigger(triggerId);
+    let route = preparedTrigger.route;
     if (!route.source_id.startsWith("wifi:")) {
-      const prepared = await this.prepareAudioRoute(route);
+      const prepared = preparedTrigger.bluetooth_audio_wake
+        ? preparedTrigger
+        : await this.prepareAudioRoute(route);
       route = prepared.route;
       if (route.available && route.source.node_name) {
         this.applyAudioRoute(route);
@@ -1592,12 +1825,15 @@ loadBluetoothDevices();
       }
 
       const sessionId = randomUUID().replace(/-/g, "");
+      const intent = normalizeRecordingIntent(options.intent, "dictation");
       const session = this.createHostRecordingSession({
         sessionId,
         triggerId,
         route,
         targetWindowId,
         captureMode: "host_capture",
+        intent,
+        mode: String(options.mode || intent),
       });
       session.bluetoothAudioWake = prepared.bluetooth_audio_wake;
       const capture = this.pipeWireCapture.start(
@@ -1605,7 +1841,7 @@ loadBluetoothDevices();
         route.source_id,
         (chunk) => this.appendRecordingAudio(session, chunk),
         PipeWireUnifiedSourceController.UNIFIED_SOURCE_NAME,
-        { onUnexpectedExit: (details) => this.abortSession(session, "audio_capture_exited", details) }
+        this.captureOptionsForSession(session)
       );
       session.capturePid = capture?.pid || null;
       return { handled: true, route, session_id: sessionId };
@@ -1614,6 +1850,7 @@ loadBluetoothDevices();
     this.applyAudioRoute(route, { activateInput: false });
     const sessionId = randomUUID().replace(/-/g, "");
     const sourceDeviceId = route.source_id.slice(5);
+    const intent = normalizeRecordingIntent(options.intent, "dictation");
     this.createHostRecordingSession({
       sessionId,
       triggerId,
@@ -1621,14 +1858,16 @@ loadBluetoothDevices();
       targetWindowId,
       captureMode: "remote_device",
       sourceDeviceId,
+      intent,
+      mode: String(options.mode || intent),
     });
     this.commandBroker.enqueue(sourceDeviceId, {
       type: "recording_start",
       payload: {
         session_id: sessionId,
         trigger_id: triggerId,
-        intent: "dictation",
-        mode: "dictation",
+        intent,
+        mode: String(options.mode || intent),
       },
     });
     return { handled: true, route, session_id: sessionId };
@@ -1641,11 +1880,13 @@ loadBluetoothDevices();
     targetWindowId,
     captureMode,
     sourceDeviceId = "",
+    intent = "dictation",
+    mode = intent,
   }) {
     const session = this.recordingSessions.create({
       id: sessionId,
-      intent: "dictation",
-      mode: "dictation",
+      intent,
+      mode,
       targetWindowId,
       ownerDeviceId: triggerId,
       triggerId,
@@ -1655,11 +1896,13 @@ loadBluetoothDevices();
       sourceId: route.source_id,
       sourceDeviceId,
       captureMode,
+      audioRoute: route,
       seenChunkIds: new Set(),
     });
     this.hostTriggerSessions.set(triggerId, sessionId);
     session.source = "audio_router";
     session.audioSource = route.source_id;
+    this.prepareMainAsrSession(session);
     this.armRendererSessionIfIdle(session);
     this.armSessionWatchdogs(session);
     return session;
@@ -1830,17 +2073,6 @@ loadBluetoothDevices();
     this.rendererSessionId = session.id;
     session.rendererDispatched = true;
     this.sendToRenderer("external-recording-start", this.rendererStartPayload(session));
-    if (session.bytes > 0 && session.pcmFile) {
-      const pcm = fs.readFileSync(session.pcmFile);
-      for (let offset = 0; offset < pcm.length; offset += MAX_AUDIO_CHUNK_BYTES) {
-        const chunk = pcm.subarray(offset, Math.min(offset + MAX_AUDIO_CHUNK_BYTES, pcm.length));
-        this.sendToRenderer("external-recording-chunk", {
-          session_id: session.id,
-          chunk,
-          byte_length: chunk.length,
-        });
-      }
-    }
     if (session.rendererStopped) this.dispatchRendererStop(session);
     return true;
   }
@@ -1858,6 +2090,7 @@ loadBluetoothDevices();
       bytes: session.bytes,
       chunks: session.chunks,
     });
+    this.finalizeMainAsrSession(session);
   }
 
   advanceRendererQueue() {
@@ -2020,6 +2253,7 @@ loadBluetoothDevices();
     if (!session || session.done || session.terminationStarted) return false;
     session.terminationStarted = true;
     if (session.watchdogTimer) clearTimeout(session.watchdogTimer);
+    session.mainAsrSession?.cancel?.();
     this.pipeWireCapture.stop(session.id);
     for (const [triggerId, sessionId] of this.hostTriggerSessions.entries()) {
       if (sessionId === session.id) this.hostTriggerSessions.delete(triggerId);
@@ -2397,6 +2631,5 @@ module.exports.selectCyberAgentCommand = selectCyberAgentCommand;
 module.exports.crc32 = crc32;
 module.exports.crc32Hex = crc32Hex;
 module.exports.createPcmWavBuffer = createPcmWavBuffer;
-module.exports.pcm16HasSignal = pcm16HasSignal;
 module.exports.withoutNestedBridgeState = withoutNestedBridgeState;
 module.exports.diagnosticMatchesTarget = diagnosticMatchesTarget;

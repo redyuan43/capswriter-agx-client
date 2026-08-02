@@ -7,14 +7,8 @@ const M5VoiceBridge = require("../src/helpers/m5VoiceBridge");
 const {
   crc32Hex,
   diagnosticMatchesTarget,
-  pcm16HasSignal,
   withoutNestedBridgeState,
 } = M5VoiceBridge;
-
-test("PCM signal detection rejects silence without hiding real samples", () => {
-  assert.equal(pcm16HasSignal(Buffer.alloc(640)), false);
-  assert.equal(pcm16HasSignal(Buffer.from([0, 0, 1, 0])), true);
-});
 
 test("diagnostic state strips nested bridge snapshots", () => {
   assert.deepEqual(withoutNestedBridgeState({
@@ -98,7 +92,7 @@ function requestBuffer(port, path, body, headers = {}) {
   });
 }
 
-async function startBridge(t, sendToRenderer = () => {}) {
+async function startBridge(t, sendToRenderer = () => {}, options = {}) {
   const commands = [];
   const bridge = new M5VoiceBridge({
     logger: { warn() {}, error() {}, info() {} },
@@ -107,6 +101,8 @@ async function startBridge(t, sendToRenderer = () => {}) {
       showFloatingBall() {},
     },
     clipboardManager: { setTargetWindow() {} },
+    databaseManager: options.databaseManager,
+    asrSessionFactory: options.asrSessionFactory,
     sendToRenderer,
   });
   bridge.port = 0;
@@ -404,7 +400,6 @@ test("M5 starts renderer ASR only after the first accepted audio chunk", async (
   );
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-start",
-    "external-recording-chunk",
   ]);
   bridge.abortAllSessions("test_cleanup");
 });
@@ -508,10 +503,10 @@ test("simultaneous device recordings stay isolated and reach the renderer serial
   await waitFor(() => assert.ok(rendererEvents.some((event) =>
     event.eventName === "external-recording-stop" && event.payload.session_id === "serial-b"
   )));
-  const replayedB = rendererEvents.find((event) =>
-    event.eventName === "external-recording-chunk" && event.payload.session_id === "serial-b"
+  assert.equal(
+    rendererEvents.some((event) => event.eventName === "external-recording-chunk"),
+    false
   );
-  assert.equal(Buffer.from(replayedB.payload.chunk).toString("hex"), "0202");
   await bridge.handleRendererResult({ session_id: "serial-b", success: true, status: "pasted", text: "b" });
   assert.equal((await stopA).statusCode, 200);
   assert.equal((await stopB).statusCode, 200);
@@ -593,6 +588,90 @@ test("audio routes apply input and output independently", async (t) => {
   assert.equal(remoteResult.output_applied, true);
 });
 
+test("idle audio restore ignores a saved Bluetooth keyboard route", async (t) => {
+  const { bridge } = await startBridge(t);
+  const usbSource = {
+    source_id: "pipewire:alsa_input.usb-mi-speakphone",
+    kind: "pipewire",
+    node_name: "alsa_input.usb-mi-speakphone",
+    name: "MI Speakphone Mono",
+    online: true,
+    transport_available: true,
+  };
+  const bluetoothSource = {
+    source_id: "pipewire:bluez_input.14_08_08_52_F9_62",
+    kind: "pipewire",
+    node_name: "bluez_input.14_08_08_52_F9_62.0",
+    name: "VibeStick MiniJoy F9:62",
+    online: true,
+    transport_available: true,
+    bluetooth: true,
+    bluetooth_address: "14080852f962",
+  };
+  const sink = {
+    sink_id: "pipewire-sink:alsa_output.usb-mi-speakphone",
+    kind: "pipewire",
+    node_name: "alsa_output.usb-mi-speakphone",
+    name: "MI Speakphone Digital Stereo (IEC958)",
+    base_name: "MI Speakphone Digital Stereo (IEC958)",
+    online: true,
+    transport_available: true,
+  };
+  bridge.audioRouting.listSources = () => [usbSource, bluetoothSource];
+  bridge.audioRouting.listSinks = () => [sink];
+  bridge.audioRouting.routesForSources = () => ({
+    version: 3,
+    routes: {
+      keyboard: {
+        source_id: bluetoothSource.source_id,
+        sink_id: sink.sink_id,
+        pipeline_id: "default",
+      },
+    },
+  });
+  bridge.audioRouting.latestActiveRoute = () => null;
+  let appliedRoute = null;
+  bridge.applyAudioRoute = (route) => {
+    appliedRoute = route;
+    return { route };
+  };
+
+  bridge.restoreUnifiedDefaultSource();
+
+  assert.equal(appliedRoute.source_id, usbSource.source_id);
+  assert.equal(appliedRoute.sink_id, sink.sink_id);
+});
+
+test("keyboard route takeover cancels only conflicting local captures", async (t) => {
+  const { bridge } = await startBridge(t);
+  const localSession = {
+    id: "local-minijoy",
+    done: false,
+    triggerId: "minijoy_bt:14080852f962",
+    captureMode: "host_capture",
+  };
+  const remoteSession = {
+    id: "remote-wifi",
+    done: false,
+    triggerId: "wifi:stick-a",
+    captureMode: "remote_device",
+  };
+  bridge.sessions.set(localSession.id, localSession);
+  bridge.sessions.set(remoteSession.id, remoteSession);
+  const terminated = [];
+  bridge.terminateSession = (session, result) => {
+    terminated.push({ session, result });
+    return true;
+  };
+
+  const cancelled = bridge.cancelConflictingLocalRecordings("keyboard");
+
+  assert.deepEqual(cancelled, ["local-minijoy"]);
+  assert.equal(terminated.length, 1);
+  assert.equal(terminated[0].session, localSession);
+  assert.equal(terminated[0].result.reason, "audio_route_handoff");
+});
+
 test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capture", async (t) => {
   const { bridge } = await startBridge(t);
   const calls = [];
@@ -628,7 +707,7 @@ test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capt
   const result = await bridge.handleHostTriggerDown("minijoy_bt:14080852f962", "42");
 
   assert.equal(result.handled, true);
-  assert.equal(result.route.source.node_name, "bluez_input.14_08_08_52_F9_62.1");
+  assert.equal(result.route.source.node_name, "bluez_input.14_08_08_52_F9_62.0");
   assert.deepEqual(calls, [
     {
       type: "wake",
@@ -637,7 +716,7 @@ test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capt
     },
     {
       type: "route",
-      sourceNodeName: "bluez_input.14_08_08_52_F9_62.1",
+      sourceNodeName: "bluez_input.14_08_08_52_F9_62.0",
     },
     {
       type: "capture",
@@ -701,10 +780,11 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   emitChunk(Buffer.alloc(640));
   assert.equal(
     bridge.audioRouting.captureHealthFor("pipewire:bluez_input.C8_85_41_68_39_0A").status,
-    "unknown"
+    "healthy"
   );
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-armed",
+    "external-recording-start",
   ]);
   emitChunk(Buffer.from([1, 2, 3, 4]));
   assert.equal(
@@ -721,12 +801,10 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-armed",
     "external-recording-start",
-    "external-recording-chunk",
     "external-recording-stop",
   ]);
-  assert.equal(rendererEvents[3].payload.bytes, 4);
-  assert.equal(rendererEvents[3].payload.chunks, 1);
-  assert.equal(bridge.sessions.get(started.session_id).silentBytes, 640);
+  assert.equal(rendererEvents[2].payload.bytes, 644);
+  assert.equal(rendererEvents[2].payload.chunks, 2);
 });
 
 test("concurrent host triggers arm only the renderer-owned session", async (t) => {
@@ -865,6 +943,42 @@ test("MiniJoy host capture with no PCM records an audio failure but remains retr
   );
 });
 
+test("unavailable MiniJoy input is rejected instead of falling back to the PC microphone", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  bridge.bluetoothDevices.activateAudioProfile = async () => ({
+    success: false,
+    detail: "device unavailable",
+  });
+  bridge.audioRouting.activateTrigger = () => ({
+    trigger_id: "minijoy_bt:14080852f962",
+    source_id: "pipewire:bluez_input.14_08_08_52_F9_62",
+    source: {
+      source_id: "pipewire:bluez_input.14_08_08_52_F9_62",
+      kind: "pipewire",
+      online: false,
+    },
+    sink: { node_name: "alsa_output.usb-mi-speaker" },
+    available: false,
+    output_available: true,
+  });
+  bridge.restoreUnifiedDefaultSource = () => {};
+
+  const response = await requestJson(port, "/recording/start", {
+    method: "POST",
+    body: {
+      session_id: "minijoy-unavailable",
+      trigger_id: "minijoy_bt:14080852f962",
+      intent: "dictation",
+    },
+  });
+  const payload = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(payload.success, false);
+  assert.equal(payload.error, "configured PipeWire input is unavailable");
+  assert.equal(bridge.sessions.has("minijoy-unavailable"), false);
+});
+
 test("keyboard host trigger captures native USB PCM without browser recording", async (t) => {
   const rendererEvents = [];
   const { bridge } = await startBridge(t, (eventName, payload) => {
@@ -903,10 +1017,66 @@ test("keyboard host trigger captures native USB PCM without browser recording", 
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-armed",
     "external-recording-start",
-    "external-recording-chunk",
     "external-recording-stop",
   ]);
-  assert.equal(rendererEvents[3].payload.bytes, 4);
+  assert.equal(rendererEvents[2].payload.bytes, 4);
+});
+
+test("native PipeWire PCM stays in main process and returns only ASR text", async (t) => {
+  const rendererEvents = [];
+  const pcm = [];
+  const asr = {
+    start: async () => ({ type: "ready" }),
+    sendPcm(chunk) {
+      pcm.push(Buffer.from(chunk));
+    },
+    finish: async () => ({ type: "final", success: true, text: "主进程识别" }),
+    cancel() {},
+  };
+  const { bridge } = await startBridge(
+    t,
+    (eventName, payload) => rendererEvents.push({ eventName, payload }),
+    { asrSessionFactory: () => asr }
+  );
+  bridge.audioRouting.activateTrigger = () => ({
+    trigger_id: "keyboard",
+    source_id: "pipewire:alsa_input.usb-mi-speakphone",
+    source: {
+      kind: "pipewire",
+      node_name: "alsa_input.usb-mi-speakphone.4",
+      online: true,
+    },
+    sink: { node_name: "alsa_output.usb-mi-speaker" },
+    available: true,
+    output_available: true,
+  });
+  bridge.audioRouting.clearActiveRoute = () => {};
+  bridge.pipeWireUnifiedSource.activate = () => {};
+  bridge.restoreUnifiedDefaultSource = () => {};
+  let emitChunk;
+  bridge.pipeWireCapture.start = (_sessionId, _sourceId, onChunk) => {
+    emitChunk = onChunk;
+    return {};
+  };
+  bridge.pipeWireCapture.stop = () => true;
+
+  const started = await bridge.handleHostTriggerDown("keyboard", "42");
+  emitChunk(Buffer.from([1, 2, 3, 4]));
+  await bridge.handleHostTriggerUp("keyboard");
+  await waitFor(() => assert.ok(rendererEvents.some(
+    (event) => event.eventName === "external-recording-result"
+  )));
+
+  assert.deepEqual(Buffer.concat(pcm), Buffer.from([1, 2, 3, 4]));
+  assert.equal(
+    rendererEvents.some((event) => event.eventName === "external-recording-chunk"),
+    false
+  );
+  const result = rendererEvents.find(
+    (event) => event.eventName === "external-recording-result"
+  );
+  assert.equal(result.payload.session_id, started.session_id);
+  assert.equal(result.payload.result.text, "主进程识别");
 });
 
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {

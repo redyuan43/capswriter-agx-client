@@ -1,5 +1,6 @@
 const MAC_PATTERN = /^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$/;
 const MINIJOY_HFP_PROFILE = "headset-head-unit-cvsd";
+const MINIJOY_HFP_UUID = "0000111e-0000-1000-8000-00805f9b34fb";
 
 function normalizeMac(value) {
   const compact = String(value || "").toUpperCase().replace(/[^0-9A-F]/g, "");
@@ -95,7 +96,38 @@ class BluetoothDeviceManager {
   }
 
   async activateAudioProfile(mac, attempts = 8) {
-    const cardName = pipeWireCardName(mac);
+    const normalizedMac = normalizeMac(mac);
+    const cardName = pipeWireCardName(normalizedMac);
+    if (!normalizedMac) {
+      return {
+        success: false,
+        card_name: "",
+        profile: MINIJOY_HFP_PROFILE,
+        detail: "invalid Bluetooth MAC",
+      };
+    }
+    let device = await this.info(normalizedMac);
+    let connectResult = null;
+    if (!device.connected) {
+      connectResult = await this.runCommand(
+        "bluetoothctl",
+        ["--timeout", "12", "connect", normalizedMac],
+        15000
+      );
+      for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
+        device = await this.info(normalizedMac);
+        if (device.connected) break;
+        if (attempt + 1 < attempts) await this.wait(500);
+      }
+      if (!device.connected) {
+        return {
+          success: false,
+          card_name: cardName,
+          profile: MINIJOY_HFP_PROFILE,
+          detail: commandText(connectResult) || "Bluetooth transport did not reconnect",
+        };
+      }
+    }
     let result = null;
     for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
       result = await this.runCommand(
@@ -117,6 +149,78 @@ class BluetoothDeviceManager {
       card_name: cardName,
       profile: MINIJOY_HFP_PROFILE,
       detail: commandText(result),
+    };
+  }
+
+  async resetAudioProfile(mac, attempts = 8) {
+    const normalizedMac = normalizeMac(mac);
+    if (!normalizedMac) {
+      return {
+        success: false,
+        profile: MINIJOY_HFP_PROFILE,
+        detail: "invalid Bluetooth MAC",
+      };
+    }
+    const devicePath = `/org/bluez/hci0/dev_${normalizedMac.replace(/:/g, "_")}`;
+    await this.runCommand("busctl", [
+      "--system",
+      "--timeout=2s",
+      "call",
+      "org.bluez",
+      devicePath,
+      "org.bluez.Device1",
+      "DisconnectProfile",
+      "s",
+      MINIJOY_HFP_UUID,
+    ], 3000);
+    await this.wait(300);
+    await this.runCommand("busctl", [
+      "--system",
+      "--timeout=2s",
+      "call",
+      "org.bluez",
+      devicePath,
+      "org.bluez.Device1",
+      "ConnectProfile",
+      "s",
+      MINIJOY_HFP_UUID,
+    ], 3000);
+    await this.wait(500);
+    const profileReset = await this.activateAudioProfile(
+      normalizedMac,
+      Math.min(2, Math.max(1, attempts))
+    );
+    if (profileReset.success) {
+      return {
+        ...profileReset,
+        recovery: "hfp_profile_reset",
+      };
+    }
+
+    const disconnectResult = await this.runCommand(
+      "bluetoothctl",
+      ["disconnect", normalizedMac],
+      12000
+    );
+    await this.wait(500);
+    const connectResult = await this.runCommand(
+      "bluetoothctl",
+      ["--timeout", "15", "connect", normalizedMac],
+      18000
+    );
+    await this.wait(500);
+    const transportReset = await this.activateAudioProfile(normalizedMac, attempts);
+    return {
+      ...transportReset,
+      recovery: "device_transport_reconnect",
+      ...(transportReset.success ? {} : {
+        detail: [
+          profileReset.detail,
+          commandText(disconnectResult),
+          commandText(connectResult),
+          transportReset.detail,
+        ].filter(Boolean).join("\n"),
+      }),
     };
   }
 
@@ -217,3 +321,4 @@ module.exports.bluetoothCommandSucceeded = bluetoothCommandSucceeded;
 module.exports.pairingArgs = pairingArgs;
 module.exports.pipeWireCardName = pipeWireCardName;
 module.exports.MINIJOY_HFP_PROFILE = MINIJOY_HFP_PROFILE;
+module.exports.MINIJOY_HFP_UUID = MINIJOY_HFP_UUID;

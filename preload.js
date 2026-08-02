@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 // 暴露安全的API给渲染进程
 contextBridge.exposeInMainWorld("electronAPI", {
+  getPlatform: () => process.platform,
   rendererHeartbeat: () => ipcRenderer.send("renderer-heartbeat"),
   // 窗口控制
   hideWindow: () => ipcRenderer.invoke("hide-window"),
@@ -135,12 +136,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("external-recording-armed", listener);
   },
 
-  onExternalRecordingChunk: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("external-recording-chunk", listener);
-    return () => ipcRenderer.removeListener("external-recording-chunk", listener);
-  },
-
   onExternalRecordingStop: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("external-recording-stop", listener);
@@ -159,8 +154,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("external-recording-error", listener);
   },
 
+  onExternalTranscriptionProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-transcription-progress", listener);
+    return () => ipcRenderer.removeListener("external-transcription-progress", listener);
+  },
+
+  onExternalRecordingResult: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-result", listener);
+    return () => ipcRenderer.removeListener("external-recording-result", listener);
+  },
+
   reportExternalRecordingResult: (payload) =>
     ipcRenderer.invoke("m5-voice-recording-result", payload),
+  playPipeWireAudio: (payload) => ipcRenderer.invoke("play-pipewire-audio", payload),
+  stopPipeWireAudio: (reason) => ipcRenderer.invoke("stop-pipewire-audio", reason),
   repairM5BluetoothDevice: (mac) =>
     ipcRenderer.invoke("repair-m5-bluetooth-device", mac),
 

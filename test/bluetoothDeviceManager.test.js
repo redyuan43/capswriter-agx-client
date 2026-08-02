@@ -10,6 +10,7 @@ const {
   pairingArgs,
   pipeWireCardName,
   MINIJOY_HFP_PROFILE,
+  MINIJOY_HFP_UUID,
 } = BluetoothDeviceManager;
 
 const MAC = "C8:85:41:68:39:0A";
@@ -58,6 +59,138 @@ test("Bluetooth command output can report a pairing failure despite a zero exit 
   ]);
   assert.equal(pipeWireCardName(MAC), "bluez_card.C8_85_41_68_39_0A");
   assert.equal(MINIJOY_HFP_PROFILE, "headset-head-unit-cvsd");
+});
+
+test("Bluetooth audio reset reconnects only the HFP profile before selecting CVSD", async () => {
+  const commands = [];
+  const waits = [];
+  const manager = new BluetoothDeviceManager({
+    wait: async (milliseconds) => waits.push(milliseconds),
+    runCommand: async (command, args) => {
+      commands.push([command, ...args]);
+      if (command === "bluetoothctl" && args[0] === "info") {
+        return {
+          success: true,
+          stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: yes\n  Bonded: yes\n  Trusted: yes\n  Connected: yes`,
+        };
+      }
+      return { success: true, stdout: "" };
+    },
+  });
+
+  const result = await manager.resetAudioProfile(MAC, 1);
+
+  assert.equal(result.success, true);
+  assert.equal(result.recovery, "hfp_profile_reset");
+  assert.deepEqual(commands[0], [
+    "busctl",
+    "--system",
+    "--timeout=2s",
+    "call",
+    "org.bluez",
+    "/org/bluez/hci0/dev_C8_85_41_68_39_0A",
+    "org.bluez.Device1",
+    "DisconnectProfile",
+    "s",
+    MINIJOY_HFP_UUID,
+  ]);
+  assert.deepEqual(commands[1], [
+    "busctl",
+    "--system",
+    "--timeout=2s",
+    "call",
+    "org.bluez",
+    "/org/bluez/hci0/dev_C8_85_41_68_39_0A",
+    "org.bluez.Device1",
+    "ConnectProfile",
+    "s",
+    MINIJOY_HFP_UUID,
+  ]);
+  assert.equal(commands.some((command) => command.includes("disconnect")), false);
+  assert.deepEqual(waits, [300, 500]);
+});
+
+test("Bluetooth audio reset falls back to one device transport reconnect", async () => {
+  const commands = [];
+  let transportReconnected = false;
+  const manager = new BluetoothDeviceManager({
+    wait: async () => {},
+    runCommand: async (command, args) => {
+      commands.push([command, ...args]);
+      if (command === "bluetoothctl" && args[0] === "info") {
+        return {
+          success: true,
+          stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: yes\n  Bonded: yes\n  Trusted: yes\n  Connected: yes`,
+        };
+      }
+      if (command === "bluetoothctl" && args.includes("connect")) {
+        transportReconnected = true;
+        return { success: true, stdout: "Connection successful" };
+      }
+      if (command === "pactl") {
+        return transportReconnected
+          ? { success: true, stdout: "" }
+          : { success: false, stderr: "Failure: No such entity" };
+      }
+      return { success: true, stdout: "" };
+    },
+  });
+
+  const result = await manager.resetAudioProfile(MAC, 2);
+
+  assert.equal(result.success, true);
+  assert.equal(result.recovery, "device_transport_reconnect");
+  assert.deepEqual(commands.find((command) => command[1] === "disconnect"), [
+    "bluetoothctl",
+    "disconnect",
+    MAC,
+  ]);
+  assert.deepEqual(commands.find((command) => command.includes("connect")), [
+    "bluetoothctl",
+    "--timeout",
+    "15",
+    "connect",
+    MAC,
+  ]);
+});
+
+test("Bluetooth audio activation reconnects an idle paired MiniJoy before selecting CVSD", async () => {
+  const commands = [];
+  let connected = false;
+  const manager = new BluetoothDeviceManager({
+    wait: async () => {},
+    runCommand: async (command, args) => {
+      commands.push([command, ...args]);
+      if (command === "bluetoothctl" && args[0] === "info") {
+        return {
+          success: true,
+          stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: yes\n  Bonded: yes\n  Trusted: yes\n  Connected: ${connected ? "yes" : "no"}`,
+        };
+      }
+      if (command === "bluetoothctl" && args.includes("connect")) {
+        connected = true;
+        return { success: true, stdout: "Connection successful" };
+      }
+      return { success: true, stdout: "" };
+    },
+  });
+
+  const result = await manager.activateAudioProfile(MAC, 2);
+
+  assert.equal(result.success, true);
+  assert.deepEqual(commands.find((command) => command.includes("connect")), [
+    "bluetoothctl",
+    "--timeout",
+    "12",
+    "connect",
+    MAC,
+  ]);
+  assert.deepEqual(commands.find((command) => command[0] === "pactl"), [
+    "pactl",
+    "set-card-profile",
+    "bluez_card.C8_85_41_68_39_0A",
+    "headset-head-unit-cvsd",
+  ]);
 });
 
 test("confirmed Bluetooth cleanup removes only the requested MAC before pairing", async () => {

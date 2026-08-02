@@ -9,7 +9,7 @@ class PipeWireCaptureController {
   constructor({
     logger = null,
     spawnProcess = spawn,
-    firstChunkRetryMs = 300,
+    firstChunkRetryMs = 1000,
     maxStartAttempts = 3,
   } = {}) {
     this.logger = logger;
@@ -38,6 +38,14 @@ class PipeWireCaptureController {
       attempt: 0,
       receivedAudio: false,
     };
+    const firstChunkRetryMs = Math.max(
+      1,
+      Number(options.firstChunkRetryMs || this.firstChunkRetryMs)
+    );
+    const maxStartAttempts = Math.max(
+      1,
+      Number(options.maxStartAttempts || this.maxStartAttempts)
+    );
     this.captures.set(id, capture);
 
     const clearRetryTimer = () => {
@@ -94,7 +102,7 @@ class PipeWireCaptureController {
           this.captures.delete(id);
           return;
         }
-        if (!capture.receivedAudio && capture.attempt < this.maxStartAttempts) {
+        if (!capture.receivedAudio && capture.attempt < maxStartAttempts) {
           launch();
           return;
         }
@@ -120,7 +128,7 @@ class PipeWireCaptureController {
         if (capture.child !== child || this.captures.get(id) !== capture) return;
         clearRetryTimer();
         if (!capture.stopping && !capture.receivedAudio &&
-            capture.attempt < this.maxStartAttempts) {
+            capture.attempt < maxStartAttempts) {
           launch();
           return;
         }
@@ -143,15 +151,30 @@ class PipeWireCaptureController {
       capture.retryTimer = setTimeout(() => {
         capture.retryTimer = null;
         if (capture.stopping || capture.child !== child || capture.receivedAudio) return;
-        if (capture.attempt >= this.maxStartAttempts) return;
+        if (capture.attempt >= maxStartAttempts) return;
         this.logger?.warn?.("PipeWire capture produced no audio, retrying", {
           sessionId: id,
           sourceId,
           attempt: capture.attempt,
         });
-        launch();
-        child.kill?.("SIGTERM");
-      }, this.firstChunkRetryMs);
+        Promise.resolve(options.beforeRetry?.({
+          sessionId: id,
+          sourceId,
+          attempt: capture.attempt,
+        })).catch((error) => {
+          this.logger?.warn?.("PipeWire capture retry preparation failed", {
+            sessionId: id,
+            sourceId,
+            error: error?.message || String(error),
+          });
+        }).finally(() => {
+          if (capture.stopping || capture.child !== child || this.captures.get(id) !== capture) {
+            return;
+          }
+          launch();
+          child.kill?.("SIGTERM");
+        });
+      }, firstChunkRetryMs);
       capture.retryTimer.unref?.();
     };
 
