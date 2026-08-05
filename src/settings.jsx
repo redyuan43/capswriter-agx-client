@@ -2,11 +2,10 @@ import { lazy, Suspense, useState, useEffect, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import { toast, Toaster } from "sonner";
-import { Activity, Settings, X, Loader2, Play, Circle, History, Link2, Radio, Server, BookOpenCheck } from "lucide-react";
+import { Settings, X, Loader2, Play, Circle, History, Radio, Server, BookOpenCheck } from "lucide-react";
 import { usePermissions } from "./hooks/usePermissions";
 import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
 
-const ProcessMonitorPanel = lazy(() => import("./components/ProcessMonitorPanel"));
 const TranslatedHistory = lazy(() => import("./components/TranslatedHistory"));
 const M5BridgePanel = lazy(() => import("./components/M5BridgePanel"));
 const AsrConnectionPanel = lazy(() => import("./components/AsrConnectionPanel"));
@@ -30,7 +29,7 @@ const VOICE_TRANSLATE_ZH = "zh";
 
 function initialSettingsTab() {
   const tab = new URLSearchParams(window.location.search).get("tab");
-  return ["bridge", "asr", "monitor"].includes(tab) ? tab : "settings";
+  return ["bridge", "asr"].includes(tab) ? tab : "settings";
 }
 
 function PanelLoading() {
@@ -201,12 +200,6 @@ const SettingsPage = () => {
   const handleClose = () => {
     if (window.electronAPI) {
       window.electronAPI.hideSettingsWindow();
-    }
-  };
-
-  const handleOpenLinkDirectory = () => {
-    if (window.electronAPI?.openLinkDirectoryWindow) {
-      window.electronAPI.openLinkDirectoryWindow();
     }
   };
 
@@ -399,13 +392,6 @@ const SettingsPage = () => {
           </div>
           <div className="flex items-center space-x-2">
             <button
-              onClick={handleOpenLinkDirectory}
-              className="px-3 py-1.5 text-sm flex items-center gap-1.5 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-            >
-              <Link2 className="w-4 h-4" />
-              语音链接表
-            </button>
-            <button
               onClick={() => setActiveTab(activeTab === 'bridge' ? 'settings' : 'bridge')}
               className={`px-3 py-1.5 text-sm flex items-center gap-1.5 rounded-lg transition-colors ${activeTab === 'bridge' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
             >
@@ -425,13 +411,6 @@ const SettingsPage = () => {
             >
               <BookOpenCheck className="w-4 h-4" />
               ASR 管理
-            </button>
-            <button
-              onClick={() => setActiveTab('monitor')}
-              className={`px-3 py-1.5 text-sm flex items-center gap-1.5 rounded-lg transition-colors ${activeTab === 'monitor' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
-            >
-              <Activity className="w-4 h-4" />
-              进程监控
             </button>
             <button
               onClick={() => setActiveTab('history')}
@@ -461,12 +440,6 @@ const SettingsPage = () => {
       {activeTab === 'asr' && <div className="flex-1 overflow-y-auto min-h-0">
         <div className="max-w-md mx-auto p-4 pb-6">
           <Suspense fallback={<PanelLoading />}><AsrConnectionPanel /></Suspense>
-        </div>
-      </div>}
-
-      {activeTab === 'monitor' && <div className="flex-1 overflow-y-auto min-h-0">
-        <div className="max-w-4xl mx-auto p-4 pb-6">
-          <Suspense fallback={<PanelLoading />}><ProcessMonitorPanel /></Suspense>
         </div>
       </div>}
 

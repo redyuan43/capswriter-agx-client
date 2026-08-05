@@ -19,7 +19,6 @@ import termios
 import time
 import urllib.request
 
-DEFAULT_MAC = "14:08:08:52:F9:62"
 DEFAULT_BRIDGE = "http://127.0.0.1:8765/state"
 SERIAL_GLOB = "/dev/serial/by-id/usb-Hades2001_M5stack_*-if00-port0"
 DEFAULT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".cache",
@@ -126,6 +125,17 @@ def pipewire_source(mac: str) -> dict:
         sources = json.loads(result["stdout"] or "[]")
     except json.JSONDecodeError:
         sources = []
+    card_name = f"bluez_card.{mac.replace(':', '_')}"
+    cards_result = run("pactl", "-f", "json", "list", "cards")
+    try:
+        cards = json.loads(cards_result["stdout"] or "[]")
+    except json.JSONDecodeError:
+        cards = []
+    active_profile = ""
+    for card in cards:
+        if str(card.get("name") or "") == card_name:
+            active_profile = str(card.get("active_profile") or "")
+            break
     for source in sources:
         properties = source.get("properties") or {}
         node_name = str(source.get("name") or properties.get("node.name") or "")
@@ -136,9 +146,15 @@ def pipewire_source(mac: str) -> dict:
         state = str(source.get("state") or "UNKNOWN").upper()
         return {
             "enumerated": True,
-            "available": state != "UNAVAILABLE",
+            # PipeWire source-node properties can retain "off" after HFP has
+            # been activated.  The owning card's active profile is the
+            # authoritative profile state; retain source-only compatibility
+            # when card data is unavailable.
+            "available": state != "UNAVAILABLE" and
+                         (not active_profile or active_profile.startswith("headset-head-unit")),
             "node_name": node_name,
             "state": state,
+            "card_profile": active_profile,
             "raw": source,
         }
     return {"enumerated": False, "available": False, "node_name": "",
@@ -168,6 +184,23 @@ def bridge_state(url: str) -> dict:
             }
     except Exception as error:  # noqa: BLE001 - return diagnostics to caller
         return {"available": False, "error": str(error)}
+
+
+def resolve_target_mac(port: str | None, requested_mac: str | None,
+                       bridge: str) -> str:
+    """Choose the active device without binding the doctor to one M5."""
+    if requested_mac:
+        return requested_mac.upper()
+    if port:
+        status = m5ctl(port, "STATUS")
+        mac = str(status.get("mac") or "").strip()
+        if mac:
+            return mac.upper()
+    bluetooth = (bridge_state(bridge).get("state") or {}).get("bluetooth") or {}
+    mac = str(bluetooth.get("target_mac") or "").strip()
+    if mac:
+        return mac.upper()
+    raise RuntimeError("无法识别目标 M5；请连接其 USB 串口或显式传入 --mac")
 
 
 def bridge_audio_status(bridge_result: dict, mac: str) -> str:
@@ -216,6 +249,15 @@ def diagnose(port: str, mac: str, bridge: str) -> dict:
             "audio_status": bridge_audio_status(bridge_result, mac)}
 
 
+def bluetooth_agent_registered(line: str) -> bool:
+    lower = line.lower()
+    return any(message in lower for message in (
+        "agent registered",
+        "agent is already registered",
+        "agent registration enabled",
+    ))
+
+
 def bluetooth_pair(mac: str) -> dict:
     """Pair in one persistent bluetoothctl session.
 
@@ -239,12 +281,22 @@ def bluetooth_pair(mac: str) -> dict:
             process.stdin.flush()
 
     send("agent on")
-    send("default-agent")
     send("power on")
     send("scan on")
-    send(f"pair {mac}")
     deadline = time.monotonic() + 45
     paired = False
+    pair_requested = False
+    default_agent_ready = False
+    device_seen = bluez_info(mac)["known"]
+    pair_earliest_at = time.monotonic() + 1.0
+
+    def request_pair_when_ready() -> None:
+        nonlocal pair_requested
+        if (default_agent_ready and device_seen and
+                time.monotonic() >= pair_earliest_at and not pair_requested):
+            send(f"pair {mac}")
+            pair_requested = True
+
     try:
         while time.monotonic() < deadline and process.poll() is None:
             readable, _, _ = select.select([process.stdout], [], [], 0.25)
@@ -255,6 +307,19 @@ def bluetooth_pair(mac: str) -> dict:
                 continue
             transcript.append(line.rstrip())
             lower = line.lower()
+            if bluetooth_agent_registered(lower):
+                send("default-agent")
+                default_agent_ready = True
+            elif "default agent request successful" in lower:
+                default_agent_ready = True
+            elif "failed to register agent object" in lower:
+                # CapsWriter may already own BlueZ's default agent.  That
+                # agent can approve the pairing prompts, so this session can
+                # still issue Pair() once the device is discovered.
+                default_agent_ready = True
+            if mac.lower() in lower and "device" in lower:
+                device_seen = True
+            request_pair_when_ready()
             if "confirm passkey" in lower or "authorize service" in lower:
                 send("yes")
             if "pairing successful" in lower or "paired: yes" in lower:
@@ -520,7 +585,8 @@ def repair_audio_only(mac: str, bridge: str, previous: dict | None = None,
 
 def repair(port: str, mac: str, bridge: str, recover_bluez: bool,
            previous: dict | None = None, cooldown_seconds: int = 60,
-           now_epoch: float | None = None) -> dict:
+           now_epoch: float | None = None,
+           force_pairing_reset: bool = False) -> dict:
     now_epoch = time.time() if now_epoch is None else now_epoch
     previous = previous or {}
     before = diagnose(port, mac, bridge)
@@ -533,7 +599,7 @@ def repair(port: str, mac: str, bridge: str, recover_bluez: bool,
             before = diagnose(port, mac, bridge)
     m5_paired = bool(before["m5"].get("paired"))
     host_paired = before["bluez"]["paired"] and before["bluez"]["bonded"]
-    reset = m5_paired != host_paired
+    reset = force_pairing_reset or m5_paired != host_paired
     pairing = None
     if reset:
         run("bluetoothctl", "remove", mac)
@@ -578,6 +644,7 @@ def repair(port: str, mac: str, bridge: str, recover_bluez: bool,
             }
     after = diagnose(port, mac, bridge)
     return {"ok": after["ok"], "reset_pairing": reset,
+            "forced_pairing_reset": force_pairing_reset,
             "bluez_recovery": bluez_recovery,
             "recovery": recovery, "before": before,
             "pairing": pairing, "after": after}
@@ -587,7 +654,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("diagnose", "repair"))
     parser.add_argument("--port")
-    parser.add_argument("--mac", default=DEFAULT_MAC)
+    parser.add_argument("--mac",
+                        help="可选：覆盖自动识别到的目标设备 MAC")
     parser.add_argument("--bridge", default=DEFAULT_BRIDGE)
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--recover-bluez", action="store_true",
@@ -598,27 +666,33 @@ def main() -> int:
                         help="只重连蓝牙传输，不重启 PipeWire/WirePlumber")
     parser.add_argument("--recovery-cooldown", type=int, default=60,
                         help="重复音频栈恢复的最短间隔秒数（默认 60）")
+    parser.add_argument("--force-pairing-reset", action="store_true",
+                        help="仅在常规重连失败后使用：清除指定 MAC 的旧配对并重新授权")
     args = parser.parse_args()
     try:
         previous = load_previous_state(args.state_file)
         if args.action == "diagnose":
             port = serial_port(args.port)
-            result = diagnose(port, args.mac.upper(), args.bridge)
+            mac = resolve_target_mac(port, args.mac, args.bridge)
+            result = diagnose(port, mac, args.bridge)
             if previous.get("recovery"):
                 result["recovery"] = previous["recovery"]
         elif args.audio_only:
+            mac = resolve_target_mac(None, args.mac, args.bridge)
             result = repair_audio_only(
-                args.mac.upper(), args.bridge, previous=previous,
+                mac, args.bridge, previous=previous,
                 cooldown_seconds=max(0, args.recovery_cooldown),
                 recover_bluez=args.recover_bluez,
                 reconnect_only=args.reconnect_only,
             )
         else:
             port = serial_port(args.port)
+            mac = resolve_target_mac(port, args.mac, args.bridge)
             result = repair(
-                port, args.mac.upper(), args.bridge, args.recover_bluez,
+                port, mac, args.bridge, args.recover_bluez,
                 previous=previous,
                 cooldown_seconds=max(0, args.recovery_cooldown),
+                force_pairing_reset=args.force_pairing_reset,
             )
     except Exception as error:  # noqa: BLE001 - CLI should return structured failures
         result = {"ok": False, "stage": "setup", "error": str(error)}

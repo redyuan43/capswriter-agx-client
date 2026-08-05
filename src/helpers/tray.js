@@ -130,7 +130,7 @@ class TrayManager {
         }
       },
       {
-        label: "进程监控",
+        label: "设置",
         click: () => {
           if (this.createSettingsWindowCallback) {
             this.createSettingsWindowCallback();

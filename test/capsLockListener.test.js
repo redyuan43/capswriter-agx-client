@@ -183,6 +183,72 @@ test('routes the PocketTerm35 physical Shift key as dictation without changing o
   ]);
 });
 
+test('treats Shift plus another key as a modifier chord before dictation starts', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 1000;
+  const devicePath = '/dev/input/event9';
+  listener._inputBuffers.set(devicePath, Buffer.alloc(0));
+  listener._inputDeviceInfo.set(devicePath, {
+    trigger_id: 'keyboard',
+    device_path: devicePath,
+    device_name: 'keyd virtual keyboard',
+    backend: 'evdev',
+  });
+  const events = [];
+  listener.setOnCapsLockDown(() => events.push('down'));
+  listener.setOnCapsLockUp(() => events.push('up'));
+  listener.setOnDictationCancel(() => events.push('cancel'));
+  const inputEvent = (code, value) => {
+    const event = Buffer.alloc(24);
+    event.writeUInt16LE(1, 16);
+    event.writeUInt16LE(code, 18);
+    event.writeInt32LE(value, 20);
+    return event;
+  };
+
+  listener._onInputEventData(devicePath, inputEvent(54, 1));
+  listener._onInputEventData(devicePath, inputEvent(3, 1));
+  listener._onInputEventData(devicePath, inputEvent(3, 0));
+  listener._onInputEventData(devicePath, inputEvent(54, 0));
+
+  assert.deepEqual(events, []);
+  assert.equal(listener._evdevHolds.size, 0);
+});
+
+test('cancels active Shift dictation when it becomes a modifier chord', () => {
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  const devicePath = '/dev/input/event9';
+  listener._inputBuffers.set(devicePath, Buffer.alloc(0));
+  listener._inputDeviceInfo.set(devicePath, {
+    trigger_id: 'keyboard',
+    device_path: devicePath,
+    device_name: 'keyd virtual keyboard',
+    backend: 'evdev',
+  });
+  const events = [];
+  listener.setOnCapsLockDown(() => events.push('down'));
+  listener.setOnCapsLockUp((payload) => events.push(['up', payload.reason]));
+  listener.setOnDictationCancel((payload) => events.push(['cancel', payload.reason]));
+  const inputEvent = (code, value) => {
+    const event = Buffer.alloc(24);
+    event.writeUInt16LE(1, 16);
+    event.writeUInt16LE(code, 18);
+    event.writeInt32LE(value, 20);
+    return event;
+  };
+
+  listener._onInputEventData(devicePath, inputEvent(54, 1));
+  listener._onInputEventData(devicePath, inputEvent(3, 1));
+  listener._onInputEventData(devicePath, inputEvent(54, 0));
+
+  assert.deepEqual(events, [
+    'down',
+    ['up', 'modifier_chord'],
+    ['cancel', 'modifier_chord'],
+  ]);
+});
+
 test('ignores close events from a replaced input stream generation', () => {
   const listener = new CapsLockListener();
   const devicePath = '/dev/input/event257';

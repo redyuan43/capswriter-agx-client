@@ -2,7 +2,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, execFileSync } = require("child_process");
-const { isHttpUrl } = require("./linkBookmarkManager");
 const { VoiceLearningManager, normalizePhrase } = require("./voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./voiceTeacherClassifier");
 
@@ -230,8 +229,6 @@ class VoiceActionManager {
     qwenRouter = null,
     teacherClassifier = null,
     learningManager = null,
-    linkBookmarkManager = null,
-    openExternal = null,
     configPath = ""
   } = {}) {
     this.logger = logger;
@@ -239,8 +236,6 @@ class VoiceActionManager {
     this.qwenRouter = qwenRouter;
     this.teacherClassifier = teacherClassifier || new VoiceTeacherClassifier({ logger });
     this.learningManager = learningManager || new VoiceLearningManager({ logger });
-    this.linkBookmarkManager = linkBookmarkManager;
-    this.openExternal = openExternal;
     this.configPath = expandHome(
       configPath || process.env.CAPSWRITER_VOICE_ACTIONS_PATH || DEFAULT_CONFIG_PATH
     );
@@ -450,7 +445,7 @@ class VoiceActionManager {
       intents: config.intents.map((intent) => {
         const action = intent.action || {};
         const actionType = String(action.type || "");
-        const highRiskAction = ["shell", "terminal_prompt", "type_text", "key_sequence", "open_link_bookmark", "codex_terminal"].includes(actionType);
+        const highRiskAction = ["shell", "terminal_prompt", "type_text", "key_sequence", "codex_terminal"].includes(actionType);
         const allowModelFallback =
           typeof intent.allowModelFallback === "boolean"
             ? intent.allowModelFallback
@@ -531,30 +526,6 @@ class VoiceActionManager {
     });
   }
 
-  async executeLinkBookmarkOverride(text, { activeWindowId = "", serverIntentId = "" } = {}) {
-    const normalizedText = String(text || "").trim();
-    if (!normalizedText) return null;
-
-    const config = this.loadConfig();
-    const activeWindow = this.getActiveWindowInfo(activeWindowId);
-    const linkMatch = await this.matchLinkBookmark(normalizedText, config);
-    const intent = linkMatch?.intent;
-    if (intent?.action?.type !== "open_link_bookmark") {
-      return null;
-    }
-
-    return await this.executeIntent(intent, {
-      text: normalizedText,
-      match: {
-        confidence: linkMatch.confidence,
-        source: linkMatch.source,
-        serverIntentId
-      },
-      activeWindow,
-      config
-    });
-  }
-
   async executeDeterministicIntentOverride(text, { activeWindowId = "", serverIntentId = "" } = {}) {
     const normalizedText = String(text || "").trim();
     if (!normalizedText) return null;
@@ -615,11 +586,6 @@ class VoiceActionManager {
     const exact = this.matchIntentByExample(text, config.intents);
     if (exact) {
       return { routeType: "intent", intent: exact, confidence: 1, source: "example" };
-    }
-
-    const linkMatch = await this.matchLinkBookmark(text, config);
-    if (linkMatch) {
-      return linkMatch;
     }
 
     if (this.looksLikeCodexFollowup(text, context)) {
@@ -802,112 +768,10 @@ class VoiceActionManager {
     return 1;
   }
 
-  async matchLinkBookmark(text, config) {
-    if (!this.linkBookmarkManager) return null;
-    const looksLikeOpenRequest = this.looksLikeOpenLinkRequest(text);
-
-    const ruleMatch = this.linkBookmarkManager.matchBookmark(text);
-    if (ruleMatch?.routeType === "ask" && looksLikeOpenRequest) {
-      return ruleMatch;
-    }
-    if (ruleMatch?.bookmark) {
-      const strongRuleMatch = ruleMatch.source === "link_exact" || ruleMatch.confidence >= 0.92;
-      if (looksLikeOpenRequest || strongRuleMatch) {
-        return this.buildLinkBookmarkMatch(ruleMatch.bookmark, ruleMatch.confidence, ruleMatch.source);
-      }
-    }
-
-    if (!looksLikeOpenRequest) return null;
-
-    const modelMatch = await this.matchLinkBookmarkWithModel(text, config);
-    if (modelMatch) return modelMatch;
-    return null;
-  }
-
-  looksLikeOpenLinkRequest(text) {
-    const normalized = normalizePhrase(text);
-    return /(打开|开启|访问|进入|看看|看一下|跳到|去到|转到|开一下|打开一下)/.test(normalized);
-  }
-
   looksLikeExplicitTerminalOpenRequest(text) {
     const normalized = normalizePhrase(text);
     if (!normalized) return false;
     return /(打开|启动|新建|起|开|创建).*(终端|命令行|terminal|console|shell)/.test(normalized);
-  }
-
-  buildLinkBookmarkMatch(bookmark, confidence, source) {
-    return {
-      routeType: "intent",
-      confidence,
-      source,
-      intent: {
-        id: "open_link_bookmark",
-        description: `打开${bookmark.title}`,
-        allowModelFallback: false,
-        action: {
-          type: "open_link_bookmark",
-          bookmarkId: bookmark.id,
-          title: bookmark.title,
-          url: bookmark.url
-        }
-      }
-    };
-  }
-
-  async matchLinkBookmarkWithModel(text, config) {
-    if (!this.qwenRouter?.chatCompletion || !this.linkBookmarkManager?.getModelCandidates) {
-      return null;
-    }
-    const candidates = this.linkBookmarkManager.getModelCandidates();
-    if (!candidates.length) return null;
-
-    const response = await this.qwenRouter.chatCompletion(
-      [
-        {
-          role: "system",
-          content:
-            "你是 CapsWriter 的链接选择器。只能从候选链接 id 中选择。只输出 JSON；不确定时 bookmarkId 必须为 null。"
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            spoken_text: text,
-            candidates,
-            output_schema: {
-              bookmarkId: "string|null",
-              confidence: "number",
-              reason: "string"
-            },
-            confidence_threshold: config.defaults.confidenceThreshold
-          }) + "\n/no_think"
-        }
-      ],
-      {
-        temperature: 0,
-        max_tokens: 96,
-        timeoutMs: Number(process.env.CAPSWRITER_LINK_ROUTE_QWEN_TIMEOUT_MS || 2500),
-        response_format: { type: "json_object" }
-      }
-    );
-
-    if (!response.success) {
-      this.logWarn("Voice link model match failed", response.error || response);
-      return null;
-    }
-
-    try {
-      const decision = JSON.parse(response.text);
-      const confidence = normalizeNumber(decision.confidence, 0);
-      if (confidence < config.defaults.confidenceThreshold || !decision.bookmarkId) {
-        return null;
-      }
-      const bookmark = this.linkBookmarkManager.getBookmark(String(decision.bookmarkId));
-      if (!bookmark || bookmark.enabled === false) return null;
-      return this.buildLinkBookmarkMatch(bookmark, confidence, "link_model");
-    } catch (error) {
-      this.logWarn("Voice link model returned invalid JSON", response.text || error);
-      return null;
-    }
   }
 
   async matchIntentWithModel(text, config, activeWindow) {
@@ -981,7 +845,7 @@ class VoiceActionManager {
   isIntentAllowedForModelFallback(intent, activeWindow) {
     if (!this.isIntentAllowedInContext(intent, activeWindow)) return false;
     const actionType = String(intent?.action?.type || "");
-    const highRiskAction = ["shell", "terminal_prompt", "type_text", "key_sequence", "open_link_bookmark", "codex_terminal"].includes(actionType);
+    const highRiskAction = ["shell", "terminal_prompt", "type_text", "key_sequence", "codex_terminal"].includes(actionType);
     const allowModelFallback =
       typeof intent.allowModelFallback === "boolean"
         ? intent.allowModelFallback
@@ -1210,9 +1074,6 @@ class VoiceActionManager {
       if (action.type === "key_sequence") {
         return await this.executeKeySequenceIntent(intent, context);
       }
-      if (action.type === "open_link_bookmark") {
-        return await this.executeOpenLinkBookmarkIntent(intent, context);
-      }
       if (action.type === "translate_clipboard") {
         return await this.executeTranslateClipboardIntent(intent, context);
       }
@@ -1365,33 +1226,6 @@ class VoiceActionManager {
       });
     }
     return this.successResult(intent, context, "key_sequence", `已执行：${intent.description || intent.id}`);
-  }
-
-  async executeOpenLinkBookmarkIntent(intent, context) {
-    const action = intent.action || {};
-    const bookmark = action.bookmarkId && this.linkBookmarkManager?.getBookmark
-      ? this.linkBookmarkManager.getBookmark(action.bookmarkId)
-      : null;
-    const url = String(bookmark?.url || action.url || "").trim();
-    if (!isHttpUrl(url)) {
-      throw new Error("只支持 http/https 链接");
-    }
-    if (bookmark?.enabled === false) {
-      throw new Error("链接已禁用");
-    }
-    if (!this.openExternal) {
-      throw new Error("openExternal unavailable");
-    }
-    if (this.isRoutingCancelled(context.cancelGeneration)) {
-      return this.cancelledResult(intent, context);
-    }
-    await this.openExternal(url);
-    return this.successResult(
-      intent,
-      context,
-      "open_link_bookmark",
-      `已打开：${bookmark?.title || action.title || url}`
-    );
   }
 
   async executeTranslateClipboardIntent(intent, context) {

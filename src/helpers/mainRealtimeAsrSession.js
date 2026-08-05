@@ -3,7 +3,7 @@ const WebSocket = require("ws");
 const REALTIME_ASR_PROTOCOL = "qwen3-asr-v1";
 const REALTIME_ASR_AUTH_PREFIX = "auth.";
 const DEFAULT_CONNECT_TIMEOUT_MS = 30000;
-const DEFAULT_FINAL_TIMEOUT_MS = 15000;
+const DEFAULT_FINAL_TIMEOUT_MS = 5000;
 const DEFAULT_PREROLL_MS = 5000;
 
 function protocolsForToken(token) {
@@ -85,11 +85,45 @@ class MainRealtimeAsrSession {
     this.finishing = false;
     this.latestTextPayload = null;
     this.startPromise = null;
+    this.finalSettled = false;
     this.finalPromise = new Promise((resolve, reject) => {
-      this.resolveFinal = resolve;
-      this.rejectFinal = reject;
+      this.resolveFinal = (payload) => {
+        if (this.finalSettled) return false;
+        this.finalSettled = true;
+        resolve(payload);
+        return true;
+      };
+      this.rejectFinal = (error) => {
+        if (this.finalSettled) return false;
+        this.finalSettled = true;
+        reject(error);
+        return true;
+      };
     });
     this.finalPromise.catch(() => {});
+  }
+
+  buildPartialFallback(reason) {
+    if (!usablePayload(this.latestTextPayload)) return null;
+    return {
+      ...this.latestTextPayload,
+      partial_fallback: true,
+      partial_fallback_reason: String(reason || "final_unavailable"),
+    };
+  }
+
+  settleFinalFailure(error, reason) {
+    if (this.finalSettled) return false;
+    const fallback = this.finishing ? this.buildPartialFallback(reason) : null;
+    if (fallback) {
+      this.logger?.warn?.("Realtime ASR final unavailable; latest partial selected", {
+        reason: fallback.partial_fallback_reason,
+        textLength: extractText(fallback).length,
+        error: error?.message || String(error || ""),
+      });
+      return this.resolveFinal(fallback);
+    }
+    return this.rejectFinal(error);
   }
 
   start() {
@@ -171,20 +205,23 @@ class MainRealtimeAsrSession {
           );
           error.realtimePayload = payload;
           if (!this.ready) settleReject(error);
-          else this.rejectFinal(error);
+          else this.settleFinalFailure(error, `server_${type}`);
         }
       });
 
       socket.on("error", (error) => {
         if (!this.ready) settleReject(error);
-        else this.rejectFinal(error);
+        else this.settleFinalFailure(error, "socket_error");
       });
 
       socket.on("close", () => {
         if (!this.ready) {
           settleReject(new Error("Realtime ASR websocket closed before ready"));
-        } else if (!this.cancelled && !this.finishing) {
-          this.rejectFinal(new Error("Realtime ASR websocket closed before final"));
+        } else if (!this.cancelled) {
+          this.settleFinalFailure(
+            new Error("Realtime ASR websocket closed before final"),
+            "socket_closed"
+          );
         }
       });
     });
@@ -238,6 +275,7 @@ class MainRealtimeAsrSession {
 
   async finish() {
     if (this.cancelled) throw new Error("Realtime ASR session is cancelled");
+    const finishStartedAt = Date.now();
     this.finishing = true;
     await this.start();
     this.flushPending();
@@ -255,11 +293,28 @@ class MainRealtimeAsrSession {
         ),
       ]);
       this.socket.close();
+      this.logger?.info?.("Realtime ASR final settled", {
+        elapsedMs: Date.now() - finishStartedAt,
+        partialFallback: payload?.partial_fallback === true,
+        fallbackReason: payload?.partial_fallback_reason || "",
+        textLength: extractText(payload).length,
+      });
       return payload;
     } catch (error) {
-      if (error.code === "REALTIME_ASR_FINAL_TIMEOUT" && usablePayload(this.latestTextPayload)) {
+      if (error.code === "REALTIME_ASR_FINAL_TIMEOUT") {
+        const fallback = this.buildPartialFallback("final_timeout");
+        if (!fallback) {
+          this.cancel();
+          throw error;
+        }
+        this.resolveFinal(fallback);
         this.socket.close();
-        return { ...this.latestTextPayload, partial_fallback: true };
+        this.logger?.warn?.("Realtime ASR final timed out; latest partial selected", {
+          elapsedMs: Date.now() - finishStartedAt,
+          timeoutMs: this.finalTimeoutMs,
+          textLength: extractText(fallback).length,
+        });
+        return fallback;
       }
       this.cancel();
       throw error;

@@ -400,6 +400,7 @@ test("M5 starts renderer ASR only after the first accepted audio chunk", async (
   );
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-start",
+    "external-recording-chunk",
   ]);
   bridge.abortAllSessions("test_cleanup");
 });
@@ -503,10 +504,10 @@ test("simultaneous device recordings stay isolated and reach the renderer serial
   await waitFor(() => assert.ok(rendererEvents.some((event) =>
     event.eventName === "external-recording-stop" && event.payload.session_id === "serial-b"
   )));
-  assert.equal(
-    rendererEvents.some((event) => event.eventName === "external-recording-chunk"),
-    false
+  const replayedB = rendererEvents.find((event) =>
+    event.eventName === "external-recording-chunk" && event.payload.session_id === "serial-b"
   );
+  assert.equal(Buffer.from(replayedB.payload.chunk).toString("hex"), "0202");
   await bridge.handleRendererResult({ session_id: "serial-b", success: true, status: "pasted", text: "b" });
   assert.equal((await stopA).statusCode, 200);
   assert.equal((await stopB).statusCode, 200);
@@ -672,6 +673,96 @@ test("keyboard route takeover cancels only conflicting local captures", async (t
   assert.equal(terminated[0].result.reason, "audio_route_handoff");
 });
 
+test("Wi-Fi trigger release finalizes after bounded drain without waiting for full acknowledgement timeout", async (t) => {
+  const rendererEvents = [];
+  const { bridge } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  const sessionId = "wifi-release-no-ack-wait";
+  const session = bridge.createHostRecordingSession({
+    sessionId,
+    triggerId: "wifi:stick-a",
+    route: {
+      source_id: "wifi:stick-a",
+      source: { kind: "wifi", device_id: "stick-a", online: true },
+      available: true,
+    },
+    targetWindowId: "42",
+    captureMode: "remote_device",
+    sourceDeviceId: "stick-a",
+  });
+  bridge.appendRecordingAudio(session, Buffer.alloc(3200));
+  bridge.remoteAudioDrainQuietMs = 5;
+  bridge.remoteAudioDrainPollMs = 1;
+  bridge.remoteAudioDrainTimeoutMs = 50;
+  let resolveAcknowledgement;
+  bridge.commandBroker.waitForAcknowledgement = () => new Promise((resolve) => {
+    resolveAcknowledgement = resolve;
+  });
+
+  const stopped = await Promise.race([
+    bridge.handleHostTriggerUp("wifi:stick-a"),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("Wi-Fi release waited for stop acknowledgement")),
+      100
+    )),
+  ]);
+
+  assert.equal(stopped.handled, true);
+  assert.equal(stopped.session_id, sessionId);
+  assert.equal(stopped.acknowledgement, null);
+  assert.ok(rendererEvents.some((event) =>
+    event.eventName === "external-recording-stop" &&
+    event.payload.session_id === sessionId
+  ));
+  resolveAcknowledgement({ status: "completed", session_id: sessionId });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(session.remoteStopAcknowledgement.status, "completed");
+});
+
+test("Wi-Fi trigger release accepts a delayed first PCM chunk before checking for empty audio", async (t) => {
+  const rendererEvents = [];
+  const { bridge } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  const sessionId = "wifi-delayed-first-pcm";
+  const session = bridge.createHostRecordingSession({
+    sessionId,
+    triggerId: "wifi:stick-a",
+    route: {
+      source_id: "wifi:stick-a",
+      source: { kind: "wifi", device_id: "stick-a", online: true },
+      available: true,
+    },
+    targetWindowId: "42",
+    captureMode: "remote_device",
+    sourceDeviceId: "stick-a",
+  });
+  bridge.remoteAudioDrainQuietMs = 10;
+  bridge.remoteAudioDrainPollMs = 1;
+  bridge.remoteAudioDrainTimeoutMs = 100;
+  let resolveAcknowledgement;
+  bridge.commandBroker.waitForAcknowledgement = () => new Promise((resolve) => {
+    resolveAcknowledgement = resolve;
+  });
+
+  const stoppedPromise = bridge.handleHostTriggerUp("wifi:stick-a");
+  setTimeout(() => bridge.appendRecordingAudio(session, Buffer.alloc(640)), 10);
+  const stopped = await stoppedPromise;
+
+  assert.equal(stopped.error, undefined);
+  assert.equal(session.bytes, 640);
+  assert.deepEqual(rendererEvents.map((event) => event.eventName), [
+    "external-recording-armed",
+    "external-recording-start",
+    "external-recording-chunk",
+    "external-recording-stop",
+  ]);
+  assert.equal(rendererEvents[3].payload.bytes, 640);
+  resolveAcknowledgement({ status: "completed", session_id: sessionId });
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
 test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capture", async (t) => {
   const { bridge } = await startBridge(t);
   const calls = [];
@@ -785,6 +876,7 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-armed",
     "external-recording-start",
+    "external-recording-chunk",
   ]);
   emitChunk(Buffer.from([1, 2, 3, 4]));
   assert.equal(
@@ -801,10 +893,12 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-armed",
     "external-recording-start",
+    "external-recording-chunk",
+    "external-recording-chunk",
     "external-recording-stop",
   ]);
-  assert.equal(rendererEvents[2].payload.bytes, 644);
-  assert.equal(rendererEvents[2].payload.chunks, 2);
+  assert.equal(rendererEvents[4].payload.bytes, 644);
+  assert.equal(rendererEvents[4].payload.chunks, 2);
 });
 
 test("concurrent host triggers arm only the renderer-owned session", async (t) => {
@@ -1017,27 +1111,17 @@ test("keyboard host trigger captures native USB PCM without browser recording", 
   assert.deepEqual(rendererEvents.map((event) => event.eventName), [
     "external-recording-armed",
     "external-recording-start",
+    "external-recording-chunk",
     "external-recording-stop",
   ]);
-  assert.equal(rendererEvents[2].payload.bytes, 4);
+  assert.equal(rendererEvents[3].payload.bytes, 4);
 });
 
-test("native PipeWire PCM stays in main process and returns only ASR text", async (t) => {
+test("native PipeWire PCM is streamed to the proven renderer ASR transport", async (t) => {
   const rendererEvents = [];
-  const pcm = [];
-  const asr = {
-    start: async () => ({ type: "ready" }),
-    sendPcm(chunk) {
-      pcm.push(Buffer.from(chunk));
-    },
-    finish: async () => ({ type: "final", success: true, text: "主进程识别" }),
-    cancel() {},
-  };
-  const { bridge } = await startBridge(
-    t,
-    (eventName, payload) => rendererEvents.push({ eventName, payload }),
-    { asrSessionFactory: () => asr }
-  );
+  const { bridge } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
   bridge.audioRouting.activateTrigger = () => ({
     trigger_id: "keyboard",
     source_id: "pipewire:alsa_input.usb-mi-speakphone",
@@ -1063,20 +1147,15 @@ test("native PipeWire PCM stays in main process and returns only ASR text", asyn
   const started = await bridge.handleHostTriggerDown("keyboard", "42");
   emitChunk(Buffer.from([1, 2, 3, 4]));
   await bridge.handleHostTriggerUp("keyboard");
-  await waitFor(() => assert.ok(rendererEvents.some(
-    (event) => event.eventName === "external-recording-result"
-  )));
 
-  assert.deepEqual(Buffer.concat(pcm), Buffer.from([1, 2, 3, 4]));
-  assert.equal(
-    rendererEvents.some((event) => event.eventName === "external-recording-chunk"),
-    false
+  const chunk = rendererEvents.find(
+    (event) => event.eventName === "external-recording-chunk"
   );
-  const result = rendererEvents.find(
-    (event) => event.eventName === "external-recording-result"
-  );
-  assert.equal(result.payload.session_id, started.session_id);
-  assert.equal(result.payload.result.text, "主进程识别");
+  assert.equal(chunk.payload.session_id, started.session_id);
+  assert.deepEqual(Buffer.from(chunk.payload.chunk), Buffer.from([1, 2, 3, 4]));
+  assert.ok(rendererEvents.some(
+    (event) => event.eventName === "external-recording-stop"
+  ));
 });
 
 test("M5 confirmation is accepted while transcription is still pending and runs after paste", async (t) => {

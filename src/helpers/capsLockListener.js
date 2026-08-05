@@ -17,7 +17,9 @@ const LINUX_INPUT_REFRESH_INTERVAL_MS = 2000;
 const MINIJOY_INPUT_POLL_INTERVAL_MS = 10;
 const DEFAULT_DICTATION_HOLD_KEY = 'right shift';
 const DEFAULT_CODEX_HOLD_KEY = 'caps lock';
+const KEYD_VIRTUAL_KEYBOARD = 'keyd virtual keyboard';
 const EXTRA_KEYBOARD_DEVICE_NAMES = [
+  KEYD_VIRTUAL_KEYBOARD,
   'Knob Mapper Virtual Keyboard',
   'VibeStick MiniJoy Keyboard',
   'VibeStick MiniJoy Mouse'
@@ -683,6 +685,9 @@ class CapsLockListener {
         device_path: devicePath,
         backend: 'evdev'
       };
+      if (value === 1) {
+        this._cancelEvdevShiftHoldsForChord(devicePath, code);
+      }
       const holdKey = this._findHoldKeyByEvdevCode(code, source);
       if (holdKey && value === 1) {
         this._handleHoldKeyDown(holdKey.role, holdKey.config, code, source);
@@ -717,7 +722,7 @@ class CapsLockListener {
     this._recordingTriggered = false;
     this._logInfo(`${keyConfig.displayName} 按下, keycode:`, keycode);
 
-    if (this._requiresHoldDelay(keyConfig)) {
+    if (this._requiresHoldDelay(keyConfig, source)) {
       // 短按过滤：超过阈值后才触发录音，确保 <= 阈值的轻按不激活。
       this._holdTimer = setTimeout(() => {
         this._holdTimer = null;
@@ -815,7 +820,7 @@ class CapsLockListener {
       this._emitHoldKeyDown(role, hold.source);
     };
 
-    if (this._requiresHoldDelay(keyConfig)) {
+    if (this._requiresHoldDelay(keyConfig, source)) {
       hold.timer = setTimeout(trigger, this.minHoldMs + 1);
       hold.timer.unref?.();
     } else {
@@ -828,6 +833,28 @@ class CapsLockListener {
     const hold = this._evdevHolds.get(holdId);
     if (!hold) return;
     this._finishEvdevHold(hold, keycode, false, 'key_released');
+  }
+
+  _cancelEvdevShiftHoldsForChord(devicePath, keycode) {
+    for (const hold of [...this._evdevHolds.values()]) {
+      if (
+        hold.source.device_path !== devicePath
+        || hold.keycode === keycode
+        || (hold.keycode !== KEY_LEFTSHIFT && hold.keycode !== KEY_RIGHTSHIFT)
+      ) {
+        continue;
+      }
+
+      const recordingTriggered = hold.recordingTriggered;
+      this._finishEvdevHold(hold, hold.keycode, true, 'modifier_chord');
+      this._logInfo(`${hold.keyConfig.displayName} 组合键透传`, {
+        chord_keycode: keycode,
+        device_path: devicePath,
+      });
+      if (recordingTriggered && hold.role === 'dictation') {
+        this._handleDictationCancel(keycode, 'modifier_chord');
+      }
+    }
   }
 
   _finishEvdevHold(hold, keycode, forced, reason) {
@@ -870,8 +897,11 @@ class CapsLockListener {
     }
   }
 
-  _requiresHoldDelay(keyConfig) {
-    return this.minHoldMs > 0 && keyConfig?.restoresCapsLock;
+  _requiresHoldDelay(keyConfig, source = {}) {
+    return this.minHoldMs > 0 && (
+      keyConfig?.restoresCapsLock
+      || source.device_name === KEYD_VIRTUAL_KEYBOARD
+    );
   }
 
   _emitHoldKeyDown(role, source = {}) {

@@ -48,6 +48,23 @@ print(json.dumps({"value": value, "captured": captured}))
   assert.equal(result.value.state.bluetooth.audio_status, "failed");
 });
 
+test("doctor accepts bluetoothctl existing-agent readiness responses", () => {
+  const result = runPython(`
+print(json.dumps({
+    "registered": doctor.bluetooth_agent_registered("Agent registered"),
+    "already_registered": doctor.bluetooth_agent_registered("Agent is already registered"),
+    "registration_enabled": doctor.bluetooth_agent_registered("Agent registration enabled"),
+    "registration_failed": doctor.bluetooth_agent_registered("Agent registration failed"),
+}))
+`);
+  assert.deepEqual(result, {
+    registered: true,
+    already_registered: true,
+    registration_enabled: true,
+    registration_failed: false,
+  });
+});
+
 test("doctor classifies residual PipeWire nodes by recent capture health", () => {
   const result = runPython(`
 m5 = {"ok": True}
@@ -254,6 +271,24 @@ print(json.dumps(doctor.pipewire_source("14:08:08:52:F9:62")))
   assert.equal(result.available, true);
   assert.equal(result.state, "SUSPENDED");
   assert.equal(result.node_name, "bluez_input.14_08_08_52_F9_62.0");
+});
+
+test("doctor rejects a residual PipeWire node when its owning card profile is off", () => {
+  const result = runPython(`
+sources = [{
+    "name": "bluez_input.14_08_08_52_F9_62.0",
+    "state": "SUSPENDED",
+    "properties": {
+      "api.bluez5.address": "14:08:08:52:F9:62",
+    },
+}]
+cards = [{"name": "bluez_card.14_08_08_52_F9_62", "active_profile": "off"}]
+doctor.run = lambda *args, **kwargs: {"ok": True, "stdout": json.dumps(cards if "cards" in args else sources), "stderr": ""}
+print(json.dumps(doctor.pipewire_source("14:08:08:52:F9:62")))
+`);
+  assert.equal(result.enumerated, true);
+  assert.equal(result.available, false);
+  assert.equal(result.card_profile, "off");
 });
 
 test("doctor keeps only the bridge audio summary to prevent recursive state growth", () => {

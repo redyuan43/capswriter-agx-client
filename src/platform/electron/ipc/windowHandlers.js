@@ -44,7 +44,6 @@ function registerWindowHandlers(ctx) {
   ipcMain.handle("open-history-window", () => (ctx.windowManager.showHistoryWindow(), true));
   ipcMain.handle("close-history-window", () => (ctx.windowManager.closeHistoryWindow(), true));
   ipcMain.handle("hide-history-window", () => (ctx.windowManager.hideHistoryWindow(), true));
-  ipcMain.handle("open-link-directory-window", () => (ctx.windowManager.showLinkDirectoryWindow(), true));
   ipcMain.handle("open-settings-window", () => (ctx.windowManager.showSettingsWindow(), true));
   ipcMain.handle("close-settings-window", () => (ctx.windowManager.closeSettingsWindow(), true));
   ipcMain.handle("hide-settings-window", () => (ctx.windowManager.hideSettingsWindow(), true));

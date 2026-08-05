@@ -23,3 +23,17 @@ test("settings page exposes the ASR administration entry", () => {
   assert.match(settingsEntry, /openAsrAdminWindow/);
   assert.match(settingsEntry, />\s*ASR 管理\s*</);
 });
+
+test("settings page keeps the selected core entries and removes voice links", () => {
+  assert.match(settingsEntry, />\s*M5 Bridge\s*</);
+  assert.match(settingsEntry, />\s*ASR 服务端\s*</);
+  assert.match(settingsEntry, />\s*翻译历史\s*</);
+  assert.doesNotMatch(settingsEntry, />\s*语音链接表\s*</);
+  assert.doesNotMatch(settingsEntry, /openLinkDirectoryWindow/);
+});
+
+test("settings page does not expose the removed process monitor", () => {
+  assert.doesNotMatch(settingsEntry, /ProcessMonitorPanel/);
+  assert.doesNotMatch(settingsEntry, />\s*进程监控\s*</);
+  assert.doesNotMatch(settingsEntry, /activeTab === ['"]monitor['"]/);
+});

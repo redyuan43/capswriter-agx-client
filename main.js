@@ -113,17 +113,16 @@ const TrayManager = require("./src/helpers/tray");
 const HotkeyManager = require("./src/helpers/hotkeyManager");
 const IPCHandlers = require("./src/helpers/ipcHandlers");
 const CapsLockListener = require("./src/helpers/capsLockListener");
-const ProcessMonitorManager = require("./src/helpers/processMonitorManager");
 const CodexTerminalManager = require("./src/helpers/codexTerminalManager");
 const { Nx1QwenRouter } = require("./src/helpers/nx1QwenRouter");
 const MiniCPMVoiceBridge = require("./src/helpers/minicpmVoiceBridge");
 const VoiceActionManager = require("./src/helpers/voiceActionManager");
 const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
-const { LinkBookmarkManager } = require("./src/helpers/linkBookmarkManager");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
 const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles");
+const HostTriggerOperationQueue = require("./src/helpers/hostTriggerOperationQueue");
 const PipeWirePlaybackController = require("./src/helpers/pipeWirePlaybackController");
 
 // Setup production PATH for Python
@@ -215,13 +214,23 @@ const clipboardManager = new ClipboardManager(logger);
 const trayManager = new TrayManager(logger);
 const hotkeyManager = new HotkeyManager();
 const capsLockListener = new CapsLockListener(logger);
-const processMonitorManager = new ProcessMonitorManager(logger);
 const minicpmVoiceBridge = new MiniCPMVoiceBridge({ logger });
+const hostTriggerOperations = new HostTriggerOperationQueue();
 let clipboardWatchTimer = null;
 let clipboardWatchEnabled = false;
 let lastClipboardText = "";
 const rendererCaptureTriggers = new Set();
 const CLIPBOARD_WATCH_INTERVAL_MS = 500;
+
+function queueHostTriggerOperation(triggerId, operationName, operation) {
+  void hostTriggerOperations.enqueue(operation).catch((error) => {
+    logger.error("Host trigger operation failed", {
+      triggerId,
+      operation: operationName,
+      error: error?.message || String(error),
+    });
+  });
+}
 
 function safeSendToMainWindow(channel, payload) {
   const win = windowManager.mainWindow;
@@ -408,8 +417,6 @@ const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory })
 const nx1QwenRouter = new Nx1QwenRouter({ logger, databaseManager });
 const voiceLearningManager = new VoiceLearningManager({ logger });
 const voiceTeacherClassifier = new VoiceTeacherClassifier({ logger, cwd: __dirname });
-const linkBookmarkManager = new LinkBookmarkManager({ logger });
-linkBookmarkManager.initializeDefaults();
 const m5VoiceBridge = new M5VoiceBridge({
   logger,
   windowManager,
@@ -457,9 +464,7 @@ const voiceActionManager = new VoiceActionManager({
   clipboardManager,
   qwenRouter: nx1QwenRouter,
   teacherClassifier: voiceTeacherClassifier,
-  learningManager: voiceLearningManager,
-  linkBookmarkManager,
-  openExternal: (url) => shell.openExternal(url)
+  learningManager: voiceLearningManager
 });
 let pendingVoiceQuestion = null;
 const PENDING_VOICE_QUESTION_TTL_MS = 120000;
@@ -503,9 +508,6 @@ codexTerminalManager.on("update", (payload) => {
 });
 codexTerminalManager.start();
 
-// Initialize process monitor manager
-processMonitorManager.setDatabaseManager(databaseManager);
-
 // Setup IPC handlers
 const ipcHandlers = new IPCHandlers({
   environmentManager,
@@ -514,8 +516,6 @@ const ipcHandlers = new IPCHandlers({
   windowManager,
   hotkeyManager,
   logger,
-  processMonitorManager,
-  linkBookmarkManager,
   voiceDatasetRecorder,
   asrConnectionProfiles,
   m5VoiceBridge,
@@ -707,19 +707,6 @@ ipcMain.handle("execute-voice-action-intent", async (_event, payload = {}) => {
     });
     return localDeterministicResult;
   }
-  const localLinkResult = await voiceActionManager.executeLinkBookmarkOverride(text, {
-    activeWindowId,
-    serverIntentId: payload.intentId || ""
-  });
-  if (localLinkResult?.handledByVoiceAction) {
-    logger.info("Codex voice route preferred local link bookmark over server intent", {
-      serverIntentId: payload.intentId || "",
-      localIntentId: localLinkResult.intentId || "",
-      matchSource: localLinkResult.matchSource || "",
-      message: localLinkResult.message || ""
-    });
-    return localLinkResult;
-  }
   return await voiceActionManager.executeIntentById(payload.intentId, {
     text,
     activeWindowId
@@ -875,14 +862,6 @@ async function startApp() {
     } catch (error) {
       logger.error("Failed to create control panel window:", error);
     }
-    try {
-      logger.info('Creating link directory window...');
-      await windowManager.createLinkDirectoryWindow();
-      windowManager.showLinkDirectoryWindow();
-      logger.info('Link directory window created successfully');
-    } catch (error) {
-      logger.error("Failed to create link directory window:", error);
-    }
   }
 
   await warnIfLegacyCoreClientRunning();
@@ -897,7 +876,7 @@ async function startApp() {
     windowManager.createControlPanelWindow()
   );
   trayManager.setCreateSettingsWindowCallback(() =>
-    windowManager.showSettingsWindow({ tab: "monitor" })
+    windowManager.showSettingsWindow()
   );
   const trayCreated = await trayManager.createTray();
   if (trayCreated) {
@@ -908,148 +887,156 @@ async function startApp() {
 
   // Setup dictation hold-key listener
   logger.info('Setting up dictation hold-key listener...');
-  capsLockListener.setOnCapsLockDown(async (payload = {}) => {
+  capsLockListener.setOnCapsLockDown((payload = {}) => {
     const triggerId = payload.trigger_id || 'keyboard';
-    logger.info(`${capsLockListener.getDictationKeyDisplayName()} pressed - showing floating ball and starting recording`);
-    for (const activeTriggerId of [...rendererCaptureTriggers]) {
-      if (activeTriggerId === triggerId) continue;
-      rendererCaptureTriggers.delete(activeTriggerId);
-      safeSendToMainWindow('caps-lock-up', {
-        trigger_id: activeTriggerId,
-        forced: true,
-        reason: 'audio_route_handoff',
-      });
-    }
-    const cancelledSessions = m5VoiceBridge.cancelConflictingLocalRecordings(
-      triggerId,
-      'audio_route_handoff'
-    );
-    if (cancelledSessions.length) {
-      logger.info('Conflicting local recordings cancelled for audio route handoff', {
+    queueHostTriggerOperation(triggerId, 'dictation_start', async () => {
+      logger.info(`${capsLockListener.getDictationKeyDisplayName()} pressed - showing floating ball and starting recording`);
+      for (const activeTriggerId of [...rendererCaptureTriggers]) {
+        if (activeTriggerId === triggerId) continue;
+        rendererCaptureTriggers.delete(activeTriggerId);
+        safeSendToMainWindow('caps-lock-up', {
+          trigger_id: activeTriggerId,
+          forced: true,
+          reason: 'audio_route_handoff',
+        });
+      }
+      const cancelledSessions = m5VoiceBridge.cancelConflictingLocalRecordings(
         triggerId,
-        cancelledSessions,
-      });
-    }
-    windowManager.showFloatingBall({
-      rememberActiveWindow: !m5VoiceBridge.hasActiveRecordings(),
-    });
-    const usesSystemDefaultCapture = process.platform === 'linux'
-      ? false
-      : m5VoiceBridge.usesSystemDefaultAudioCapture(triggerId);
-    if (process.platform !== 'linux' && shouldUseRendererCapture(
-      triggerId,
-      usesSystemDefaultCapture
-    )) {
-      rendererCaptureTriggers.add(triggerId);
-      safeSendToMainWindow('caps-lock-down', payload);
-      return;
-    }
-    const routed = await m5VoiceBridge.handleHostTriggerDown(
-      triggerId,
-      windowManager.previousActiveWindow || ''
-    );
-    if (!routed.handled) {
-      if (routed.busy) {
-        safeSendToMainWindow('external-recording-error', {
-          trigger_id: triggerId,
-          error: '录音任务已满，请稍后重试',
-        });
-        setTimeout(() => windowManager.hideFloatingBall(), 1600);
-        return;
-      }
-      if (process.platform === 'linux') {
-        logger.warn('PipeWire audio route is unavailable', {
+        'audio_route_handoff'
+      );
+      if (cancelledSessions.length) {
+        logger.info('Conflicting local recordings cancelled for audio route handoff', {
           triggerId,
-          route: routed.route || null,
+          cancelledSessions,
         });
-        safeSendToMainWindow('external-recording-error', {
-          trigger_id: triggerId,
-          error: 'PipeWire 音频路由不可用',
-        });
-        setTimeout(() => windowManager.hideFloatingBall(), 1600);
+      }
+      windowManager.showFloatingBall({
+        rememberActiveWindow: !m5VoiceBridge.hasActiveRecordings(),
+      });
+      const usesSystemDefaultCapture = process.platform === 'linux'
+        ? false
+        : m5VoiceBridge.usesSystemDefaultAudioCapture(triggerId);
+      if (process.platform !== 'linux' && shouldUseRendererCapture(
+        triggerId,
+        usesSystemDefaultCapture
+      )) {
+        rendererCaptureTriggers.add(triggerId);
+        safeSendToMainWindow('caps-lock-down', payload);
         return;
       }
-      safeSendToMainWindow('caps-lock-down', payload);
-    }
-  });
-
-  capsLockListener.setOnCapsLockUp(async (payload = {}) => {
-    const triggerId = payload.trigger_id || 'keyboard';
-    logger.info(`${capsLockListener.getDictationKeyDisplayName()} released - stopping recording, keep floating ball visible for result`);
-    
-    // Restore the window that was active before the floating recorder appeared.
-    if (windowManager.previousActiveWindow) {
-      clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
-    }
-
-    if (rendererCaptureTriggers.delete(triggerId)) {
-      safeSendToMainWindow('caps-lock-up', payload);
-      return;
-    }
-    
-    // 然后发送停止录音事件
-    const routed = payload.forced
-      ? { handled: m5VoiceBridge.abortHostTrigger(triggerId, payload.reason || 'input_device_closed') }
-      : await m5VoiceBridge.handleHostTriggerUp(triggerId);
-    if (!routed.handled) {
-      safeSendToMainWindow('caps-lock-up', payload);
-    }
-
-    if (process.platform !== 'linux' && capsLockListener.isCapsLockDictationKey()) {
-      setTimeout(() => {
-        try {
-          if (capsLockListener.restoreCapsLockState()) {
-            logger.info('Caps Lock restored after release');
-          }
-        } catch (error) {
-          logger.warn('Failed to restore Caps Lock state:', error?.message || error);
-        }
-      }, 10);
-    }
-  });
-
-  capsLockListener.setOnCodexHoldDown(async () => {
-    logger.info(`${capsLockListener.getCodexKeyDisplayName()} pressed - showing floating ball and starting Codex voice recording`);
-    windowManager.showFloatingBall();
-    if (process.platform === 'linux') {
       const routed = await m5VoiceBridge.handleHostTriggerDown(
-        'keyboard',
-        windowManager.previousActiveWindow || '',
-        { intent: 'codex', mode: 'codex' }
+        triggerId,
+        windowManager.previousActiveWindow || ''
       );
       if (!routed.handled) {
-        safeSendToMainWindow('external-recording-error', {
-          trigger_id: 'keyboard',
-          error: routed.busy ? '录音任务已满，请稍后重试' : 'PipeWire 音频路由不可用',
-        });
+        if (routed.busy) {
+          safeSendToMainWindow('external-recording-error', {
+            trigger_id: triggerId,
+            error: '录音任务已满，请稍后重试',
+          });
+          setTimeout(() => windowManager.hideFloatingBall(), 1600);
+          return;
+        }
+        if (process.platform === 'linux') {
+          logger.warn('PipeWire audio route is unavailable', {
+            triggerId,
+            route: routed.route || null,
+          });
+          safeSendToMainWindow('external-recording-error', {
+            trigger_id: triggerId,
+            error: 'PipeWire 音频路由不可用',
+          });
+          setTimeout(() => windowManager.hideFloatingBall(), 1600);
+          return;
+        }
+        safeSendToMainWindow('caps-lock-down', payload);
       }
-      return;
-    }
-    safeSendToMainWindow('codex-hold-down');
+    });
   });
 
-  capsLockListener.setOnCodexHoldUp(async () => {
-    logger.info(`${capsLockListener.getCodexKeyDisplayName()} released - stopping Codex voice recording`);
-    if (windowManager.previousActiveWindow) {
-      clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
-    }
-    if (process.platform === 'linux') {
-      await m5VoiceBridge.handleHostTriggerUp('keyboard');
-      return;
-    }
-    safeSendToMainWindow('codex-hold-up');
+  capsLockListener.setOnCapsLockUp((payload = {}) => {
+    const triggerId = payload.trigger_id || 'keyboard';
+    queueHostTriggerOperation(triggerId, 'dictation_stop', async () => {
+      logger.info(`${capsLockListener.getDictationKeyDisplayName()} released - stopping recording, keep floating ball visible for result`);
 
-    if (process.platform !== 'linux' && capsLockListener.isCapsLockCodexKey()) {
-      setTimeout(() => {
-        try {
-          if (capsLockListener.restoreCapsLockState()) {
-            logger.info('Caps Lock restored after Codex hold release');
+      // Restore the window that was active before the floating recorder appeared.
+      if (windowManager.previousActiveWindow) {
+        clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
+      }
+
+      if (rendererCaptureTriggers.delete(triggerId)) {
+        safeSendToMainWindow('caps-lock-up', payload);
+        return;
+      }
+
+      // 然后发送停止录音事件
+      const routed = payload.forced
+        ? { handled: m5VoiceBridge.abortHostTrigger(triggerId, payload.reason || 'input_device_closed') }
+        : await m5VoiceBridge.handleHostTriggerUp(triggerId);
+      if (!routed.handled) {
+        safeSendToMainWindow('caps-lock-up', payload);
+      }
+
+      if (process.platform !== 'linux' && capsLockListener.isCapsLockDictationKey()) {
+        setTimeout(() => {
+          try {
+            if (capsLockListener.restoreCapsLockState()) {
+              logger.info('Caps Lock restored after release');
+            }
+          } catch (error) {
+            logger.warn('Failed to restore Caps Lock state:', error?.message || error);
           }
-        } catch (error) {
-          logger.warn('Failed to restore Caps Lock state after Codex hold:', error?.message || error);
+        }, 10);
+      }
+    });
+  });
+
+  capsLockListener.setOnCodexHoldDown(() => {
+    queueHostTriggerOperation('keyboard', 'codex_start', async () => {
+      logger.info(`${capsLockListener.getCodexKeyDisplayName()} pressed - showing floating ball and starting Codex voice recording`);
+      windowManager.showFloatingBall();
+      if (process.platform === 'linux') {
+        const routed = await m5VoiceBridge.handleHostTriggerDown(
+          'keyboard',
+          windowManager.previousActiveWindow || '',
+          { intent: 'codex', mode: 'codex' }
+        );
+        if (!routed.handled) {
+          safeSendToMainWindow('external-recording-error', {
+            trigger_id: 'keyboard',
+            error: routed.busy ? '录音任务已满，请稍后重试' : 'PipeWire 音频路由不可用',
+          });
         }
-      }, 10);
-    }
+        return;
+      }
+      safeSendToMainWindow('codex-hold-down');
+    });
+  });
+
+  capsLockListener.setOnCodexHoldUp(() => {
+    queueHostTriggerOperation('keyboard', 'codex_stop', async () => {
+      logger.info(`${capsLockListener.getCodexKeyDisplayName()} released - stopping Codex voice recording`);
+      if (windowManager.previousActiveWindow) {
+        clipboardManager.setTargetWindow(windowManager.previousActiveWindow);
+      }
+      if (process.platform === 'linux') {
+        await m5VoiceBridge.handleHostTriggerUp('keyboard');
+        return;
+      }
+      safeSendToMainWindow('codex-hold-up');
+
+      if (process.platform !== 'linux' && capsLockListener.isCapsLockCodexKey()) {
+        setTimeout(() => {
+          try {
+            if (capsLockListener.restoreCapsLockState()) {
+              logger.info('Caps Lock restored after Codex hold release');
+            }
+          } catch (error) {
+            logger.warn('Failed to restore Caps Lock state after Codex hold:', error?.message || error);
+          }
+        }, 10);
+      }
+    });
   });
 
   capsLockListener.setOnDictationCancel((payload = {}) => {
@@ -1154,7 +1141,6 @@ app.on("will-quit", () => {
   pipeWirePlayback.stop("app_quit");
   m5VoiceBridge.stop();
   globalShortcut.unregisterAll();
-  processMonitorManager.destroy();
   requestManagedStackShutdown();
 });
 
@@ -1166,6 +1152,5 @@ module.exports = {
   clipboardManager,
   trayManager,
   hotkeyManager,
-  logger,
-  processMonitorManager
+  logger
 };

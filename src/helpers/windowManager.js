@@ -35,7 +35,6 @@ class WindowManager {
     this.controlPanelWindow = null;
     this.historyWindow = null;
     this.settingsWindow = null;
-    this.linkDirectoryWindow = null;
     this.asrAdminWindow = null;
     this.browserWindowFactory = options.browserWindowFactory || ((windowOptions) => new BrowserWindow(windowOptions));
     this.env = options.env || process.env;
@@ -404,7 +403,7 @@ class WindowManager {
 
     const isDev = process.env.NODE_ENV === "development";
 
-    const tab = ["asr", "bridge", "monitor"].includes(options.tab) ? options.tab : "settings";
+    const tab = ["asr", "bridge"].includes(options.tab) ? options.tab : "settings";
     if (isDev) {
       await this.settingsWindow.loadURL(`${devServerUrl}?page=settings&tab=${tab}`);
     } else {
@@ -483,48 +482,6 @@ class WindowManager {
     return adminWindow;
   }
 
-  async createLinkDirectoryWindow() {
-    if (this.isHeadless) {
-      return null;
-    }
-
-    if (this.linkDirectoryWindow) {
-      this.linkDirectoryWindow.focus();
-      return this.linkDirectoryWindow;
-    }
-
-    this.linkDirectoryWindow = new BrowserWindow({
-      width: 980,
-      height: 680,
-      show: false,
-      title: "语音链接表 - 语音转写",
-      alwaysOnTop: false,
-      icon: appIconPath,
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        preload: path.join(__dirname, "..", "..", "preload.js"),
-      },
-    });
-
-    const isDev = process.env.NODE_ENV === "development";
-
-    if (isDev) {
-      await this.linkDirectoryWindow.loadURL(`${devServerUrl}?page=links`);
-    } else {
-      await this.linkDirectoryWindow.loadFile(
-        path.join(__dirname, "..", "dist", "index.html"),
-        { query: { page: "links" } }
-      );
-    }
-
-    this.linkDirectoryWindow.on("closed", () => {
-      this.linkDirectoryWindow = null;
-    });
-
-    return this.linkDirectoryWindow;
-  }
-
   showControlPanel() {
     if (this.controlPanelWindow) {
       this.controlPanelWindow.show();
@@ -570,7 +527,7 @@ class WindowManager {
 
   showSettingsWindow(options = {}) {
     if (this.settingsWindow) {
-      const tab = ["asr", "bridge", "monitor"].includes(options.tab) ? options.tab : "";
+      const tab = ["asr", "bridge"].includes(options.tab) ? options.tab : "";
       if (tab) {
         const isDev = process.env.NODE_ENV === "development";
         if (isDev) {
@@ -604,9 +561,6 @@ class WindowManager {
     if (this.settingsWindow) {
       this.settingsWindow.close();
     }
-    if (this.linkDirectoryWindow) {
-      this.linkDirectoryWindow.close();
-    }
   }
 
   closeAllWindows() {
@@ -637,18 +591,6 @@ class WindowManager {
     return true;
   }
 
-  showLinkDirectoryWindow() {
-    if (this.linkDirectoryWindow) {
-      this.linkDirectoryWindow.show();
-      this.linkDirectoryWindow.focus();
-    } else {
-      this.createLinkDirectoryWindow().then(() => {
-        if (this.linkDirectoryWindow) {
-          this.linkDirectoryWindow.show();
-        }
-      });
-    }
-  }
 }
 
 module.exports = WindowManager;

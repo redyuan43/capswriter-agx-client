@@ -4,7 +4,6 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { LinkBookmarkManager } = require("../../src/helpers/linkBookmarkManager");
 const VoiceActionManager = require("../../src/helpers/voiceActionManager");
 const { VoiceLearningManager } = require("../../src/helpers/voiceLearningManager");
 
@@ -12,7 +11,7 @@ function createTempPath(name) {
   return path.join(os.tmpdir(), `capswriter-${name}-${process.pid}-${Date.now()}.json`);
 }
 
-function createManager({ teacherDecision = null, shortcuts = [], clipboardManager = {}, linkBookmarkManager = null, openExternal = null } = {}) {
+function createManager({ teacherDecision = null, shortcuts = [], clipboardManager = {} } = {}) {
   const teacherCalls = [];
   const reviewLaunches = [];
   const learningManager = new VoiceLearningManager({
@@ -37,8 +36,6 @@ function createManager({ teacherDecision = null, shortcuts = [], clipboardManage
       cancelActive: () => false
     },
     learningManager,
-    linkBookmarkManager,
-    openExternal,
     configPath
   });
 
@@ -214,115 +211,6 @@ async function run() {
     assert.strictEqual(result.cancelled, true);
     assert.strictEqual(result.intentId, "move_window_to_right_workspace");
     assert.strictEqual(keySequences.length, 1);
-  }
-
-  {
-    const openedUrls = [];
-    const linkBookmarkManager = new LinkBookmarkManager({
-      bookmarksPath: createTempPath("link-bookmarks")
-    });
-    linkBookmarkManager.saveBookmark({
-      id: "daily_report",
-      title: "日报系统",
-      url: "http://127.0.0.1:9999/report",
-      aliases: ["日报", "日报页面"],
-      enabled: true
-    });
-    const { manager } = createManager({
-      linkBookmarkManager,
-      openExternal: async (url) => {
-        openedUrls.push(url);
-      }
-    });
-
-    const result = await manager.handlePrompt("打开日报页面", {});
-
-    assert.strictEqual(result.success, true);
-    assert.strictEqual(result.intentId, "open_link_bookmark");
-    assert.strictEqual(result.actionType, "open_link_bookmark");
-    assert.deepStrictEqual(openedUrls, ["http://127.0.0.1:9999/report"]);
-  }
-
-  {
-    const openedUrls = [];
-    const linkBookmarkManager = new LinkBookmarkManager({
-      bookmarksPath: createTempPath("link-bookmarks-strong-alias")
-    });
-    const { manager } = createManager({
-      linkBookmarkManager,
-      openExternal: async (url) => {
-        openedUrls.push(url);
-      }
-    });
-
-    const result = await manager.handlePrompt("设计风格", {});
-
-    assert.strictEqual(result.success, true);
-    assert.strictEqual(result.intentId, "open_link_bookmark");
-    assert.strictEqual(result.matchSource, "link_exact");
-    assert.deepStrictEqual(openedUrls, ["http://127.0.0.1:17573/design-systems"]);
-  }
-
-  {
-    const openedUrls = [];
-    const linkBookmarkManager = new LinkBookmarkManager({
-      bookmarksPath: createTempPath("link-bookmarks-chatgpt")
-    });
-    const { manager } = createManager({
-      linkBookmarkManager,
-      openExternal: async (url) => {
-        openedUrls.push(url);
-      }
-    });
-
-    const result = await manager.handlePrompt("打开ChatGPT页面", {});
-
-    assert.strictEqual(result.success, true);
-    assert.strictEqual(result.intentId, "open_link_bookmark");
-    assert.strictEqual(result.matchSource, "link_exact");
-    assert.deepStrictEqual(openedUrls, ["https://chatgpt.com"]);
-  }
-
-  {
-    const openedUrls = [];
-    const shellCalls = [];
-    const linkBookmarkManager = new LinkBookmarkManager({
-      bookmarksPath: createTempPath("link-bookmarks-server-override")
-    });
-    const { manager } = createManager({
-      linkBookmarkManager,
-      openExternal: async (url) => {
-        openedUrls.push(url);
-      }
-    });
-    manager.spawnDetached = async (command, args) => {
-      shellCalls.push({ command, args });
-    };
-
-    const result = await manager.executeLinkBookmarkOverride("打开ChatGPT网页", {
-      serverIntentId: "open_gnome_terminal"
-    });
-
-    assert.strictEqual(result.success, true);
-    assert.strictEqual(result.intentId, "open_link_bookmark");
-    assert.strictEqual(result.actionType, "open_link_bookmark");
-    assert.deepStrictEqual(openedUrls, ["https://chatgpt.com"]);
-    assert.deepStrictEqual(shellCalls, []);
-  }
-
-  {
-    const { manager } = createManager();
-    const shellCalls = [];
-    manager.spawnDetached = async (command, args) => {
-      shellCalls.push({ command, args });
-    };
-
-    const result = await manager.executeLinkBookmarkOverride("打开一个终端", {
-      serverIntentId: "open_gnome_terminal"
-    });
-
-    assert.strictEqual(result, null);
-    assert.deepStrictEqual(shellCalls, []);
   }
 
   {

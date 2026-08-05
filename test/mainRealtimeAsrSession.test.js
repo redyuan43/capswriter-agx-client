@@ -90,3 +90,78 @@ test("main ASR cancellation drops pending PCM and closes the socket", async () =
   assert.equal(session.pendingBytes, 0);
   assert.equal(socket.readyState, FakeWebSocket.CLOSED);
 });
+
+test("main ASR immediately uses the latest partial when the socket closes during finalization", async () => {
+  FakeWebSocket.instances = [];
+  const session = new MainRealtimeAsrSession({
+    connectionProvider: async () => ({ url: "ws://asr.example/realtime" }),
+    WebSocketClass: FakeWebSocket,
+    connectTimeoutMs: 1000,
+    finalTimeoutMs: 1000,
+  });
+
+  const start = session.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.message({ type: "ready" });
+  await start;
+
+  const finishing = session.finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.message({ type: "partial", text: "连接关闭前的结果" });
+  socket.close();
+
+  const result = await finishing;
+  assert.equal(result.text, "连接关闭前的结果");
+  assert.equal(result.partial_fallback, true);
+  assert.equal(result.partial_fallback_reason, "socket_closed");
+});
+
+test("main ASR uses the latest partial after the bounded final timeout", async () => {
+  FakeWebSocket.instances = [];
+  const session = new MainRealtimeAsrSession({
+    connectionProvider: async () => ({ url: "ws://asr.example/realtime" }),
+    WebSocketClass: FakeWebSocket,
+    connectTimeoutMs: 1000,
+    finalTimeoutMs: 20,
+  });
+
+  const start = session.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.message({ type: "ready" });
+  await start;
+
+  const finishing = session.finish();
+  socket.message({ type: "partial", text: "超时兜底文本" });
+  const keepAlive = setTimeout(() => {}, 1000);
+  const result = await finishing.finally(() => clearTimeout(keepAlive));
+  assert.equal(result.text, "超时兜底文本");
+  assert.equal(result.partial_fallback, true);
+  assert.equal(result.partial_fallback_reason, "final_timeout");
+});
+
+test("main ASR still fails when the socket closes without any usable partial", async () => {
+  FakeWebSocket.instances = [];
+  const session = new MainRealtimeAsrSession({
+    connectionProvider: async () => ({ url: "ws://asr.example/realtime" }),
+    WebSocketClass: FakeWebSocket,
+    connectTimeoutMs: 1000,
+    finalTimeoutMs: 1000,
+  });
+
+  const start = session.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.message({ type: "ready" });
+  await start;
+
+  const finishing = session.finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.close();
+
+  await assert.rejects(finishing, /closed before final/);
+});

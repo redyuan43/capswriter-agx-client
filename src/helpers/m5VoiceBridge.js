@@ -32,6 +32,9 @@ const MAX_CONCURRENT_RECORDINGS = 4;
 const RECORDING_FIRST_CHUNK_TIMEOUT_MS = 12000;
 const RECORDING_STALL_TIMEOUT_MS = 10000;
 const RECORDING_MAX_DURATION_MS = 180000;
+const REMOTE_AUDIO_DRAIN_TIMEOUT_MS = 2000;
+const REMOTE_AUDIO_DRAIN_QUIET_MS = 400;
+const REMOTE_AUDIO_DRAIN_POLL_MS = 25;
 const DEFAULT_MINIJOY_BLUETOOTH_MAC = "14:08:08:52:F9:62";
 const MAX_DIAGNOSTIC_AGE_MS = 5 * 60 * 1000;
 const BLUETOOTH_RECOVERY_COOLDOWN_MS = 60000;
@@ -310,6 +313,9 @@ class M5VoiceBridge {
     this.recordingFirstChunkTimeoutMs = RECORDING_FIRST_CHUNK_TIMEOUT_MS;
     this.recordingStallTimeoutMs = RECORDING_STALL_TIMEOUT_MS;
     this.recordingMaxDurationMs = RECORDING_MAX_DURATION_MS;
+    this.remoteAudioDrainTimeoutMs = REMOTE_AUDIO_DRAIN_TIMEOUT_MS;
+    this.remoteAudioDrainQuietMs = REMOTE_AUDIO_DRAIN_QUIET_MS;
+    this.remoteAudioDrainPollMs = REMOTE_AUDIO_DRAIN_POLL_MS;
     this.enabled = parseBool(process.env.M5_VOICE_BRIDGE_ENABLED, true);
     this.host = process.env.M5_VOICE_BRIDGE_HOST || DEFAULT_HOST;
     this.port = Number(process.env.M5_VOICE_BRIDGE_PORT || DEFAULT_PORT);
@@ -1161,7 +1167,6 @@ loadBluetoothDevices();
     session.audioSource = body.audio_source || "stickc_plus_pcm";
     session.protocolVersion = Math.max(1, Number(body.protocol_version || 1));
     session.seenChunkIds = new Set();
-    this.prepareMainAsrSession(session);
     this.armSessionWatchdogs(session);
     if (captureMode === "host_capture") {
       this.applyAudioRoute(route);
@@ -1208,7 +1213,6 @@ loadBluetoothDevices();
     if (!this.recordingSessions.appendAudio(session, body)) {
       return false;
     }
-    this.prepareMainAsrSession(session)?.sendPcm(body);
     if (!session.firstAudioAt) {
       session.firstAudioAt = session.lastAudioAt;
       if (session.captureMode === "host_capture") {
@@ -1220,10 +1224,18 @@ loadBluetoothDevices();
         bytes: body.length,
       });
     }
+    const chunk = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
     const dispatchedNow = !session.rendererDispatched &&
       this.dispatchRendererSessionIfIdle(session);
     if (dispatchedNow) {
       return true;
+    }
+    if (this.rendererSessionId === session.id) {
+      this.sendToRenderer("external-recording-chunk", {
+        session_id: session.id,
+        chunk,
+        byte_length: body.length,
+      });
     }
     return true;
   }
@@ -1902,7 +1914,6 @@ loadBluetoothDevices();
     this.hostTriggerSessions.set(triggerId, sessionId);
     session.source = "audio_router";
     session.audioSource = route.source_id;
-    this.prepareMainAsrSession(session);
     this.armRendererSessionIfIdle(session);
     this.armSessionWatchdogs(session);
     return session;
@@ -1933,17 +1944,35 @@ loadBluetoothDevices();
         type: "recording_stop",
         payload: { session_id: sessionId },
       });
-      acknowledgement = await this.commandBroker.waitForAcknowledgement(
+      const acknowledgementStartedAt = Date.now();
+      const acknowledgementPromise = this.commandBroker.waitForAcknowledgement(
         session.sourceDeviceId,
         command.command_id
       );
-      if (!acknowledgement || acknowledgement.status !== "completed") {
-        this.logger?.warn?.("Host-triggered remote audio stop was not acknowledged", {
+      session.remoteStopAcknowledgementPromise = acknowledgementPromise;
+      void acknowledgementPromise.then((result) => {
+        session.remoteStopAcknowledgement = result;
+        if (!result || result.status !== "completed") {
+          this.logger?.warn?.("Host-triggered remote audio stop was not acknowledged", {
+            sessionId,
+            deviceId: session.sourceDeviceId,
+            acknowledgement: result,
+          });
+          return;
+        }
+        this.logger?.info?.("Host-triggered remote audio stop acknowledged in background", {
           sessionId,
           deviceId: session.sourceDeviceId,
-          acknowledgement,
+          elapsedMs: Date.now() - acknowledgementStartedAt,
         });
-      }
+      }).catch((error) => {
+        this.logger?.warn?.("Host-triggered remote audio stop acknowledgement failed", {
+          sessionId,
+          deviceId: session.sourceDeviceId,
+          error: error?.message || String(error),
+        });
+      });
+      acknowledgement = await this.waitForRemoteAudioDrain(session, acknowledgementPromise);
     }
     if (session.bytes === 0) {
       if (this.isRendererVisibleSession(session)) {
@@ -1969,6 +1998,50 @@ loadBluetoothDevices();
     this.audioRouting.clearActiveRoute(triggerId);
     this.restoreUnifiedDefaultSource();
     return { handled: true, session_id: sessionId, acknowledgement };
+  }
+
+  async waitForRemoteAudioDrain(session, acknowledgementPromise) {
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(0, Number(this.remoteAudioDrainTimeoutMs || 0));
+    const quietMs = Math.max(0, Number(this.remoteAudioDrainQuietMs || 0));
+    const pollMs = Math.max(1, Number(this.remoteAudioDrainPollMs || 1));
+    let observedBytes = session?.bytes || 0;
+    let lastAudioChangeAt = startedAt;
+    let acknowledgement = null;
+    let acknowledgementSettled = false;
+    const settledAcknowledgement = Promise.resolve(acknowledgementPromise).then(
+      (result) => ({ settled: true, result }),
+      () => ({ settled: true, result: null })
+    );
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const remainingMs = timeoutMs - (Date.now() - startedAt);
+      const delay = new Promise((resolve) => {
+        const timer = setTimeout(
+          () => resolve({ settled: false }),
+          Math.min(pollMs, remainingMs)
+        );
+        timer.unref?.();
+      });
+      const outcome = acknowledgementSettled
+        ? await delay
+        : await Promise.race([settledAcknowledgement, delay]);
+      if (outcome.settled) {
+        acknowledgementSettled = true;
+        acknowledgement = outcome.result;
+        if (acknowledgement?.status === "completed") {
+          return acknowledgement;
+        }
+      }
+      if ((session?.bytes || 0) !== observedBytes) {
+        observedBytes = session.bytes;
+        lastAudioChangeAt = Date.now();
+      }
+      if (observedBytes > 0 && Date.now() - lastAudioChangeAt >= quietMs) {
+        return acknowledgement;
+      }
+    }
+    return acknowledgement;
   }
 
   latestSessionId() {
@@ -2073,6 +2146,17 @@ loadBluetoothDevices();
     this.rendererSessionId = session.id;
     session.rendererDispatched = true;
     this.sendToRenderer("external-recording-start", this.rendererStartPayload(session));
+    if (session.bytes > 0 && session.pcmFile) {
+      const pcm = fs.readFileSync(session.pcmFile);
+      for (let offset = 0; offset < pcm.length; offset += MAX_AUDIO_CHUNK_BYTES) {
+        const chunk = pcm.subarray(offset, Math.min(offset + MAX_AUDIO_CHUNK_BYTES, pcm.length));
+        this.sendToRenderer("external-recording-chunk", {
+          session_id: session.id,
+          chunk,
+          byte_length: chunk.length,
+        });
+      }
+    }
     if (session.rendererStopped) this.dispatchRendererStop(session);
     return true;
   }
@@ -2090,7 +2174,6 @@ loadBluetoothDevices();
       bytes: session.bytes,
       chunks: session.chunks,
     });
-    this.finalizeMainAsrSession(session);
   }
 
   advanceRendererQueue() {

@@ -136,6 +136,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("external-recording-armed", listener);
   },
 
+  onExternalRecordingChunk: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("external-recording-chunk", listener);
+    return () => ipcRenderer.removeListener("external-recording-chunk", listener);
+  },
+
   onExternalRecordingStop: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("external-recording-stop", listener);
@@ -181,11 +187,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   executeVoiceActionIntent: (payload) => ipcRenderer.invoke("execute-voice-action-intent", payload),
   cancelCodexVoiceRoute: (payload) => ipcRenderer.invoke("cancel-codex-voice-route", payload),
   learnVoiceRouteShortcut: (candidate) => ipcRenderer.invoke("learn-voice-route-shortcut", candidate),
-  getLinkBookmarks: () => ipcRenderer.invoke("get-link-bookmarks"),
-  saveLinkBookmark: (bookmark) => ipcRenderer.invoke("save-link-bookmark", bookmark),
-  deleteLinkBookmark: (id) => ipcRenderer.invoke("delete-link-bookmark", id),
-  reloadLinkBookmarks: () => ipcRenderer.invoke("reload-link-bookmarks"),
-  openLinkBookmark: (payload) => ipcRenderer.invoke("open-link-bookmark", payload),
   openCodexDebugTerminal: () => ipcRenderer.invoke("open-codex-debug-terminal"),
   resolveNx1QwenRouter: (options) => ipcRenderer.invoke("resolve-nx1-qwen-router", options),
   testNx1QwenRouter: () => ipcRenderer.invoke("test-nx1-qwen-router"),
@@ -260,8 +261,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   openHistoryWindow: () => ipcRenderer.invoke("open-history-window"),
   closeHistoryWindow: () => ipcRenderer.invoke("close-history-window"),
   hideHistoryWindow: () => ipcRenderer.invoke("hide-history-window"),
-  openLinkDirectoryWindow: () => ipcRenderer.invoke("open-link-directory-window"),
-
   // 设置窗口相关
   openSettingsWindow: () => ipcRenderer.invoke("open-settings-window"),
   closeSettingsWindow: () => ipcRenderer.invoke("close-settings-window"),
@@ -292,45 +291,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // 性能监控
   getPerformanceStats: () => ipcRenderer.invoke("get-performance-stats"),
-  clearPerformanceStats: () => ipcRenderer.invoke("clear-performance-stats"),
-
-  // 进程监控
-  getMonitorConfigs: () => ipcRenderer.invoke("get-monitor-configs"),
-  addMonitorConfig: (config) => ipcRenderer.invoke("add-monitor-config", config),
-  updateMonitorConfig: (id, updates) => ipcRenderer.invoke("update-monitor-config", id, updates),
-  deleteMonitorConfig: (id) => ipcRenderer.invoke("delete-monitor-config", id),
-  startMonitor: (id) => ipcRenderer.invoke("start-monitor", id),
-  stopMonitor: (id) => ipcRenderer.invoke("stop-monitor", id),
-  getMonitorStatus: (id) => ipcRenderer.invoke("get-monitor-status", id),
-  getAllMonitorsStatus: () => ipcRenderer.invoke("get-all-monitors-status"),
-  isMonitorRunning: (id) => ipcRenderer.invoke("is-monitor-running", id),
-
-  // 进程监控事件监听
-  onMonitorStatusUpdate: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on("monitor-status-update", listener);
-    return () => ipcRenderer.removeListener("monitor-status-update", listener);
-  },
-  onMonitorAlert: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on("monitor-alert", listener);
-    return () => ipcRenderer.removeListener("monitor-alert", listener);
-  },
-  onMonitorError: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on("monitor-error", listener);
-    return () => ipcRenderer.removeListener("monitor-error", listener);
-  },
-  onMonitorStopped: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on("monitor-stopped", listener);
-    return () => ipcRenderer.removeListener("monitor-stopped", listener);
-  },
-  onMonitorProcessExited: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on("monitor-process-exited", listener);
-    return () => ipcRenderer.removeListener("monitor-process-exited", listener);
-  }
+  clearPerformanceStats: () => ipcRenderer.invoke("clear-performance-stats")
 });
 
 // 添加一些实用的常量

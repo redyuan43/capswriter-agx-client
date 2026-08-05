@@ -1,6 +1,6 @@
 const { ipcMain } = require("electron");
 
-const { forwardMonitorEvents, registerIpcHandlers } = require("../platform/electron/ipc/registerIpcHandlers");
+const { registerIpcHandlers } = require("../platform/electron/ipc/registerIpcHandlers");
 
 class IPCHandlers {
   constructor(managers) {
@@ -10,15 +10,12 @@ class IPCHandlers {
     this.windowManager = managers.windowManager;
     this.hotkeyManager = managers.hotkeyManager;
     this.logger = managers.logger;
-    this.processMonitorManager = managers.processMonitorManager;
-    this.linkBookmarkManager = managers.linkBookmarkManager;
     this.voiceDatasetRecorder = managers.voiceDatasetRecorder;
     this.asrConnectionProfiles = managers.asrConnectionProfiles;
     this.m5VoiceBridge = managers.m5VoiceBridge;
     this.f2RegisteredSenders = new Set();
 
     registerIpcHandlers(this);
-    forwardMonitorEvents(this);
   }
 
   emitSettingsUpdate(payload) {
