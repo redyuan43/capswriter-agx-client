@@ -171,6 +171,7 @@ test("health requires the configured token and returns bridge identity", async (
     clipboardManager: {},
     sendToRenderer() {},
   });
+  bridge.restoreUnifiedDefaultSource = () => null;
   bridge.start();
   await once(bridge.server, "listening");
   t.after(() => bridge.stop());
