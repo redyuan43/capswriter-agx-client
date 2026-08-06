@@ -247,13 +247,13 @@ print(json.dumps({"value": value, "commands": commands}))
 `);
   assert.equal(result.value.ok, true);
   assert.equal(result.value.commands.length, 2);
-  assert.equal(result.value.audio_profile.profile, "headset-head-unit-cvsd");
+  assert.equal(result.value.audio_profile.profile, "headset-head-unit-msbc");
   assert.equal(result.commands.length, 3);
   assert.deepEqual(result.commands[2], [
     "pactl",
     "set-card-profile",
     "bluez_card.14_08_08_52_F9_62",
-    "headset-head-unit-cvsd",
+    "headset-head-unit-msbc",
   ]);
 });
 

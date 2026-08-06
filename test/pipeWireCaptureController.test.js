@@ -166,3 +166,188 @@ test("PipeWire capture waits for asynchronous retry preparation before relaunchi
   assert.equal(children.length, 2);
   assert.equal(controller.stop("prepared-retry"), true);
 });
+
+test("PipeWire capture validates initial PCM and flushes quiet changing audio", () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  const controller = new PipeWireCaptureController({ spawnProcess: () => child });
+  const chunks = [];
+
+  controller.start("valid-pcm", "pipewire:source", (chunk) => chunks.push(chunk), "", {
+    initialAudioBytes: 8,
+    validateInitialAudio: (pcm) => ({
+      valid: pcm.some((byte) => byte !== 0),
+      reason: "all_zero",
+    }),
+  });
+  child.stdout.emit("data", Buffer.from([1, 0, 2, 0]));
+  assert.equal(chunks.length, 0);
+  child.stdout.emit("data", Buffer.from([3, 0, 4, 0]));
+
+  assert.deepEqual(Buffer.concat(chunks), Buffer.from([1, 0, 2, 0, 3, 0, 4, 0]));
+  assert.equal(controller.stop("valid-pcm"), true);
+});
+
+test("PipeWire capture resets the route only after invalid initial PCM", async () => {
+  const children = [];
+  const retryReasons = [];
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      children.push(child);
+      return child;
+    },
+  });
+  const chunks = [];
+  controller.start("invalid-then-valid", "pipewire:source", (chunk) => chunks.push(chunk), "", {
+    initialAudioBytes: 8,
+    maxStartAttempts: 2,
+    validateInitialAudio: (pcm) => ({
+      valid: pcm.some((byte) => byte !== 0),
+      reason: "all_zero",
+    }),
+    beforeRetry: ({ reason }) => retryReasons.push(reason),
+  });
+
+  children[0].stdout.emit("data", Buffer.alloc(8));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(children.length, 2);
+  assert.deepEqual(retryReasons, ["invalid_audio"]);
+  assert.equal(chunks.length, 0);
+
+  children[1].stdout.emit("data", Buffer.from([1, 0, 2, 0, 3, 0, 4, 0]));
+  assert.equal(chunks.length, 1);
+  assert.equal(controller.stop("invalid-then-valid"), true);
+});
+
+test("PipeWire capture waits through mSBC startup silence and flushes all buffered PCM", () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  const controller = new PipeWireCaptureController({ spawnProcess: () => child });
+  const chunks = [];
+  let retries = 0;
+
+  controller.start("startup-silence", "pipewire:source", (chunk) => chunks.push(chunk), "", {
+    initialAudioBytes: 8,
+    maxInitialAudioBytes: 16,
+    deferredInvalidAudioReasons: ["all_zero"],
+    validateInitialAudio: (pcm) => ({
+      valid: pcm.some((byte) => byte !== 0),
+      reason: "all_zero",
+    }),
+    beforeRetry: () => { retries += 1; },
+  });
+
+  child.stdout.emit("data", Buffer.alloc(8));
+  assert.equal(chunks.length, 0);
+  assert.equal(retries, 0);
+  child.stdout.emit("data", Buffer.from([1, 0, 2, 0]));
+
+  assert.deepEqual(Buffer.concat(chunks), Buffer.from([
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0,
+  ]));
+  assert.equal(retries, 0);
+  assert.equal(controller.stop("startup-silence"), true);
+});
+
+test("PipeWire capture retries when mSBC startup remains silent through its grace window", async () => {
+  const children = [];
+  const retries = [];
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      children.push(child);
+      return child;
+    },
+  });
+
+  controller.start("persistent-silence", "pipewire:source", () => {}, "", {
+    initialAudioBytes: 8,
+    maxInitialAudioBytes: 16,
+    deferredInvalidAudioReasons: ["all_zero"],
+    maxStartAttempts: 2,
+    validateInitialAudio: () => ({ valid: false, reason: "all_zero" }),
+    beforeRetry: (details) => retries.push(details.validationReason),
+  });
+
+  children[0].stdout.emit("data", Buffer.alloc(8));
+  assert.equal(children.length, 1);
+  children[0].stdout.emit("data", Buffer.alloc(8));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(children.length, 2);
+  assert.deepEqual(retries, ["all_zero"]);
+  assert.equal(controller.stop("persistent-silence"), true);
+});
+
+test("PipeWire capture reports invalid PCM after retry exhaustion", async () => {
+  const children = [];
+  const failures = [];
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      children.push(child);
+      return child;
+    },
+  });
+  controller.start("always-invalid", "pipewire:source", () => {}, "", {
+    initialAudioBytes: 8,
+    maxStartAttempts: 2,
+    validateInitialAudio: () => ({
+      valid: false,
+      reason: "all_zero",
+      metrics: { peak: 0 },
+    }),
+    onInvalidAudio: (details) => failures.push(details),
+  });
+
+  children[0].stdout.emit("data", Buffer.alloc(8));
+  await new Promise((resolve) => setImmediate(resolve));
+  children[1].stdout.emit("data", Buffer.alloc(8));
+
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].validationReason, "all_zero");
+  assert.equal(failures[0].metrics.peak, 0);
+  assert.equal(controller.captures.has("always-invalid"), false);
+});
+
+test("PipeWire capture rebuilds the route before retrying an early process exit", async () => {
+  const children = [];
+  const preparations = [];
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      children.push(child);
+      return child;
+    },
+  });
+  controller.start("early-exit", "pipewire:source", () => {}, "", {
+    maxStartAttempts: 2,
+    beforeRetry: (details) => preparations.push(details),
+  });
+
+  children[0].emit("close", 1, null);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(children.length, 2);
+  assert.equal(preparations.length, 1);
+  assert.equal(preparations[0].reason, "capture_exited");
+  assert.equal(preparations[0].code, 1);
+  assert.equal(controller.stop("early-exit"), true);
+});

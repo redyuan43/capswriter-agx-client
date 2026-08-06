@@ -24,7 +24,7 @@ SERIAL_GLOB = "/dev/serial/by-id/usb-Hades2001_M5stack_*-if00-port0"
 DEFAULT_STATE_FILE = os.path.join(os.path.expanduser("~"), ".cache",
                                   "capswriter-agx-client", "m5bridge-doctor.json")
 RECOVERY_HELPER = "/usr/libexec/capswriter-m5-recover-bluetooth"
-MINIJOY_HFP_PROFILE = "headset-head-unit-cvsd"
+MINIJOY_HFP_PROFILE = "headset-head-unit-msbc"
 
 
 def run(*args: str, timeout: int = 20) -> dict:

@@ -14,6 +14,7 @@ const M5DeviceCommandBroker = require("./m5DeviceCommandBroker");
 const PipeWireCaptureController = require("./pipeWireCaptureController");
 const PipeWireUnifiedSourceController = require("./pipeWireUnifiedSourceController");
 const BluetoothDeviceManager = require("./bluetoothDeviceManager");
+const { classifyPcmTransport } = require("./pcmSignalQuality");
 const {
   MainRealtimeAsrSession,
   extractText: extractMainAsrText,
@@ -43,6 +44,7 @@ const HOST_AUDIO_FAILURE_REASONS = new Set([
   "audio_capture_exited",
   "audio_input_empty",
   "audio_input_stalled",
+  "audio_input_invalid",
   "first_audio_chunk_timeout",
 ]);
 
@@ -1279,7 +1281,7 @@ loadBluetoothDevices();
     const mac = match[1].replace(/_/g, ":").toUpperCase();
     const wake = await this.bluetoothDevices.activateAudioProfile(mac, 3);
     if (!wake.success) {
-      this.logger?.warn?.("MiniJoy CVSD wake failed before recording", {
+      this.logger?.warn?.("MiniJoy mSBC wake failed before recording", {
         triggerId: route.trigger_id,
         sourceId,
         mac,
@@ -1349,6 +1351,11 @@ loadBluetoothDevices();
       ...base,
       firstChunkRetryMs: 3000,
       maxStartAttempts: 2,
+      initialAudioBytes: 12288,
+      maxInitialAudioBytes: 32000,
+      deferredInvalidAudioReasons: ["all_zero", "frozen", "sparse_frozen"],
+      validateInitialAudio: classifyPcmTransport,
+      onInvalidAudio: (details) => this.abortSession(session, "audio_input_invalid", details),
       beforeRetry: async () => {
         const reset = await this.bluetoothDevices.resetAudioProfile(mac, 8);
         const route = this.audioRouting.activateTrigger(session.triggerId, {
@@ -2077,6 +2084,37 @@ loadBluetoothDevices();
         message: "Cyber agent streaming",
       });
       return { success: true };
+    }
+    const rendererFailed = payload.success === false ||
+      String(payload.status || "") === "transcription_failed";
+    const bluetoothHostCapture = session.captureMode === "host_capture" &&
+      String(session.sourceId || "").startsWith("pipewire:bluez_input.");
+    if (rendererFailed && bluetoothHostCapture && session.pcmFile) {
+      try {
+        const quality = classifyPcmTransport(fs.readFileSync(session.pcmFile));
+        if (!quality.valid) {
+          const details = {
+            validationReason: quality.reason,
+            metrics: quality.metrics,
+          };
+          this.audioRouting.recordCaptureFailure(
+            session.sourceId,
+            "audio_input_invalid",
+            details
+          );
+          this.logger?.warn?.("MiniJoy ASR failed with invalid Bluetooth PCM", {
+            sessionId: session.id,
+            sourceId: session.sourceId,
+            ...details,
+          });
+          this.queueBluetoothAudioRecovery(session, "audio_input_invalid");
+        }
+      } catch (error) {
+        this.logger?.warn?.("Unable to inspect failed MiniJoy PCM", {
+          sessionId: session.id,
+          error: error?.message || String(error),
+        });
+      }
     }
     this.finishSession(session, payload);
     return { success: true };

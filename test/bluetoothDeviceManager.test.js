@@ -33,7 +33,7 @@ test("Bluetooth repair asks before removing one stale MAC", async () => {
     if (args[0] === "info") {
       return { success: true, stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: no\n  Bonded: no\n  Trusted: no\n  Connected: no` };
     }
-    if (args.includes("pair")) {
+    if (command === "sh" && args[1]?.includes(` pair ${MAC}`)) {
       return { success: false, stdout: "Failed to pair: org.bluez.Error.AlreadyExists" };
     }
     return { success: true, stdout: "" };
@@ -58,10 +58,10 @@ test("Bluetooth command output can report a pairing failure despite a zero exit 
     MAC,
   ]);
   assert.equal(pipeWireCardName(MAC), "bluez_card.C8_85_41_68_39_0A");
-  assert.equal(MINIJOY_HFP_PROFILE, "headset-head-unit-cvsd");
+  assert.equal(MINIJOY_HFP_PROFILE, "headset-head-unit-msbc");
 });
 
-test("Bluetooth audio reset reconnects only the HFP profile before selecting CVSD", async () => {
+test("Bluetooth audio reset cycles only the PipeWire profile before selecting mSBC", async () => {
   const commands = [];
   const waits = [];
   const manager = new BluetoothDeviceManager({
@@ -81,33 +81,27 @@ test("Bluetooth audio reset reconnects only the HFP profile before selecting CVS
   const result = await manager.resetAudioProfile(MAC, 1);
 
   assert.equal(result.success, true);
-  assert.equal(result.recovery, "hfp_profile_reset");
+  assert.equal(result.recovery, "pipewire_profile_reset");
   assert.deepEqual(commands[0], [
-    "busctl",
-    "--system",
-    "--timeout=2s",
-    "call",
-    "org.bluez",
-    "/org/bluez/hci0/dev_C8_85_41_68_39_0A",
-    "org.bluez.Device1",
-    "DisconnectProfile",
-    "s",
-    MINIJOY_HFP_UUID,
+    "bluetoothctl",
+    "info",
+    MAC,
   ]);
   assert.deepEqual(commands[1], [
-    "busctl",
-    "--system",
-    "--timeout=2s",
-    "call",
-    "org.bluez",
-    "/org/bluez/hci0/dev_C8_85_41_68_39_0A",
-    "org.bluez.Device1",
-    "ConnectProfile",
-    "s",
-    MINIJOY_HFP_UUID,
+    "pactl",
+    "set-card-profile",
+    "bluez_card.C8_85_41_68_39_0A",
+    "off",
   ]);
+  assert.deepEqual(commands[3], [
+    "pactl",
+    "set-card-profile",
+    "bluez_card.C8_85_41_68_39_0A",
+    "headset-head-unit-msbc",
+  ]);
+  assert.equal(commands.some((command) => command[0] === "busctl"), false);
   assert.equal(commands.some((command) => command.includes("disconnect")), false);
-  assert.deepEqual(waits, [300, 500]);
+  assert.deepEqual(waits, [200]);
 });
 
 test("Bluetooth audio reset falls back to one device transport reconnect", async () => {
@@ -154,7 +148,7 @@ test("Bluetooth audio reset falls back to one device transport reconnect", async
   ]);
 });
 
-test("Bluetooth audio activation reconnects an idle paired MiniJoy before selecting CVSD", async () => {
+test("Bluetooth audio activation reconnects an idle paired MiniJoy before selecting mSBC", async () => {
   const commands = [];
   let connected = false;
   const manager = new BluetoothDeviceManager({
@@ -189,7 +183,7 @@ test("Bluetooth audio activation reconnects an idle paired MiniJoy before select
     "pactl",
     "set-card-profile",
     "bluez_card.C8_85_41_68_39_0A",
-    "headset-head-unit-cvsd",
+    "headset-head-unit-msbc",
   ]);
 });
 
@@ -205,7 +199,7 @@ test("confirmed Bluetooth cleanup removes only the requested MAC before pairing"
         stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: ${paired ? "yes" : "no"}\n  Bonded: ${paired ? "yes" : "no"}\n  Trusted: ${paired ? "yes" : "no"}\n  Connected: ${paired ? "yes" : "no"}`,
       };
     }
-    if (args.includes("pair")) {
+    if (command === "sh" && args[1]?.includes(` pair ${MAC}`)) {
       pairAttempts += 1;
       if (pairAttempts === 1) return { success: false, stdout: "org.bluez.Error.AlreadyExists" };
       paired = true;
@@ -217,13 +211,16 @@ test("confirmed Bluetooth cleanup removes only the requested MAC before pairing"
 
   assert.equal(result.success, true);
   assert.deepEqual(commands.find((command) => command[1] === "remove"), ["bluetoothctl", "remove", MAC]);
-  assert.equal(commands.filter((command) => command.includes("scan")).length, 2);
+  assert.equal(
+    commands.filter((command) => command[0] === "sh" && command[2]?.includes("scan on")).length,
+    2
+  );
   assert.equal(commands.some((command) => command.includes("14:08:08:52:F9:62")), false);
   assert.deepEqual(commands.find((command) => command[0] === "pactl"), [
     "pactl",
     "set-card-profile",
     "bluez_card.C8_85_41_68_39_0A",
-    "headset-head-unit-cvsd",
+    "headset-head-unit-msbc",
   ]);
 });
 
@@ -239,7 +236,7 @@ test("forced Bluetooth cleanup re-pairs an already connected MiniJoy by MAC", as
       };
     }
     if (args[0] === "remove") paired = false;
-    if (args.includes("pair")) paired = true;
+    if (command === "sh" && args[1]?.includes(` pair ${MAC}`)) paired = true;
     return { success: true, stdout: "ok" };
   };
   const manager = new BluetoothDeviceManager({ runCommand });
@@ -250,7 +247,10 @@ test("forced Bluetooth cleanup re-pairs an already connected MiniJoy by MAC", as
 
   assert.equal(result.success, true);
   assert.deepEqual(commands.find((command) => command[1] === "remove"), ["bluetoothctl", "remove", MAC]);
-  assert.equal(commands.some((command) => command.includes("pair")), true);
+  assert.equal(
+    commands.some((command) => command[0] === "sh" && command[2]?.includes(` pair ${MAC}`)),
+    true
+  );
 });
 
 test("Bluetooth repair rejects a false-success pairing command when BlueZ remains unpaired", async () => {
@@ -261,7 +261,7 @@ test("Bluetooth repair rejects a false-success pairing command when BlueZ remain
         stdout: `Device ${MAC}\n  Name: VibeStick MiniJoy\n  Paired: no\n  Bonded: no\n  Trusted: no\n  Connected: no`,
       };
     }
-    if (args.includes("pair")) {
+    if (command === "sh" && args[1]?.includes(` pair ${MAC}`)) {
       return { success: true, stdout: "Failed to pair: org.bluez.Error.Failed" };
     }
     return { success: true, stdout: "ok" };
@@ -273,7 +273,7 @@ test("Bluetooth repair rejects a false-success pairing command when BlueZ remain
   assert.equal(result.stage, "pair_failed");
 });
 
-test("Bluetooth repair accepts a partial BlueZ connect once the CVSD audio profile works", async () => {
+test("Bluetooth repair accepts a partial BlueZ connect once the mSBC audio profile works", async () => {
   const commands = [];
   const runCommand = async (command, args) => {
     commands.push([command, ...args]);
@@ -300,6 +300,6 @@ test("Bluetooth repair accepts a partial BlueZ connect once the CVSD audio profi
 
   assert.equal(result.success, true);
   assert.equal(result.stage, "connected");
-  assert.equal(result.audio_profile.profile, "headset-head-unit-cvsd");
+  assert.equal(result.audio_profile.profile, "headset-head-unit-msbc");
   assert.equal(commands.some((command) => command[0] === "pactl"), true);
 });

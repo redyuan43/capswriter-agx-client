@@ -121,7 +121,7 @@ async function startBridge(t, sendToRenderer = () => {}, options = {}) {
   bridge.bluetoothDevices.activateAudioProfile = async (mac) => ({
     success: true,
     card_name: `bluez_card.${mac.replace(/:/g, "_")}`,
-    profile: "headset-head-unit-cvsd",
+    profile: "headset-head-unit-msbc",
   });
   bridge.start();
   await once(bridge.server, "listening");
@@ -764,7 +764,7 @@ test("Wi-Fi trigger release accepts a delayed first PCM chunk before checking fo
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capture", async (t) => {
+test("MiniJoy audio route wakes mSBC and refreshes the PipeWire node before capture", async (t) => {
   const { bridge } = await startBridge(t);
   const calls = [];
   let activation = 0;
@@ -785,7 +785,7 @@ test("MiniJoy audio route wakes CVSD and refreshes the PipeWire node before capt
   };
   bridge.bluetoothDevices.activateAudioProfile = async (mac, attempts) => {
     calls.push({ type: "wake", mac, attempts });
-    return { success: true, profile: "headset-head-unit-cvsd" };
+    return { success: true, profile: "headset-head-unit-msbc" };
   };
   bridge.pipeWireUnifiedSource.activate = (sourceNodeName) => {
     calls.push({ type: "route", sourceNodeName });
@@ -1036,6 +1036,98 @@ test("MiniJoy host capture with no PCM records an audio failure but remains retr
     ),
     false
   );
+});
+
+test("MiniJoy capture validates only Bluetooth PCM and retries invalid transport audio", async (t) => {
+  const { bridge } = await startBridge(t);
+  const bluetoothSession = {
+    id: "bluetooth-quality",
+    sourceId: "pipewire:bluez_input.C8_85_41_68_39_0A",
+    triggerId: "minijoy_bt:c8854168390a",
+  };
+  const usbSession = {
+    id: "usb-quality",
+    sourceId: "pipewire:alsa_input.usb-microphone",
+    triggerId: "keyboard",
+  };
+
+  const bluetoothOptions = bridge.captureOptionsForSession(bluetoothSession);
+  const usbOptions = bridge.captureOptionsForSession(usbSession);
+
+  assert.equal(bluetoothOptions.initialAudioBytes, 12288);
+  assert.equal(bluetoothOptions.maxInitialAudioBytes, 32000);
+  assert.deepEqual(
+    bluetoothOptions.deferredInvalidAudioReasons,
+    ["all_zero", "frozen", "sparse_frozen"]
+  );
+  assert.equal(bluetoothOptions.validateInitialAudio(Buffer.alloc(12288)).valid, false);
+  const quietChanging = Buffer.alloc(12288);
+  for (let offset = 0; offset < quietChanging.length; offset += 2) {
+    quietChanging.writeInt16LE((offset / 2) % 17 - 8, offset);
+  }
+  assert.equal(bluetoothOptions.validateInitialAudio(quietChanging).valid, true);
+  assert.equal("initialAudioBytes" in usbOptions, false);
+});
+
+test("failed ASR marks frozen MiniJoy PCM unhealthy and queues Bluetooth recovery", async (t) => {
+  const { bridge } = await startBridge(t);
+  const sourceId = "pipewire:bluez_input.C8_85_41_68_39_0A";
+  const session = bridge.recordingSessions.create({
+    id: "frozen-bluetooth-pcm",
+    intent: "dictation",
+    triggerId: "minijoy_bt:c8854168390a",
+  });
+  session.captureMode = "host_capture";
+  session.sourceId = sourceId;
+  bridge.recordingSessions.appendAudio(session, Buffer.alloc(8192));
+  const recoveries = [];
+  bridge.queueBluetoothAudioRecovery = (candidate, reason) => {
+    recoveries.push({ candidate, reason });
+    return true;
+  };
+
+  await bridge.handleRendererResult({
+    session_id: session.id,
+    success: false,
+    status: "transcription_failed",
+  });
+
+  assert.equal(bridge.audioRouting.captureHealthFor(sourceId).status, "failed");
+  assert.equal(
+    bridge.audioRouting.captureHealthFor(sourceId).failure_reason,
+    "audio_input_invalid"
+  );
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0].reason, "audio_input_invalid");
+});
+
+test("failed ASR does not reset Bluetooth for valid quiet PCM", async (t) => {
+  const { bridge } = await startBridge(t);
+  const session = bridge.recordingSessions.create({
+    id: "quiet-valid-bluetooth-pcm",
+    intent: "dictation",
+    triggerId: "minijoy_bt:c8854168390a",
+  });
+  session.captureMode = "host_capture";
+  session.sourceId = "pipewire:bluez_input.C8_85_41_68_39_0A";
+  const pcm = Buffer.alloc(8192);
+  for (let offset = 0; offset < pcm.length; offset += 2) {
+    pcm.writeInt16LE((offset / 2) % 11 - 5, offset);
+  }
+  bridge.recordingSessions.appendAudio(session, pcm);
+  let recoveryQueued = false;
+  bridge.queueBluetoothAudioRecovery = () => {
+    recoveryQueued = true;
+    return true;
+  };
+
+  await bridge.handleRendererResult({
+    session_id: session.id,
+    success: false,
+    status: "transcription_failed",
+  });
+
+  assert.equal(recoveryQueued, false);
 });
 
 test("unavailable MiniJoy input is rejected instead of falling back to the PC microphone", async (t) => {

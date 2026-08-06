@@ -1,5 +1,5 @@
 const MAC_PATTERN = /^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$/;
-const MINIJOY_HFP_PROFILE = "headset-head-unit-cvsd";
+const MINIJOY_HFP_PROFILE = "headset-head-unit-msbc";
 const MINIJOY_HFP_UUID = "0000111e-0000-1000-8000-00805f9b34fb";
 
 function normalizeMac(value) {
@@ -46,6 +46,10 @@ function bluetoothCommandSucceeded(result) {
     .test(commandText(result));
 }
 
+function deviceAlreadyAbsent(result) {
+  return /\b(?:not available|does not exist)\b/i.test(commandText(result));
+}
+
 function pairingArgs(mac) {
   return [
     "--agent",
@@ -54,6 +58,15 @@ function pairingArgs(mac) {
     "30",
     "pair",
     mac,
+  ];
+}
+
+function pairingWhileScanningArgs(mac) {
+  return [
+    "-lc",
+    `bluetoothctl --timeout 35 scan on >/dev/null 2>&1 & scan_pid=$!; ` +
+      `sleep 2; bluetoothctl --agent NoInputNoOutput --timeout 30 pair ${mac}; ` +
+      "status=$?; kill $scan_pid 2>/dev/null || true; wait $scan_pid 2>/dev/null || true; exit $status",
   ];
 }
 
@@ -161,35 +174,64 @@ class BluetoothDeviceManager {
         detail: "invalid Bluetooth MAC",
       };
     }
+    const cardName = pipeWireCardName(normalizedMac);
+    let device = await this.info(normalizedMac);
+    if (device.connected) {
+      const profileOff = await this.runCommand(
+        "pactl",
+        ["set-card-profile", cardName, "off"],
+        5000
+      );
+      await this.wait(200);
+      const pipeWireReset = await this.activateAudioProfile(
+        normalizedMac,
+        Math.min(2, Math.max(1, attempts))
+      );
+      if (profileOff?.success && pipeWireReset.success) {
+        return {
+          ...pipeWireReset,
+          recovery: "pipewire_profile_reset",
+        };
+      }
+      device = await this.info(normalizedMac);
+    }
+
     const devicePath = `/org/bluez/hci0/dev_${normalizedMac.replace(/:/g, "_")}`;
-    await this.runCommand("busctl", [
-      "--system",
-      "--timeout=2s",
-      "call",
-      "org.bluez",
-      devicePath,
-      "org.bluez.Device1",
-      "DisconnectProfile",
-      "s",
-      MINIJOY_HFP_UUID,
-    ], 3000);
-    await this.wait(300);
-    await this.runCommand("busctl", [
-      "--system",
-      "--timeout=2s",
-      "call",
-      "org.bluez",
-      devicePath,
-      "org.bluez.Device1",
-      "ConnectProfile",
-      "s",
-      MINIJOY_HFP_UUID,
-    ], 3000);
-    await this.wait(500);
-    const profileReset = await this.activateAudioProfile(
-      normalizedMac,
-      Math.min(2, Math.max(1, attempts))
-    );
+    let profileReset = {
+      success: false,
+      profile: MINIJOY_HFP_PROFILE,
+      detail: "Bluetooth transport is disconnected",
+    };
+    if (device.connected) {
+      await this.runCommand("busctl", [
+        "--system",
+        "--timeout=2s",
+        "call",
+        "org.bluez",
+        devicePath,
+        "org.bluez.Device1",
+        "DisconnectProfile",
+        "s",
+        MINIJOY_HFP_UUID,
+      ], 3000);
+      await this.wait(300);
+      await this.runCommand("busctl", [
+        "--system",
+        "--timeout=2s",
+        "call",
+        "org.bluez",
+        devicePath,
+        "org.bluez.Device1",
+        "ConnectProfile",
+        "s",
+        MINIJOY_HFP_UUID,
+      ], 3000);
+      await this.wait(500);
+      profileReset = await this.activateAudioProfile(
+        normalizedMac,
+        Math.min(2, Math.max(1, attempts))
+      );
+    }
     if (profileReset.success) {
       return {
         ...profileReset,
@@ -246,7 +288,7 @@ class BluetoothDeviceManager {
         };
       }
       const removed = await this.runCommand("bluetoothctl", ["remove", normalizedMac], 10000);
-      if (!bluetoothCommandSucceeded(removed)) {
+      if (!bluetoothCommandSucceeded(removed) && !deviceAlreadyAbsent(removed)) {
         return { success: false, stage: "remove_failed", device: before, detail: commandText(removed) };
       }
       before = {
@@ -259,8 +301,7 @@ class BluetoothDeviceManager {
     }
 
     if (!before.paired || !before.bonded) {
-      await this.runCommand("bluetoothctl", ["--timeout", "8", "scan", "on"], 10000);
-      let pair = await this.runCommand("bluetoothctl", pairingArgs(normalizedMac), 35000);
+      let pair = await this.runCommand("sh", pairingWhileScanningArgs(normalizedMac), 40000);
       if (/org\.bluez\.Error\.AlreadyExists/i.test(commandText(pair))) {
         if (!confirmCleanup) {
           return {
@@ -272,11 +313,10 @@ class BluetoothDeviceManager {
           };
         }
         const removed = await this.runCommand("bluetoothctl", ["remove", normalizedMac], 10000);
-        if (!removed?.success) {
+        if (!bluetoothCommandSucceeded(removed) && !deviceAlreadyAbsent(removed)) {
           return { success: false, stage: "remove_failed", device: before, detail: commandText(removed) };
         }
-        await this.runCommand("bluetoothctl", ["--timeout", "8", "scan", "on"], 10000);
-        pair = await this.runCommand("bluetoothctl", pairingArgs(normalizedMac), 35000);
+        pair = await this.runCommand("sh", pairingWhileScanningArgs(normalizedMac), 40000);
       }
       const paired = await this.info(normalizedMac);
       if (!bluetoothCommandSucceeded(pair) || !paired.paired || !paired.bonded) {
