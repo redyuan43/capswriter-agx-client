@@ -37,6 +37,16 @@ class M5VoiceBridgeRouter {
         await bridge.handleDeviceCommandPoll(req, res, url);
         return;
       }
+      if (path === "/codex-trace") {
+        bridge.requireToken(req);
+        bridge.sendJson(res, 200, await bridge.codexTrace(url));
+        return;
+      }
+      if (path === "/codex-trace/session") {
+        bridge.requireToken(req);
+        bridge.sendJson(res, 200, await bridge.codexTraceSession(url));
+        return;
+      }
       if (path === "/" || path === "/dashboard") {
         bridge.sendHtml(res, 200, bridge.buildDashboardHtml());
         return;
