@@ -1508,10 +1508,23 @@ loadBluetoothDevices();
     const saved = this.audioRouting.routesForSources(sources);
     const activeRoute = this.audioRouting.latestActiveRoute();
     const triggerId = activeRoute?.trigger_id || "keyboard";
+    const restoreSaved = activeRoute
+      ? saved
+      : {
+        version: 3,
+        routes: {
+          keyboard: saved.routes?.keyboard?.sink_id
+            ? {
+              sink_id: saved.routes.keyboard.sink_id,
+              pipeline_id: saved.routes.keyboard.pipeline_id || "default",
+            }
+            : {},
+        },
+      };
     const route = this.audioRouting.resolveRoute(
       triggerId,
       sources,
-      activeRoute ? saved : { version: 3, routes: {} },
+      restoreSaved,
       {
         fallbackToAvailable: true,
         sinks,
@@ -1774,7 +1787,15 @@ loadBluetoothDevices();
     return this.audioRouting.usesSystemDefaultCapture(triggerId);
   }
 
-  resolveOutputSinkNodeName(triggerId = "keyboard") {
+  async resolveOutputSinkNodeName(triggerId = "keyboard") {
+    const defaultSink = await this.runCommand(
+      "pactl",
+      ["get-default-sink"],
+      3000
+    );
+    if (defaultSink?.success && String(defaultSink.stdout || "").trim()) {
+      return String(defaultSink.stdout).trim();
+    }
     const state = this.audioRouting.getState();
     const route = state.routes?.[triggerId] || state.routes?.keyboard;
     return String(route?.sink?.node_name || "").trim();

@@ -590,6 +590,30 @@ test("audio routes apply input and output independently", async (t) => {
   assert.equal(remoteResult.output_applied, true);
 });
 
+test("PipeWire playback follows the current default sink instead of a stale saved route", async (t) => {
+  const { bridge } = await startBridge(t);
+  bridge.audioRouting.getState = () => ({
+    routes: {
+      keyboard: {
+        sink: { node_name: "alsa_output.pci-hdmi" },
+      },
+    },
+  });
+  bridge.runCommand = async (command, args) => {
+    assert.equal(command, "pactl");
+    assert.deepEqual(args, ["get-default-sink"]);
+    return {
+      success: true,
+      stdout: "alsa_output.pci-analog-stereo\n",
+    };
+  };
+
+  assert.equal(
+    await bridge.resolveOutputSinkNodeName("keyboard"),
+    "alsa_output.pci-analog-stereo"
+  );
+});
+
 test("idle audio restore ignores a saved Bluetooth keyboard route", async (t) => {
   const { bridge } = await startBridge(t);
   const usbSource = {
@@ -619,14 +643,23 @@ test("idle audio restore ignores a saved Bluetooth keyboard route", async (t) =>
     online: true,
     transport_available: true,
   };
+  const configuredSink = {
+    sink_id: "pipewire-sink:alsa_output.pci-hdmi",
+    kind: "pipewire",
+    node_name: "alsa_output.pci-hdmi",
+    name: "HDMI",
+    base_name: "HDMI",
+    online: true,
+    transport_available: true,
+  };
   bridge.audioRouting.listSources = () => [usbSource, bluetoothSource];
-  bridge.audioRouting.listSinks = () => [sink];
+  bridge.audioRouting.listSinks = () => [sink, configuredSink];
   bridge.audioRouting.routesForSources = () => ({
     version: 3,
     routes: {
       keyboard: {
         source_id: bluetoothSource.source_id,
-        sink_id: sink.sink_id,
+        sink_id: configuredSink.sink_id,
         pipeline_id: "default",
       },
     },
@@ -641,7 +674,7 @@ test("idle audio restore ignores a saved Bluetooth keyboard route", async (t) =>
   bridge.restoreUnifiedDefaultSource();
 
   assert.equal(appliedRoute.source_id, usbSource.source_id);
-  assert.equal(appliedRoute.sink_id, sink.sink_id);
+  assert.equal(appliedRoute.sink_id, configuredSink.sink_id);
 });
 
 test("keyboard route takeover cancels only conflicting local captures", async (t) => {

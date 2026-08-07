@@ -805,7 +805,7 @@ ipcMain.handle("play-pipewire-audio", async (_event, payload = {}) => {
   }
   const audio = Buffer.from(payload.audio || []);
   const triggerId = String(payload.trigger_id || "keyboard");
-  const sinkNodeName = m5VoiceBridge.resolveOutputSinkNodeName(triggerId);
+  const sinkNodeName = await m5VoiceBridge.resolveOutputSinkNodeName(triggerId);
   return await pipeWirePlayback.play(audio, {
     sinkNodeName,
     requestId: String(payload.request_id || `renderer-audio-${Date.now()}`),
