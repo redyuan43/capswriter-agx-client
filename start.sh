@@ -109,6 +109,12 @@ ensure_pnpm() {
     return 0
   fi
 
+  local local_pnpm="${PNPM_HOME:-$HOME/.local/share/pnpm}/pnpm"
+  if [[ -x "$local_pnpm" ]]; then
+    export PATH="$(dirname "$local_pnpm"):$PATH"
+    return 0
+  fi
+
   if command -v corepack >/dev/null 2>&1; then
     corepack enable
   fi
