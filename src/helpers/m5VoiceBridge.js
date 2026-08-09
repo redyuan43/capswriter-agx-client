@@ -47,7 +47,8 @@ const HOST_AUDIO_FAILURE_REASONS = new Set([
   "audio_input_invalid",
   "first_audio_chunk_timeout",
 ]);
-
+const CODEX_TRACE_TIMEOUT_MS = 3000;
+const CODEX_TRACE_CACHE_MS = 3000;
 function cleanToken(value) {
   const token = String(value || "").trim();
   if (!token || [
@@ -334,6 +335,11 @@ class M5VoiceBridge {
       otaDir: process.env.M5_VOICE_BRIDGE_OTA_DIR || process.env.VIBE_STICK_OTA_DIR,
     });
     this.otaDir = this.otaService.otaDir;
+    this.codexTraceUrl = String(
+      process.env.M5_CODEX_TRACE_URL || "http://agx.taild500c8.ts.net:8788/api/codex-trace/device"
+    ).trim();
+    this.codexTraceCache = null;
+    this.fetch = globalThis.fetch;
     this.latestTtsAudioFile = "";
     this.ttsPlaybackRequestId = "";
     this.ttsPlaybackQueue = [];
@@ -418,6 +424,56 @@ class M5VoiceBridge {
 
   listDevices() {
     return this.deviceRegistry.listOnline();
+  }
+
+  async codexTrace(url) {
+    const range = String(url.searchParams.get("range") || "48h").trim();
+    const includeHistory = url.searchParams.get("includeHistory") === "1";
+    return this.fetchCodexTrace(`/api/codex-trace/device?range=${encodeURIComponent(range)}&includeHistory=${includeHistory ? "1" : "0"}&limit=10`);
+  }
+
+  async codexTraceSession(url) {
+    const threadId = String(url.searchParams.get("threadId") || "").trim();
+    if (!threadId) {
+      throw Object.assign(new Error("threadId is required"), { statusCode: 400 });
+    }
+    const range = String(url.searchParams.get("range") || "48h").trim();
+    return this.fetchCodexTrace(`/api/codex-trace/device/session/${encodeURIComponent(threadId)}?range=${encodeURIComponent(range)}`);
+  }
+
+  async fetchCodexTrace(pathname) {
+    if (!this.codexTraceUrl || typeof this.fetch !== "function") {
+      throw Object.assign(new Error("CodexTrace endpoint is unavailable"), { statusCode: 503 });
+    }
+    const configured = new URL(this.codexTraceUrl);
+    const endpoint = new URL(pathname, configured.origin);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CODEX_TRACE_TIMEOUT_MS);
+    try {
+      const response = await this.fetch(endpoint, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" }
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw Object.assign(new Error(payload?.error || `CodexTrace HTTP ${response.status}`), { statusCode: response.status });
+      }
+      this.codexTraceCache = { payload, at: Date.now() };
+      return { ...payload, stale: false, cachedAt: new Date(this.codexTraceCache.at).toISOString() };
+    } catch (error) {
+      const cached = this.codexTraceCache;
+      if (cached) {
+        return {
+          ...cached.payload,
+          stale: true,
+          cachedAt: new Date(cached.at).toISOString(),
+          error: error?.message || "CodexTrace upstream unavailable"
+        };
+      }
+      throw Object.assign(new Error(error?.message || "CodexTrace upstream unavailable"), { statusCode: 503 });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   buildDashboardHtml() {
