@@ -124,6 +124,7 @@ ENV/
 env.bak/
 venv.bak/
 
+
 # FunASR models and cache
 models/
 cache/
@@ -153,3 +154,9 @@ temp/
 .gyprc
 
 python
+
+# Bundled Linux device mapper source
+!python/
+!python/knob-mapper/
+!python/knob-mapper/*.py
+!python/knob-mapper/config.yaml

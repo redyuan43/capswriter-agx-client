@@ -94,6 +94,10 @@ configure_minijoy_input_permission() {
 # Allow the active graphical user to read keyboard events and the MiniJoy mouse event device.
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="VibeStick MiniJoy Mouse", TAG+="uaccess"
+# Allow the CapsWriter device mapper to create virtual keyboard events.
+KERNEL=="uinput", TAG+="uaccess"
+# Keep the verified LiQi raw HID interface address stable across reboots.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="514c", ATTRS{idProduct}=="4155", SYMLINK+="knob-mapper-raw", TAG+="uaccess"
 EOF
 
   echo "Configuring MiniJoy trackball input permission..."

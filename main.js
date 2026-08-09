@@ -124,6 +124,7 @@ const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
 const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles");
 const HostTriggerOperationQueue = require("./src/helpers/hostTriggerOperationQueue");
 const PipeWirePlaybackController = require("./src/helpers/pipeWirePlaybackController");
+const { KnobMapperManager } = require("./src/helpers/knobMapperManager");
 
 // Setup production PATH for Python
 function setupProductionPath() {
@@ -405,6 +406,11 @@ async function warnIfLegacyCoreClientRunning() {
 // Ensure data directory and initialize database
 const dataDirectory = environmentManager.ensureDataDirectory();
 databaseManager.initialize(dataDirectory);
+const knobMapperManager = new KnobMapperManager({
+  logger,
+  databaseManager,
+  dataDirectory,
+});
 const asrConnectionProfiles = new AsrConnectionProfiles({
   databaseManager,
   dataDirectory,
@@ -519,6 +525,7 @@ const ipcHandlers = new IPCHandlers({
   voiceDatasetRecorder,
   asrConnectionProfiles,
   m5VoiceBridge,
+  knobMapperManager,
 });
 
 ipcMain.handle("set-clipboard-watch-enabled", (_event, enabled) => {
@@ -1091,6 +1098,13 @@ async function startApp() {
   }
   m5VoiceBridge.start();
 
+  if (process.platform === "linux" && knobMapperManager.isEnabled()) {
+    const mapperStatus = await knobMapperManager.start({ automatic: true });
+    if (!mapperStatus.success) {
+      logger.warn("Knob mapper automatic startup failed", mapperStatus.error || mapperStatus);
+    }
+  }
+
   logger.info('Application startup complete');
 }
 
@@ -1140,6 +1154,7 @@ app.on("will-quit", () => {
   stopClipboardWatch();
   pipeWirePlayback.stop("app_quit");
   m5VoiceBridge.stop();
+  void knobMapperManager.stop();
   globalShortcut.unregisterAll();
   requestManagedStackShutdown();
 });

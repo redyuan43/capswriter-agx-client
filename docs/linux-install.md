@@ -53,6 +53,8 @@ The installer automatically:
 - installs a udev `uaccess` rule for keyboard input and the `VibeStick MiniJoy Mouse` input device;
 - imports the graphical-session environment and starts the monitored client;
 - restarts the complete client process group after an unexpected crash.
+- bundles the verified Linux device mapper and exposes its controls in the
+  CapsWriter settings page;
 
 After a system reboot, CapsWriter starts again when the user logs into the
 graphical desktop. A GUI application cannot run before a user graphical session
@@ -90,6 +92,9 @@ default, so it can distinguish ordinary Right Shift from MiniJoy input. The
 rule remains effective when MiniJoy reconnects and does not add the user to the
 global `input` group.
 
+The same rule also exposes the verified LiQi raw HID interface as
+`/dev/knob-mapper-raw` for the integrated device mapper.
+
 When multiple MiniJoy devices share the same Bluetooth name, CapsWriter uses
 their Bluetooth MAC addresses to keep their HID buttons and HFP microphones
 separate. The routing page shows a short suffix such as `MiniJoy F9:62`, and
@@ -98,6 +103,24 @@ the saved route survives `/dev/input/eventN` changes after reconnecting.
 Use `--skip-input-permission` when MiniJoy is not used or system permissions
 must remain unchanged. If MiniJoy was already connected during installation,
 reconnect it once and restart CapsWriter.
+
+## Verified Device Mapping
+
+The settings page includes the verified mappings for the LiQi dual knob,
+DOIO three-key keyboard, IINE keyboard, and Ulanzi/MINI_KEYBOARD. The mapper
+runs as a child process of the CapsWriter user service, so it starts again
+after the graphical session is restored.
+
+If the standalone mapper service was previously installed, disable it before
+using the integrated mapper:
+
+```bash
+systemctl --user disable --now knob-mapper.service
+```
+
+The page can start, stop, restart, and scan the mapper. Device values are
+intentionally read-only in this first integrated version; only the verified
+hardware contract is exposed.
 
 ## Verify
 
