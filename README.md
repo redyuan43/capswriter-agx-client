@@ -244,6 +244,18 @@ export CAPS_LISTENER_BACKEND=evdev
 
 如果日志出现 `EACCES`，检查 udev 规则是否已安装，以及当前会话是否由 systemd-logind 管理。
 
+### Linux 设备映射
+
+CapsWriter 设置页中的“设备映射”管理已经验证过的 LiQi 双旋钮、DOIO 三键键盘、IINE 和 Ulanzi/MINI_KEYBOARD。映射器随 CapsWriter 客户端启动，并使用稳定的设备名或 `/dev/input/by-id/` 路径，不依赖变化的 `eventN` 编号。
+
+如果之前单独运行过 `knob-mapper.service`，迁移到 CapsWriter 后应停用旧服务，避免两个进程同时抓取输入设备：
+
+```bash
+systemctl --user disable --now knob-mapper.service
+```
+
+之后从 CapsWriter 设置页的“设备映射”中查看服务状态、扫描设备或执行重启。
+
 验证日志：
 
 ```bash

@@ -1,0 +1,257 @@
+devices:
+  knob1_evdev:
+    - /dev/input/by-id/usb-LiQi_Technology*_USB_Composite_Device_*-event-kbd
+  knob2_evdev:
+    - /dev/input/by-id/usb-LiQi_Technology*_USB_Composite_Device_*-event-kbd
+  doio_evdev:
+    - /dev/input/by-id/usb-DOIO_KBGM-M03A-HE-if02-event-kbd
+  named_evdev:
+    - Ulanzi Dial Keyboard
+    - MINI_KEYBOARD
+  passthrough_named_evdev:
+    - IINE_keyboard
+  raw_report_hidraw:
+    - /dev/knob-mapper-raw
+  knob1_cw_key: KEY_VOLUMEUP
+  knob1_ccw_key: KEY_VOLUMEDOWN
+  # When holding the button and rotating the knob, calibration showed:
+  # one direction -> next song, the other -> previous song.
+  knob1_chord_cw_key: KEY_NEXTSONG
+  knob1_chord_ccw_key: KEY_PREVIOUSSONG
+  # Calibration showed the second knob sends the number keys:
+  # clockwise -> "2", counter-clockwise -> "1".
+  knob2_cw_key: KEY_2
+  knob2_ccw_key: KEY_1
+  button1_key: KEY_MUTE
+  doio_key1: KEY_J
+  doio_key2: KEY_K
+  doio_key3: KEY_L
+  doio_up_key: KEY_UP
+  doio_down_key: KEY_DOWN
+  doio_left_key: KEY_LEFT
+  doio_right_key: KEY_RIGHT
+  doio_enter_key: KEY_ENTER
+  # Trace shows the physical press is silent; the device emits this pulse
+  # when the physical button is released.
+  button1_mode: release_pulse
+
+behavior:
+  grab_evdev: true
+  hold_seconds: 0.2
+
+raw_hid:
+  report_id: 1
+  burst_gap_seconds: 0.16
+  min_reports: 4
+  min_magnitude: 8
+  # Run `sudo ./knob_mapper.py --calibrate second-knob` to replace these.
+  clockwise_vector: [1, -1]
+  counterclockwise_vector: [-1, 1]
+
+raw_report_map:
+  "01 10 00 00 00 00 00 00": raw.button1.press
+  "01 08 00 00 00 00 00 00": raw.button2.press
+
+key_events:
+  KEY_VOLUMEUP: ulanzi.volume_up.press
+  KEY_VOLUMEDOWN: ulanzi.volume_down.press
+
+key_state_events:
+  KEY_MUTE: ulanzi.mute
+
+hold_tap_events:
+  # Long press mirrors the AMD/DOIO three-key keyboard, while short taps stay separate.
+  KEY_PREVIOUSSONG: ulanzi.caps_key
+  KEY_PLAYPAUSE: ulanzi.enter_key
+  KEY_NEXTSONG: ulanzi.shift_key
+
+passthrough_key_state_events:
+  # IINE right-side key trace: event25 / IINE_keyboard / KEY_SPACE.
+  KEY_SPACE: iine.right_shift
+
+chord_events:
+  KEY_LEFTMETA+KEY_C: ulanzi.copy.press
+  KEY_LEFTMETA+KEY_V: ulanzi.paste.press
+  KEY_LEFTMETA+KEY_Z: ulanzi.undo.press
+  KEY_LEFTSHIFT+KEY_LEFTMETA+KEY_Z: ulanzi.redo.press
+
+abs_axis_events:
+  ABS_Y:
+    touch_key: BTN_TOUCH
+    positive: knob2.ccw
+    negative: knob2.cw
+    min_delta: 500
+
+actions:
+  ulanzi.caps_key.tap:
+    # Short tap intentionally does nothing; Caps only activates on hold.
+  ulanzi.caps_key.hold:
+    uinput_key_down: KEY_CAPSLOCK
+  ulanzi.caps_key.hold_release:
+    uinput_key_up: KEY_CAPSLOCK
+  ulanzi.enter_key.tap:
+    uinput_key: KEY_ENTER
+  ulanzi.enter_key.hold:
+    uinput_key_down: KEY_ENTER
+  ulanzi.enter_key.hold_release:
+    uinput_key_up: KEY_ENTER
+  ulanzi.shift_key.tap:
+    # Short tap intentionally does nothing; Shift only activates on hold.
+  ulanzi.shift_key.hold:
+    uinput_key_down: KEY_RIGHTSHIFT
+  ulanzi.shift_key.hold_release:
+    uinput_key_up: KEY_RIGHTSHIFT
+  iine.right_shift.press:
+    uinput_key_down: KEY_RIGHTSHIFT
+  iine.right_shift.release:
+    uinput_key_up: KEY_RIGHTSHIFT
+  ulanzi.volume_up.press:
+    uinput_sequence:
+      - keydown: Super_L
+      - keydown: Alt_L
+      - key: Right
+      - keyup: Alt_L
+      - keyup: Super_L
+    every_n: 1
+  ulanzi.volume_down.press:
+    uinput_sequence:
+      - keydown: Super_L
+      - keydown: Alt_L
+      - key: Left
+      - keyup: Alt_L
+      - keyup: Super_L
+    every_n: 1
+  ulanzi.mute.press:
+    uinput_key_down: KEY_LEFTMETA
+  ulanzi.mute.release:
+    uinput_key_up: KEY_LEFTMETA
+  ulanzi.copy.press:
+    uinput_key: KEY_F19
+  ulanzi.paste.press:
+    uinput_key: KEY_F20
+  ulanzi.undo.press:
+    uinput_key: KEY_F21
+  ulanzi.redo.press:
+    uinput_key: KEY_F22
+  knob2.cw:
+    sequence:
+      - keydown: Control_L
+      - keydown: Super_L
+      - key: Right
+      - keyup: Super_L
+      - keyup: Control_L
+    every_n: 1
+  knob2.ccw:
+    sequence:
+      - keydown: Control_L
+      - keydown: Super_L
+      - key: Left
+      - keyup: Super_L
+      - keyup: Control_L
+    every_n: 1
+  knob1.cw:
+    sequence:
+      - keydown: Alt_L
+      - keydown: Super_L
+      - key: Right
+      - keyup: Super_L
+      - keyup: Alt_L
+    every_n: 1
+  knob1.ccw:
+    sequence:
+      - keydown: Alt_L
+      - keydown: Super_L
+      - key: Left
+      - keyup: Super_L
+      - keyup: Alt_L
+    every_n: 1
+  knob1.chord_cw:
+    sequence:
+      - keydown: Shift_L
+      - keydown: Super_L
+      - key: Right
+      - keyup: Super_L
+      - keyup: Shift_L
+    every_n: 1
+  knob1.chord_ccw:
+    sequence:
+      - keydown: Shift_L
+      - keydown: Super_L
+      - key: Left
+      - keyup: Super_L
+      - keyup: Shift_L
+    every_n: 1
+  button1.pulse_start:
+    # Hardware pulse starts at physical release time; no action here by default.
+  button1.hold:
+    # Not available in release_pulse mode.
+  button1.hold_release:
+    # Not available in release_pulse mode.
+  button1.release_pulse:
+    hotkey: Return
+  doio.key1.press:
+    key_down: Super_L
+  doio.key1.release:
+    key_up: Super_L
+  doio.key2.press:
+    key_down: Return
+  doio.key2.release:
+    key_up: Return
+  doio.key3.press:
+    key_down: Shift_R
+  doio.key3.release:
+    key_up: Shift_R
+  doio.up.press:
+    scroll: up
+  doio.up.release:
+    # Optional release action.
+  doio.down.press:
+    scroll: down
+  doio.down.release:
+    # Optional release action.
+  doio.left.press:
+    window_cycle: forward
+    release_after_seconds: 1
+  doio.left.release:
+    # Optional release action.
+  doio.right.press:
+    window_cycle: backward
+    release_after_seconds: 1
+  doio.right.release:
+    # Optional release action.
+  doio.enter.press:
+    hotkey: Return
+  doio.enter.release:
+    # Optional release action.
+  doio.super_up.press:
+    sequence:
+      - key: Up
+  doio.super_up.release:
+    # Optional release action.
+  doio.super_down.press:
+    sequence:
+      - key: Down
+  doio.super_down.release:
+    # Optional release action.
+  doio.super_left.press:
+    sequence:
+      - key: Left
+  doio.super_left.release:
+    # Optional release action.
+  doio.super_right.press:
+    sequence:
+      - key: Right
+  doio.super_right.release:
+    # Optional release action.
+  raw.button1.press:
+    hotkey: BackSpace
+  raw.button2.press:
+    hotkey: Return
+  button2.press:
+    # Configure `button2_key` under devices once the second button is calibrated.
+  button2.hold:
+    # Not used by default.
+  button2.hold_release:
+    # Not used by default.
+  button2.release:
+    # Intentionally empty: ordinary release should not release Shift unless hold fired.

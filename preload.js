@@ -68,6 +68,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   saveSetting: (key, value) => ipcRenderer.invoke("save-setting", key, value),
   resetSettings: () => ipcRenderer.invoke("reset-settings"),
 
+  // Linux verified device mapping
+  getKnobMapperStatus: () => ipcRenderer.invoke("get-knob-mapper-status"),
+  listKnobMapperDevices: () => ipcRenderer.invoke("list-knob-mapper-devices"),
+  startKnobMapper: () => ipcRenderer.invoke("start-knob-mapper"),
+  stopKnobMapper: () => ipcRenderer.invoke("stop-knob-mapper"),
+  restartKnobMapper: () => ipcRenderer.invoke("restart-knob-mapper"),
+  setKnobMapperEnabled: (enabled) => ipcRenderer.invoke("set-knob-mapper-enabled", enabled),
+
   // 实时 ASR 服务端配置；列表响应不包含令牌明文。
   listAsrConnectionProfiles: () => ipcRenderer.invoke("list-asr-connection-profiles"),
   saveAsrConnectionProfile: (profile, options) =>

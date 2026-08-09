@@ -2,13 +2,14 @@ import { lazy, Suspense, useState, useEffect, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import { toast, Toaster } from "sonner";
-import { Settings, X, Loader2, Play, Circle, History, Radio, Server, BookOpenCheck } from "lucide-react";
+import { Settings, X, Loader2, Play, Circle, History, Radio, Server, BookOpenCheck, Keyboard } from "lucide-react";
 import { usePermissions } from "./hooks/usePermissions";
 import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
 
 const TranslatedHistory = lazy(() => import("./components/TranslatedHistory"));
 const M5BridgePanel = lazy(() => import("./components/M5BridgePanel"));
 const AsrConnectionPanel = lazy(() => import("./components/AsrConnectionPanel"));
+const KnobMapperPanel = lazy(() => import("./components/KnobMapperPanel"));
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
 const SETTING_VOICE_TRANSLATE_TARGET = "voice_translate_target";
@@ -29,7 +30,7 @@ const VOICE_TRANSLATE_ZH = "zh";
 
 function initialSettingsTab() {
   const tab = new URLSearchParams(window.location.search).get("tab");
-  return ["bridge", "asr"].includes(tab) ? tab : "settings";
+  return ["bridge", "asr", "knob"].includes(tab) ? tab : "settings";
 }
 
 function PanelLoading() {
@@ -406,6 +407,13 @@ const SettingsPage = () => {
               ASR 服务端
             </button>
             <button
+              onClick={() => setActiveTab('knob')}
+              className={`px-3 py-1.5 text-sm flex items-center gap-1.5 rounded-lg transition-colors ${activeTab === 'knob' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
+            >
+              <Keyboard className="w-4 h-4" />
+              设备映射
+            </button>
+            <button
               onClick={handleOpenAsrAdmin}
               className="px-3 py-1.5 text-sm flex items-center gap-1.5 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
             >
@@ -442,6 +450,12 @@ const SettingsPage = () => {
           <Suspense fallback={<PanelLoading />}><AsrConnectionPanel /></Suspense>
         </div>
       </div>}
+
+      {activeTab === 'knob' && (
+        <Suspense fallback={<PanelLoading />}>
+          <KnobMapperPanel />
+        </Suspense>
+      )}
 
       {activeTab === 'settings' && <div className="flex-1 overflow-y-auto min-h-0">
         <div className="max-w-md mx-auto p-6 pb-8">
