@@ -54,6 +54,10 @@ class M5DeviceRegistry {
       reset_reason: String(req.headers["x-vibe-stick-reset-reason"] || ""),
       reset_reason_code: String(req.headers["x-vibe-stick-reset-reason-code"] || ""),
       boot_count: String(req.headers["x-vibe-stick-boot-count"] || ""),
+      input_profile_revision: parseInteger(
+        req.headers["x-vibe-stick-input-profile-revision"],
+        previous.input_profile_revision ?? 0
+      ),
       pmic_wake: String(req.headers["x-vibe-stick-pmic-wake"] || ""),
       pmic_irq: String(req.headers["x-vibe-stick-pmic-irq"] || ""),
       pmic_timer: String(req.headers["x-vibe-stick-pmic-timer"] || ""),

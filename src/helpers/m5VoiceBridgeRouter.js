@@ -10,7 +10,9 @@ class M5VoiceBridgeRouter {
     if (req.method === "GET") {
       if (path === "/health") {
         bridge.requireToken(req);
-        bridge.sendJson(res, 200, bridge.healthPayload());
+        bridge.sendJson(res, 200, bridge.healthPayload({
+          device: Boolean(req.vibeDevice),
+        }));
         return;
       }
       if (path === "/state") {
@@ -93,6 +95,18 @@ class M5VoiceBridgeRouter {
     }
     if (path === "/device/commands/ack") {
       await bridge.handleDeviceCommandAck(req, res);
+      return;
+    }
+    if (path === "/device/keyboard/report") {
+      await bridge.handleCardputerKeyboardReport(req, res);
+      return;
+    }
+    if (path === "/device/pointer/report") {
+      await bridge.handleCardputerPointerReport(req, res);
+      return;
+    }
+    if (path === "/device/input/event") {
+      await bridge.handleMappedInputEvent(req, res);
       return;
     }
     bridge.sendJson(res, 404, { success: false, error: "not found" });

@@ -6,7 +6,15 @@ const CapsLockListener = require('../src/helpers/capsLockListener');
 const {
   describeLinuxInputDevice,
   discoverNamedLinuxInputDevicePaths,
+  isIgnoredLinuxInputDevice,
 } = CapsLockListener;
+
+test('ignores the Cardputer virtual keyboard as a dictation trigger source', () => {
+  assert.equal(isIgnoredLinuxInputDevice({
+    device_name: 'VibeStick Cardputer Keyboard',
+  }), true);
+  assert.equal(isIgnoredLinuxInputDevice({ device_name: 'USB Keyboard' }), false);
+});
 
 test('prefers evdev for automatic Linux input monitoring on X11', () => {
   const previousBackend = process.env.CAPS_LISTENER_BACKEND;

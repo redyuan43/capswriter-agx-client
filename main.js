@@ -431,6 +431,44 @@ const m5VoiceBridge = new M5VoiceBridge({
   asrConnectionProfiles,
   sendToRenderer: safeSendToMainWindow,
 });
+const mappedVoiceTriggers = new Set();
+m5VoiceBridge.deviceMapping.setActionExecutor(async (action, phase, context = {}) => {
+  const triggerId = `cardputer-map:${context.deviceId || "unknown"}:${action.type}`;
+  const isCodex = action.type.startsWith("capswriter.codex.");
+  if (action.type === "capswriter.cancel") {
+    voiceActionManager.cancelActiveRouting("cardputer_mapping");
+    safeSendToMainWindow("dictation-cancel-requested", {
+      reason: "cardputer_mapping",
+      trigger_id: triggerId,
+    });
+    return { handled: true };
+  }
+  if (action.type === "capswriter.confirm") {
+    safeSendToMainWindow("dictation-confirm-requested", { trigger_id: triggerId });
+    return { handled: true };
+  }
+  if (!action.type.startsWith("capswriter.dictation.") && !isCodex) {
+    return { handled: false, error: "unsupported mapped CapsWriter action" };
+  }
+
+  const toggle = action.type.endsWith(".toggle");
+  if (toggle && phase === "release") return { handled: true };
+  const shouldRelease = (!toggle && phase === "release") ||
+    (toggle && mappedVoiceTriggers.has(triggerId));
+  if (shouldRelease) {
+    mappedVoiceTriggers.delete(triggerId);
+    return m5VoiceBridge.handleHostTriggerUp(triggerId);
+  }
+  if (phase !== "press" && phase !== "trigger") return { handled: true };
+  windowManager.showFloatingBall();
+  const result = await m5VoiceBridge.handleHostTriggerDown(
+    triggerId,
+    windowManager.previousActiveWindow || "",
+    isCodex ? { intent: "codex", mode: "codex" } : undefined
+  );
+  if (result.handled) mappedVoiceTriggers.add(triggerId);
+  return result;
+});
 const pipeWirePlayback = new PipeWirePlaybackController({ logger });
 let rendererRecoveryActive = false;
 let lastRendererHeartbeatAt = Date.now();

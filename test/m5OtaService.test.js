@@ -44,6 +44,39 @@ test("OTA service rejects unknown boards and missing images", () => {
   assert.equal(service.binary("sticks3"), null);
 });
 
+test("OTA service keeps Cardputer-Adv firmware on its own board target", (t) => {
+  const otaDir = fs.mkdtempSync(path.join(os.tmpdir(), "m5-ota-cardputer-"));
+  t.after(() => fs.rmSync(otaDir, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(otaDir, "cardputer_adv.json"),
+    JSON.stringify({
+      version: "0.1.0",
+      file_name: "cardputer_adv.bin",
+    })
+  );
+  fs.writeFileSync(
+    path.join(otaDir, "cardputer_adv.bin"),
+    Buffer.from([8, 9, 10, 11, 12])
+  );
+
+  const service = new M5OtaService({ otaDir });
+  assert.deepEqual(service.manifest("cardputer_adv"), {
+    version: "0.1.0",
+    file_name: "cardputer_adv.bin",
+    available: true,
+    board: "cardputer_adv",
+    url: "/ota/bin?board=cardputer_adv",
+  });
+  assert.deepEqual(service.binary("cardputer_adv"), {
+    binaryPath: path.join(otaDir, "cardputer_adv.bin"),
+    size: 5,
+  });
+  assert.deepEqual(service.manifest("sticks3"), {
+    available: false,
+    board: "sticks3",
+  });
+});
+
 test("OTA service keeps MiniJoy firmware independent from StickC Plus", (t) => {
   const otaDir = fs.mkdtempSync(path.join(os.tmpdir(), "m5-ota-minijoy-"));
   t.after(() => fs.rmSync(otaDir, { recursive: true, force: true }));

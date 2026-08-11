@@ -10,6 +10,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
+import CardputerMappingEditor from "./CardputerMappingEditor";
 
 const REFRESH_INTERVAL_MS = 4000;
 
@@ -142,6 +143,8 @@ export default function KnobMapperPanel() {
             刷新
           </ActionButton>
         </div>
+
+        <CardputerMappingEditor />
 
         <section className="rounded-xl border border-gray-200 bg-white p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">

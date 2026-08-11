@@ -8,6 +8,9 @@ const M5DeviceRegistry = require("./m5DeviceRegistry");
 const M5OtaService = require("./m5OtaService");
 const M5RecordingSessions = require("./m5RecordingSessions");
 const M5VoiceBridgeRouter = require("./m5VoiceBridgeRouter");
+const CardputerKeyboardBridge = require("./cardputerKeyboardBridge");
+const CardputerPointerBridge = require("./cardputerPointerBridge");
+const { DeviceMappingService } = require("./deviceMappingService");
 const M5FollowupKeyDispatcher = require("./m5FollowupKeyDispatcher");
 const AudioRoutingManager = require("./audioRoutingManager");
 const M5DeviceCommandBroker = require("./m5DeviceCommandBroker");
@@ -289,6 +292,26 @@ class M5VoiceBridge {
     this.deviceRegistry = new M5DeviceRegistry();
     this.devices = this.deviceRegistry.devices;
     this.commandBroker = new M5DeviceCommandBroker();
+    this.deviceMapping = new DeviceMappingService({
+      databaseManager,
+      logger: this.logger,
+      commandBroker: this.commandBroker,
+    });
+    this.cardputerKeyboard = new CardputerKeyboardBridge({ logger: this.logger });
+    this.cardputerPointer = new CardputerPointerBridge({
+      logger: this.logger,
+      mapper: this.deviceMapping,
+    });
+    this.deviceMapping.setKeyboardEmitter(async (keys, phase) => {
+      if (phase === "release") {
+        await this.cardputerKeyboard.backend.releaseAll();
+        return;
+      }
+      await this.cardputerKeyboard.backend.report(keys);
+      if (phase === "tap") {
+        setTimeout(() => this.cardputerKeyboard.backend.releaseAll().catch(() => {}), 30);
+      }
+    });
     this.audioRouting = new AudioRoutingManager({
       databaseManager,
       logger: this.logger,
@@ -392,6 +415,8 @@ class M5VoiceBridge {
       });
     }
     this.pipeWireCapture.stopAll();
+    this.cardputerKeyboard.stop();
+    this.cardputerPointer.stop();
     this.recordingSessions.clear();
     this.hostTriggerSessions.clear();
     this.rendererQueue = [];
@@ -409,7 +434,9 @@ class M5VoiceBridge {
   }
 
   rememberDevice(req, requestPath) {
-    return this.deviceRegistry.remember(req, requestPath);
+    const device = this.deviceRegistry.remember(req, requestPath);
+    this.deviceMapping.ensureDeviceProfile(device);
+    return device;
   }
 
   pruneDevices(now = Date.now()) {
@@ -717,20 +744,44 @@ loadBluetoothDevices();
     }
   }
 
-  healthPayload() {
-    return {
+  healthPayload({ device = false } = {}) {
+    const identity = {
       ok: true,
       bridge_id: this.bridgeId,
       bridge_label: this.bridgeLabel,
       bridge_name: "capswriter-m5-voice-bridge",
       bridge_version: "1.0.0",
+      token_required: Boolean(this.token),
+    };
+    if (device) return identity;
+    return {
+      ...identity,
       bridge_instance_id: this.bridgeInstanceId,
       recording_protocol_version: 2,
       max_concurrent_recordings: MAX_CONCURRENT_RECORDINGS,
       recording_first_chunk_timeout_ms: this.recordingFirstChunkTimeoutMs,
       recording_stall_timeout_ms: this.recordingStallTimeoutMs,
-      token_required: Boolean(this.token),
+      cardputer_keyboard: this.cardputerKeyboard.status(),
+      cardputer_pointer: this.cardputerPointer.status(),
     };
+  }
+
+  async handleCardputerKeyboardReport(req, res) {
+    const body = parseJson(await readRequestBody(req, 2048));
+    const result = await this.cardputerKeyboard.handleReport(req.vibeDevice, body);
+    this.sendJson(res, 200, result);
+  }
+
+  async handleCardputerPointerReport(req, res) {
+    const body = parseJson(await readRequestBody(req, 2048));
+    const result = await this.cardputerPointer.handleReport(req.vibeDevice, body);
+    this.sendJson(res, 200, result);
+  }
+
+  async handleMappedInputEvent(req, res) {
+    const body = parseJson(await readRequestBody(req, 2048));
+    const result = await this.deviceMapping.handleInputEvent(req.vibeDevice, body);
+    this.sendJson(res, 200, result);
   }
 
   async handleEvent(req, res) {
@@ -1838,6 +1889,7 @@ loadBluetoothDevices();
       return;
     }
     const acknowledgement = this.commandBroker.acknowledge(deviceId, body);
+    this.deviceMapping.acknowledgeProfile(deviceId, acknowledgement);
     this.sendJson(res, 200, { success: true, acknowledgement });
   }
 

@@ -144,6 +144,114 @@ async function waitFor(assertion, timeoutMs = 1000) {
   }
 }
 
+test("Cardputer keyboard reports are allowlisted and routed to the input backend", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  const reports = [];
+  bridge.cardputerKeyboard.backend = {
+    async report(codes) { reports.push([...codes]); },
+    async releaseAll() {},
+    stop() {},
+  };
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "28:84:85:76:25:c0",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+    "X-Vibe-Stick-Board": "cardputer_adv",
+  };
+
+  const accepted = await requestJson(port, "/device/keyboard/report", {
+    method: "POST",
+    headers,
+    body: {
+      protocol_version: 1,
+      session_id: "boot-test",
+      sequence: 1,
+      modifiers: 2,
+      keys: [4],
+    },
+  });
+  const rejected = await requestJson(port, "/device/keyboard/report", {
+    method: "POST",
+    headers: { ...headers, "X-Vibe-Stick-Device-Id": "ac:27:6e:d2:80:e0" },
+    body: {
+      protocol_version: 1,
+      session_id: "boot-test",
+      sequence: 1,
+      modifiers: 0,
+      keys: [],
+    },
+  });
+
+  assert.equal(accepted.statusCode, 200);
+  assert.deepEqual(reports, [[42, 30]]);
+  assert.equal(rejected.statusCode, 403);
+});
+
+test("Cardputer pointer reports are allowlisted and routed to the input backend", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  const reports = [];
+  bridge.cardputerPointer.backend = {
+    async report(report) { reports.push({ ...report }); },
+    async releaseAll() {},
+    stop() {},
+  };
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "28:84:85:76:25:c0",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+    "X-Vibe-Stick-Board": "cardputer_adv",
+  };
+
+  const accepted = await requestJson(port, "/device/pointer/report", {
+    method: "POST",
+    headers,
+    body: {
+      protocol_version: 1,
+      session_id: "boot-test",
+      sequence: 1,
+      dx: 8,
+      dy: -5,
+      wheel: 1,
+      buttons: 1,
+    },
+  });
+  const rejected = await requestJson(port, "/device/pointer/report", {
+    method: "POST",
+    headers: { ...headers, "X-Vibe-Stick-Device-Id": "ac:27:6e:d2:80:e0" },
+    body: {
+      protocol_version: 1,
+      session_id: "boot-test",
+      sequence: 1,
+      dx: 0,
+      dy: 0,
+      wheel: 0,
+      buttons: 0,
+    },
+  });
+
+  assert.equal(accepted.statusCode, 200);
+  assert.deepEqual(reports, [{ dx: 8, dy: -5, wheel: 1, buttons: 1 }]);
+  assert.equal(rejected.statusCode, 403);
+});
+
+test("device health response stays within the legacy firmware capture buffer", async (t) => {
+  const { port } = await startBridge(t);
+  const response = await request(port, {
+    "X-Vibe-Stick-Device-Id": "28:84:85:76:25:c0",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+    "X-Vibe-Stick-Board": "cardputer_adv",
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.ok(Buffer.byteLength(response.body) < 512);
+  assert.deepEqual(JSON.parse(response.body), {
+    ok: true,
+    bridge_id: "capswriter-m5-voice-bridge",
+    bridge_label: "capswriter-m5-voice-bridge",
+    bridge_name: "capswriter-m5-voice-bridge",
+    bridge_version: "1.0.0",
+    token_required: false,
+  });
+});
+
 test("health requires the configured token and returns bridge identity", async (t) => {
   const env = {
     M5_VOICE_BRIDGE_PORT: process.env.M5_VOICE_BRIDGE_PORT,
@@ -188,11 +296,25 @@ test("health requires the configured token and returns bridge identity", async (
   assert.equal(health.max_concurrent_recordings, 4);
   assert.equal(health.recording_first_chunk_timeout_ms, 12000);
   assert.equal(health.recording_stall_timeout_ms, 10000);
+  assert.deepEqual(health.cardputer_keyboard, {
+    protocol_version: 1,
+    backend: "uinput",
+    enabled: true,
+    allowed_device_count: 1,
+  });
+  assert.deepEqual(health.cardputer_pointer, {
+    protocol_version: 1,
+    backend: "uinput",
+    enabled: true,
+    allowed_device_count: 1,
+  });
   delete health.bridge_instance_id;
   delete health.recording_protocol_version;
   delete health.max_concurrent_recordings;
   delete health.recording_first_chunk_timeout_ms;
   delete health.recording_stall_timeout_ms;
+  delete health.cardputer_keyboard;
+  delete health.cardputer_pointer;
   assert.deepEqual(health, {
     ok: true,
     bridge_id: "desk-a",

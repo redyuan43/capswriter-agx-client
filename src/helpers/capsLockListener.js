@@ -18,6 +18,7 @@ const MINIJOY_INPUT_POLL_INTERVAL_MS = 10;
 const DEFAULT_DICTATION_HOLD_KEY = 'right shift';
 const DEFAULT_CODEX_HOLD_KEY = 'caps lock';
 const KEYD_VIRTUAL_KEYBOARD = 'keyd virtual keyboard';
+const CARDPUTER_VIRTUAL_KEYBOARD = 'VibeStick Cardputer Keyboard';
 const EXTRA_KEYBOARD_DEVICE_NAMES = [
   KEYD_VIRTUAL_KEYBOARD,
   'Knob Mapper Virtual Keyboard',
@@ -144,6 +145,10 @@ function discoverNamedLinuxInputDevicePaths(text, names) {
     }
   }
   return devicePaths;
+}
+
+function isIgnoredLinuxInputDevice(deviceInfo) {
+  return String(deviceInfo?.device_name || '') === CARDPUTER_VIRTUAL_KEYBOARD;
 }
 
 class CapsLockListener {
@@ -448,6 +453,9 @@ class CapsLockListener {
 
     try {
       const deviceInfo = this._describeLinuxInputDevice(devicePath);
+      if (isIgnoredLinuxInputDevice(deviceInfo)) {
+        return false;
+      }
       const pollMiniJoy = isMiniJoyTriggerId(deviceInfo.trigger_id);
       const fd = fs.openSync(
         devicePath,
@@ -1135,3 +1143,4 @@ module.exports.discoverNamedLinuxInputDevicePaths = discoverNamedLinuxInputDevic
 module.exports.normalizeBluetoothAddress = normalizeBluetoothAddress;
 module.exports.miniJoyTriggerId = miniJoyTriggerId;
 module.exports.isMiniJoyTriggerId = isMiniJoyTriggerId;
+module.exports.isIgnoredLinuxInputDevice = isIgnoredLinuxInputDevice;
