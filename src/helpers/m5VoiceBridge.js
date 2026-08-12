@@ -10,6 +10,7 @@ const M5RecordingSessions = require("./m5RecordingSessions");
 const M5VoiceBridgeRouter = require("./m5VoiceBridgeRouter");
 const CardputerKeyboardBridge = require("./cardputerKeyboardBridge");
 const CardputerPointerBridge = require("./cardputerPointerBridge");
+const CardputerMessageService = require("./cardputerMessageService");
 const { DeviceMappingService } = require("./deviceMappingService");
 const M5FollowupKeyDispatcher = require("./m5FollowupKeyDispatcher");
 const AudioRoutingManager = require("./audioRoutingManager");
@@ -273,6 +274,7 @@ class M5VoiceBridge {
     asrConnectionProfiles = null,
     asrSessionFactory = null,
     sendToRenderer,
+    dataDirectory,
   }) {
     this.logger = logger;
     this.windowManager = windowManager;
@@ -301,6 +303,10 @@ class M5VoiceBridge {
     this.cardputerPointer = new CardputerPointerBridge({
       logger: this.logger,
       mapper: this.deviceMapping,
+    });
+    this.cardputerMessages = new CardputerMessageService({
+      dataDirectory,
+      logger: this.logger,
     });
     this.deviceMapping.setKeyboardEmitter(async (keys, phase) => {
       if (phase === "release") {
@@ -782,6 +788,46 @@ loadBluetoothDevices();
     const body = parseJson(await readRequestBody(req, 2048));
     const result = await this.deviceMapping.handleInputEvent(req.vibeDevice, body);
     this.sendJson(res, 200, result);
+  }
+
+  async handleCheckBoardsMessage(req, res) {
+    this.cardputerMessages.authenticateIntegration(req);
+    const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
+    this.sendJson(res, 200, await this.cardputerMessages.ingest(body));
+  }
+
+  async handleCardputerMessageSync(req, res, url) {
+    const result = await this.cardputerMessages.sync(
+      req.vibeDevice,
+      url.searchParams.get("after"),
+      url.searchParams.get("limit")
+    );
+    this.sendJson(res, 200, result);
+  }
+
+  handleCardputerMessageResource(req, res, url) {
+    this.cardputerMessages.assertCardputer(req.vibeDevice);
+    const filePath = this.cardputerMessages.resource(
+      req.vibeDevice,
+      url.searchParams.get("kind"),
+      url.searchParams.get("id")
+    );
+    if (!filePath || !fs.existsSync(filePath)) {
+      this.sendJson(res, 404, { success: false, error: "message resource not found" });
+      return;
+    }
+    const stat = fs.statSync(filePath);
+    res.writeHead(200, {
+      "Content-Type": filePath.endsWith(".ttf") ? "font/ttf" : "audio/wav",
+      "Content-Length": stat.size,
+      "Cache-Control": "private, max-age=3600",
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+
+  async handleCardputerMessageAck(req, res) {
+    const body = parseJson(await readRequestBody(req, 2048));
+    this.sendJson(res, 200, this.cardputerMessages.acknowledge(req.vibeDevice, body.cursor));
   }
 
   async handleEvent(req, res) {

@@ -39,6 +39,16 @@ class M5VoiceBridgeRouter {
         await bridge.handleDeviceCommandPoll(req, res, url);
         return;
       }
+      if (path === "/device/messages/sync") {
+        bridge.requireToken(req);
+        await bridge.handleCardputerMessageSync(req, res, url);
+        return;
+      }
+      if (path === "/device/messages/resource") {
+        bridge.requireToken(req);
+        bridge.handleCardputerMessageResource(req, res, url);
+        return;
+      }
       if (path === "/" || path === "/dashboard") {
         bridge.sendHtml(res, 200, bridge.buildDashboardHtml());
         return;
@@ -63,6 +73,11 @@ class M5VoiceBridgeRouter {
 
     if (req.method !== "POST") {
       bridge.sendJson(res, 405, { success: false, error: "method not allowed" });
+      return;
+    }
+
+    if (path === "/integrations/check-boards/messages") {
+      await bridge.handleCheckBoardsMessage(req, res);
       return;
     }
 
@@ -107,6 +122,10 @@ class M5VoiceBridgeRouter {
     }
     if (path === "/device/input/event") {
       await bridge.handleMappedInputEvent(req, res);
+      return;
+    }
+    if (path === "/device/messages/ack") {
+      await bridge.handleCardputerMessageAck(req, res);
       return;
     }
     bridge.sendJson(res, 404, { success: false, error: "not found" });

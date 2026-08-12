@@ -410,6 +410,7 @@ const knobMapperManager = new KnobMapperManager({
   logger,
   databaseManager,
   dataDirectory,
+  dataDirectory,
 });
 const asrConnectionProfiles = new AsrConnectionProfiles({
   databaseManager,
