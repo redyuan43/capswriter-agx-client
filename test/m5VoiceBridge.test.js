@@ -657,7 +657,7 @@ test("device command poll returns commands for the requesting device", async (t)
   assert.equal(payload.command.payload.session_id, "remote-session");
 });
 
-test("Cardputer command poll does not hold a long-lived HTTP request", async (t) => {
+test("Cardputer command poll is capped at one second", async (t) => {
   const { port } = await startBridge(t);
   const startedAt = Date.now();
   const response = await requestJson(
@@ -672,7 +672,9 @@ test("Cardputer command poll does not hold a long-lived HTTP request", async (t)
     }
   );
   assert.equal(response.statusCode, 200);
-  assert.ok(Date.now() - startedAt < 1000);
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(elapsedMs >= 900);
+  assert.ok(elapsedMs < 2000);
 });
 
 test("audio routes apply input and output independently", async (t) => {

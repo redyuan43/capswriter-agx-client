@@ -1920,7 +1920,7 @@ loadBluetoothDevices();
     const cursor = Number(url.searchParams.get("cursor") || 0);
     const requestedTimeoutMs = Number(url.searchParams.get("timeout_ms") || 25000);
     const timeoutMs = req.vibeDevice?.board === "cardputer_adv"
-      ? 0
+      ? Math.min(requestedTimeoutMs, 1000)
       : requestedTimeoutMs;
     const command = await this.commandBroker.poll(deviceId, cursor, timeoutMs);
     this.sendJson(res, 200, {
