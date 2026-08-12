@@ -657,6 +657,24 @@ test("device command poll returns commands for the requesting device", async (t)
   assert.equal(payload.command.payload.session_id, "remote-session");
 });
 
+test("Cardputer command poll does not hold a long-lived HTTP request", async (t) => {
+  const { port } = await startBridge(t);
+  const startedAt = Date.now();
+  const response = await requestJson(
+    port,
+    "/device/commands/poll?cursor=0&timeout_ms=25000",
+    {
+      headers: {
+        "X-Vibe-Stick-Device-Id": "cardputer-a",
+        "X-Vibe-Stick-Firmware-Name": "vibestick",
+        "X-Vibe-Stick-Board": "cardputer_adv",
+      },
+    }
+  );
+  assert.equal(response.statusCode, 200);
+  assert.ok(Date.now() - startedAt < 1000);
+});
+
 test("audio routes apply input and output independently", async (t) => {
   const { bridge } = await startBridge(t);
   const calls = [];
