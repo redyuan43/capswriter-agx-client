@@ -800,7 +800,9 @@ loadBluetoothDevices();
     const result = await this.cardputerMessages.sync(
       req.vibeDevice,
       url.searchParams.get("after"),
-      url.searchParams.get("limit")
+      url.searchParams.get("limit"),
+      url.searchParams.get("bootstrap"),
+      url.searchParams.get("before")
     );
     this.sendJson(res, 200, result);
   }
@@ -1253,7 +1255,7 @@ loadBluetoothDevices();
       intent,
       mode,
       targetWindowId,
-      ownerDeviceId,
+      ownerDeviceId: captureMode === "remote_device" ? sourceId.slice(5) : ownerDeviceId,
       triggerId,
     });
     session.triggerId = triggerId;
@@ -2029,7 +2031,7 @@ loadBluetoothDevices();
       intent,
       mode,
       targetWindowId,
-      ownerDeviceId: triggerId,
+      ownerDeviceId: captureMode === "remote_device" ? sourceDeviceId : triggerId,
       triggerId,
     });
     Object.assign(session, {

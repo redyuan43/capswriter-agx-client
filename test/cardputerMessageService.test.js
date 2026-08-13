@@ -4,6 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const CardputerMessageService = require("../src/helpers/cardputerMessageService");
+const { truncateUtf8 } = CardputerMessageService;
 const { sha256, FONT_SHA256, NOTIFY_SOURCE_SHA256 } = CardputerMessageService;
 
 function device() {
@@ -55,4 +56,66 @@ test("integration and device endpoints reject untrusted callers", () => {
   assert.throws(() => service.authenticateIntegration({ headers: {} }), /unauthorized/);
   assert.throws(() => service.assertCardputer({ board: "sticks3" }), /Cardputer/);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("empty devices bootstrap from only the latest messages", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cardputer-bootstrap-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const service = new CardputerMessageService({ dataDirectory: root });
+  service.ensureSystemResources = async () => ({ font: {}, notification: {} });
+  service.ensureAudioPipeline = async () => {};
+  service.index.cursor = 8;
+  service.index.messages = Array.from({ length: 8 }, (_, index) => ({
+    cursor: index + 1,
+    audio_id: `audio-${index + 1}`,
+  }));
+
+  const first = await service.sync(device(), 0, 1, 4);
+  const next = await service.sync(device(), first.messages[0].cursor, 1, 4);
+
+  assert.equal(first.messages[0].cursor, 5);
+  assert.equal(next.messages[0].cursor, 6);
+});
+
+test("duplicate delivery can backfill spoken text", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cardputer-spoken-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const service = new CardputerMessageService({ dataDirectory: root });
+  service.index.messages.push({ message_id: "message-1", cursor: 1 });
+
+  const result = await service.ingest({
+    message_id: "message-1",
+    audio_ids: ["audio-1"],
+    spoken_text: "设备 agx，目录 check_boards。处理完成。",
+  });
+
+  assert.equal(result.duplicate, true);
+  assert.equal(service.index.messages[0].spoken_text, "设备 agx，目录 check_boards。处理完成。");
+});
+
+test("recent legacy audio is normalized once and versioned", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cardputer-audio-migrate-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let transcodes = 0;
+  const service = new CardputerMessageService({
+    dataDirectory: root,
+    transcode: async (inputs, output) => {
+      transcodes += 1;
+      fs.copyFileSync(inputs[0], output);
+    },
+  });
+  fs.writeFileSync(path.join(service.audioDir, "legacy.wav"), "legacy-audio");
+  service.index.messages.push({ audio_id: "legacy" });
+
+  await service.ensureAudioPipeline();
+  await service.ensureAudioPipeline();
+
+  assert.equal(transcodes, 1);
+  assert.equal(service.index.messages[0].audio_pipeline_version, "loudnorm-v1");
+});
+
+test("spoken text truncation preserves UTF-8 boundaries", () => {
+  const text = truncateUtf8("中".repeat(400), 1024);
+  assert.ok(Buffer.byteLength(text) <= 1024);
+  assert.equal(text.includes("�"), false);
 });

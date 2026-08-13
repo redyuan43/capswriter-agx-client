@@ -657,6 +657,30 @@ test("device command poll returns commands for the requesting device", async (t)
   assert.equal(payload.command.payload.session_id, "remote-session");
 });
 
+test("remote-device HTTP sessions belong to the Wi-Fi device, not the trigger alias", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  bridge.activatePreparedTrigger = async () => ({
+    route: {
+      trigger_id: "test-cardputer",
+      source_id: "wifi:cardputer-a",
+      source: { kind: "wifi", device_id: "cardputer-a", online: true },
+      available: true,
+      output_available: false,
+    },
+    bluetooth_audio_wake: null,
+  });
+
+  const response = await requestJson(port, "/recording/start", {
+    method: "POST",
+    body: { session_id: "remote-device-owner", trigger_id: "test-cardputer" },
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    bridge.sessions.get("remote-device-owner").ownerDeviceId,
+    "cardputer-a"
+  );
+});
+
 test("Cardputer command poll is capped at one second", async (t) => {
   const { port } = await startBridge(t);
   const startedAt = Date.now();
@@ -867,6 +891,7 @@ test("Wi-Fi trigger release finalizes after bounded drain without waiting for fu
     captureMode: "remote_device",
     sourceDeviceId: "stick-a",
   });
+  assert.equal(session.ownerDeviceId, "stick-a");
   bridge.appendRecordingAudio(session, Buffer.alloc(3200));
   bridge.remoteAudioDrainQuietMs = 5;
   bridge.remoteAudioDrainPollMs = 1;

@@ -5,13 +5,23 @@ const { createHash } = require("crypto");
 const ffmpegPath = require("ffmpeg-static");
 
 const MAX_MESSAGES = 100;
+const DEVICE_MESSAGE_LIMIT = 12;
 const MAX_SOURCE_AUDIO_BYTES = 16 * 1024 * 1024;
+const AUDIO_PIPELINE_VERSION = "loudnorm-v1";
 const FONT_SHA256 = "21b96a0377f067833a93af3082eb28d4ffab7a8cd46bfd513286f1d64b7b0949";
 const NOTIFY_SOURCE_SHA256 = "a7e960d3318295d877485e60fecf25841a28f3912797cfddd12a3b8449211d29";
 const DEFAULT_BUNDLED_RESOURCES = path.resolve(__dirname, "../../assets/cardputer");
 
 function sha256(buffer) {
   return createHash("sha256").update(buffer).digest("hex");
+}
+
+function truncateUtf8(value, maxBytes) {
+  const text = String(value || "");
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  let end = text.length;
+  while (end > 0 && Buffer.byteLength(text.slice(0, end)) > maxBytes) end -= 1;
+  return text.slice(0, end);
 }
 
 function cleanMessageId(value) {
@@ -63,6 +73,7 @@ class CardputerMessageService {
     fs.mkdirSync(this.tmpDir, { recursive: true });
     this.index = this.loadIndex();
     this.resourcePromise = null;
+    this.audioPipelinePromise = null;
   }
 
   loadIndex() {
@@ -104,7 +115,14 @@ class CardputerMessageService {
       throw Object.assign(new Error("invalid Check Boards message"), { statusCode: 400 });
     }
     const existing = this.index.messages.find((item) => item.message_id === messageId);
-    if (existing) return { accepted: true, duplicate: true, cursor: existing.cursor };
+    if (existing) {
+      const spokenText = truncateUtf8(payload.spoken_text, 1024);
+      if (spokenText && existing.spoken_text !== spokenText) {
+        existing.spoken_text = spokenText;
+        this.persist();
+      }
+      return { accepted: true, duplicate: true, cursor: existing.cursor };
+    }
 
     const key = sha256(Buffer.from(messageId)).slice(0, 24);
     const inputFiles = [];
@@ -127,12 +145,14 @@ class CardputerMessageService {
         card_id: String(payload.card_id || "").slice(0, 180),
         title: String(payload.title || "消息").slice(0, 120),
         summary: String(payload.summary || "").slice(0, 600),
+        spoken_text: truncateUtf8(payload.spoken_text || payload.summary || payload.title, 1024),
         status: String(payload.status || "").slice(0, 32),
         received_at: String(payload.received_at || "").slice(0, 40),
         generated_at: String(payload.generated_at || "").slice(0, 40),
         audio_id: key,
         audio_size: audio.length,
         audio_sha256: sha256(audio),
+        audio_pipeline_version: AUDIO_PIPELINE_VERSION,
       };
       this.index.messages.push(message);
       while (this.index.messages.length > MAX_MESSAGES) {
@@ -196,16 +216,62 @@ class CardputerMessageService {
     };
   }
 
-  async sync(device, after = 0, limit = 20) {
+  async sync(device, after = 0, limit = 20, bootstrap = 0, before = 0) {
     this.assertCardputer(device);
+    await this.ensureAudioPipeline();
     const resources = await this.ensureSystemResources();
     const safeAfter = Math.max(0, Number(after) || 0);
     const safeLimit = Math.max(1, Math.min(20, Number(limit) || 20));
-    const messages = this.index.messages
-      .filter((item) => item.cursor > safeAfter)
-      .slice(0, safeLimit)
+    const safeBootstrap = Math.max(0, Math.min(20, Number(bootstrap) || 0));
+    const safeBefore = Math.max(0, Number(before) || 0);
+    const allMessages = this.index.messages;
+    const older = safeBefore > 0;
+    const candidates = older
+      ? allMessages.filter((item) => item.cursor < safeBefore)
+      : safeAfter === 0 && safeBootstrap > 0
+        ? allMessages.slice(-safeBootstrap)
+        : allMessages.filter((item) => item.cursor > safeAfter);
+    const selected = older ? candidates.slice(-safeLimit) : candidates.slice(0, safeLimit);
+    const messages = selected
       .map((item) => ({ ...item, audio_url: `/device/messages/resource?kind=audio&id=${item.audio_id}` }));
-    return { cursor: this.index.cursor, resources, messages, has_more: messages.length === safeLimit };
+    const hasMore = older
+      ? candidates.length > selected.length
+      : safeAfter === 0 && safeBootstrap > 0
+        ? allMessages.some((item) => item.cursor < (selected[0]?.cursor || 0))
+        : candidates.length > selected.length;
+    return { cursor: this.index.cursor, resources, messages, has_more: hasMore };
+  }
+
+  async ensureAudioPipeline() {
+    if (!this.audioPipelinePromise) {
+      this.audioPipelinePromise = this.migrateRecentAudio().catch((error) => {
+        this.audioPipelinePromise = null;
+        throw error;
+      });
+    }
+    return this.audioPipelinePromise;
+  }
+
+  async migrateRecentAudio() {
+    let changed = false;
+    for (const message of this.index.messages.slice(-DEVICE_MESSAGE_LIMIT)) {
+      if (message.audio_pipeline_version === AUDIO_PIPELINE_VERSION) continue;
+      const source = path.join(this.audioDir, `${message.audio_id}.wav`);
+      if (!fs.existsSync(source)) continue;
+      const output = path.join(this.tmpDir, `${message.audio_id}.normalized.wav`);
+      try {
+        await this.transcode([source], output);
+        const audio = fs.readFileSync(output);
+        fs.renameSync(output, source);
+        message.audio_size = audio.length;
+        message.audio_sha256 = sha256(audio);
+        message.audio_pipeline_version = AUDIO_PIPELINE_VERSION;
+        changed = true;
+      } finally {
+        fs.rmSync(output, { force: true });
+      }
+    }
+    if (changed) this.persist();
   }
 
   resource(device, kind, id) {
@@ -233,6 +299,7 @@ class CardputerMessageService {
       const child = spawn(ffmpegPath, [
         "-hide_banner", "-loglevel", "error", "-y",
         "-f", "concat", "-safe", "0", "-i", listPath,
+        "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", outputPath,
       ], { stdio: ["ignore", "ignore", "pipe"] });
       let errorText = "";
@@ -253,3 +320,4 @@ module.exports.cleanAudioId = cleanAudioId;
 module.exports.sha256 = sha256;
 module.exports.FONT_SHA256 = FONT_SHA256;
 module.exports.NOTIFY_SOURCE_SHA256 = NOTIFY_SOURCE_SHA256;
+module.exports.truncateUtf8 = truncateUtf8;

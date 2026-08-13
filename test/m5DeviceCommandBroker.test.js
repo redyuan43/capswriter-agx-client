@@ -47,6 +47,19 @@ test("device command broker wakes a pending poll and records acknowledgements", 
   assert.equal(Number.isFinite(acknowledgement.acknowledged_at), true);
 });
 
+test("device command broker rebases after a device retained cursor outlives bridge restart", async () => {
+  const broker = new M5DeviceCommandBroker();
+  const command = broker.enqueue("cardputer", {
+    type: "recording_start",
+    session_id: "session-after-restart",
+  });
+
+  const delivered = await broker.poll("cardputer", 220, 0);
+  assert.equal(delivered.command_id, command.command_id);
+  assert.equal(delivered.cursor, 221);
+  assert.equal(broker.latestCursor("cardputer"), 221);
+});
+
 test("device command broker waits for completion acknowledgements", async () => {
   const broker = new M5DeviceCommandBroker();
   const command = broker.enqueue("stick-c", { type: "recording_stop" });

@@ -55,7 +55,27 @@ class M5DeviceCommandBroker {
     ) || null;
   }
 
+  synchronizeCursor(deviceId, cursor = 0) {
+    const reportedCursor = Math.max(0, Number(cursor) || 0);
+    const state = this.stateFor(deviceId);
+    if (reportedCursor <= state.cursor) return state.cursor;
+
+    // Devices retain their cursor across a bridge restart while this broker is
+    // intentionally in-memory. Rebase pending commands above that retained
+    // cursor, otherwise the device can never observe commands from the new
+    // bridge process.
+    state.commands = state.commands.filter((command) =>
+      !state.acknowledgements.has(command.command_id)
+    );
+    state.cursor = reportedCursor;
+    for (const command of state.commands) {
+      command.cursor = ++state.cursor;
+    }
+    return state.cursor;
+  }
+
   async poll(deviceId, cursor = 0, timeoutMs = DEFAULT_POLL_TIMEOUT_MS) {
+    this.synchronizeCursor(deviceId, cursor);
     const immediate = this.commandAfter(deviceId, cursor);
     if (immediate) return immediate;
     const state = this.stateFor(deviceId);
