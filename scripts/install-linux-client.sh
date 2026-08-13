@@ -44,6 +44,28 @@ Options:
 EOF
 }
 
+report_runtime_dependencies() {
+  local missing_tools=()
+
+  for tool in wtype ydotool ydotoold; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing_tools+=("$tool")
+    fi
+  done
+
+  if [ "${#missing_tools[@]}" -eq 0 ]; then
+    echo "Wayland auto-paste tools detected (wtype and ydotool)."
+  else
+    echo "Warning: automatic paste needs the following tools: ${missing_tools[*]}." >&2
+    echo "Install the distribution packages for wtype and ydotool, then log out and back in if prompted." >&2
+    echo "Dictation remains available; recognized text will stay in the clipboard until auto-paste is available." >&2
+  fi
+
+  if ! command -v pactl >/dev/null 2>&1; then
+    echo "Note: pactl is unavailable. CapsWriter will use Electron's default microphone capture on Linux." >&2
+  fi
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --install-dir)
@@ -188,6 +210,7 @@ verify_release_asset "$M5_RECOVERY_RULE_NAME"
 
 echo "Checksums verified."
 
+report_runtime_dependencies
 configure_minijoy_input_permission
 configure_bluetooth_recovery_permission
 

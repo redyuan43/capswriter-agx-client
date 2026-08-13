@@ -218,6 +218,9 @@ bash "$HOME/.cache/capswriter-installer/install-capswriter-agx-client.sh"
 安装器默认会创建：
 
 - AppImage：`~/.local/opt/capswriter-agx-client/CapsWriter-GUI.AppImage`
+
+Linux 自动粘贴还需要安装 `wtype` 和 `ydotool`。完整前置条件、Wayland
+兼容性与故障处理请参阅 [Linux 安装说明](docs/linux-install.md)。
 - 启动器：`~/.local/bin/capswriter-agx-client`
 - 应用菜单项：`~/.local/share/applications/capswriter-agx-client.desktop`
 - 图形登录自启动项：`~/.config/autostart/capswriter-agx-client.desktop`

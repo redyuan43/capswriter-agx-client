@@ -12,6 +12,7 @@ const {
   safeStorage
 } = require("electron");
 const path = require("path");
+const fs = require("fs");
 const { spawn, execSync } = require("child_process");
 
 // Codex completion chimes are owned by the renderer UI. The event is triggered
@@ -26,6 +27,10 @@ const ASR_PROXY_SERVER = normalizeProxyServer(
   || process.env.https_proxy,
 );
 const ASR_PROXY_CONFIG_TIMEOUT_MS = 3000;
+const LINUX_PACTL_AVAILABLE = process.platform !== "linux" || String(process.env.PATH || "")
+  .split(path.delimiter)
+  .filter(Boolean)
+  .some((directory) => fs.existsSync(path.join(directory, "pactl")));
 
 function normalizeProxyServer(value) {
   try {
@@ -960,12 +965,15 @@ async function startApp() {
         rememberActiveWindow: !m5VoiceBridge.hasActiveRecordings(),
       });
       const usesSystemDefaultCapture = process.platform === 'linux'
-        ? false
+        ? !LINUX_PACTL_AVAILABLE
         : m5VoiceBridge.usesSystemDefaultAudioCapture(triggerId);
-      if (process.platform !== 'linux' && shouldUseRendererCapture(
+      if (shouldUseRendererCapture(
         triggerId,
         usesSystemDefaultCapture
       )) {
+        if (process.platform === 'linux') {
+          logger.warn('pactl is unavailable; using renderer microphone capture', { triggerId });
+        }
         rendererCaptureTriggers.add(triggerId);
         safeSendToMainWindow('caps-lock-down', payload);
         return;

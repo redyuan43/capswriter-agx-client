@@ -24,6 +24,28 @@ distribution's FUSE 2 compatibility package first. On Ubuntu/Debian:
 sudo apt-get install -y libfuse2
 ```
 
+## Runtime dependencies
+
+CapsWriter needs an OS-supported input-injection backend to automatically paste
+recognized text. Install both `wtype` and `ydotool` before using automatic
+paste:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install -y wtype ydotool
+```
+
+`wtype` is preferred on Wayland when the compositor implements the
+`virtual-keyboard` protocol. `ydotool` is the fallback when that protocol is
+unavailable. The installer adds a narrowly scoped `uaccess` rule for
+`/dev/uinput`; log out and back in after installation so the active desktop
+session receives that ACL. Do not add the user to the global `input` group.
+
+Some distributions do not ship the PulseAudio-compatible `pactl` CLI even when
+PipeWire is running. This does not block keyboard dictation: CapsWriter falls
+back to the Electron default microphone. Install the distribution package that
+provides `pactl` only when you need explicit PipeWire device routing.
+
 ## Install
 
 The repository is private, so authenticate GitHub CLI once:
@@ -51,6 +73,7 @@ The installer automatically:
 - writes a launcher at `~/.local/bin/capswriter-agx-client`;
 - creates one systemd user service plus a GNOME/XDG login starter;
 - installs a udev `uaccess` rule for keyboard input and the `VibeStick MiniJoy Mouse` input device;
+- checks for `wtype` and `ydotool`, and prints the automatic-paste prerequisite when either is missing;
 - imports the graphical-session environment and starts the monitored client;
 - restarts the complete client process group after an unexpected crash.
 - bundles the verified Linux device mapper and exposes its controls in the
