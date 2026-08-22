@@ -27,6 +27,23 @@ export function selectRealtimeFinalTimeoutFallback(error, latestPayload) {
     : null;
 }
 
+export function selectRealtimeStreamFailureFallback(error, latestPayload) {
+  const reason = String(error?.realtimeReason || "");
+  const message = String(error?.message || "");
+  const streamInterrupted =
+    reason === "audio_idle_without_finish" ||
+    reason === "client_pcm_stalled" ||
+    /audio stopped without finish or cancel/i.test(message);
+  if (!streamInterrupted || !isUsableASRPayload(latestPayload)) {
+    return null;
+  }
+  return {
+    ...latestPayload,
+    partial_fallback: true,
+    partial_fallback_reason: reason || "realtime_stream_interrupted",
+  };
+}
+
 export function createRealtimeProtocolError(payload, fallbackMessage) {
   const error = new Error(
     payload?.error ||

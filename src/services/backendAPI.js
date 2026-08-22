@@ -1243,6 +1243,66 @@ export class ExternalPCMRealtimeSession extends PCMRealtimeSession {
       bufferFlushedEventType: 'external_pcm_buffer_flushed',
       watchdogEventType: 'external_pcm_watchdog_stalled',
     });
+    this.silenceKeepaliveAfterMs = normalizePositiveNumber(
+      options.silenceKeepaliveAfterMs,
+      1000
+    );
+    this.silenceKeepaliveIntervalMs = normalizePositiveNumber(
+      options.silenceKeepaliveIntervalMs,
+      1000
+    );
+    this.silenceKeepaliveBytes = Math.max(
+      2,
+      Math.round((this.targetSampleRate * 2) / 50)
+    );
+    this.lastSourcePcmAt = 0;
+    this.silenceKeepaliveTimer = null;
+  }
+
+  async start() {
+    await super.start();
+    this.lastSourcePcmAt = Date.now();
+    this.startSilenceKeepalive();
+  }
+
+  sendPCM(chunk) {
+    this.lastSourcePcmAt = Date.now();
+    super.sendPCM(chunk);
+  }
+
+  startSilenceKeepalive() {
+    if (this.silenceKeepaliveTimer !== null ||
+        this.silenceKeepaliveAfterMs <= 0 ||
+        this.silenceKeepaliveIntervalMs <= 0) {
+      return;
+    }
+    this.silenceKeepaliveTimer = setInterval(() => {
+      if (this.stopped ||
+          !this.started ||
+          !this.websocket ||
+          this.websocket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const idleMs = Date.now() - this.lastSourcePcmAt;
+      if (idleMs < this.silenceKeepaliveAfterMs) {
+        return;
+      }
+      const silence = new Uint8Array(this.silenceKeepaliveBytes);
+      this.websocket.send(silence.buffer);
+      this.recordPcmSent(silence.byteLength);
+      this.emitClientEvent({
+        type: 'external_pcm_silence_keepalive',
+        idleMs,
+        bytes: silence.byteLength,
+      });
+    }, this.silenceKeepaliveIntervalMs);
+  }
+
+  stopInput() {
+    if (this.silenceKeepaliveTimer !== null) {
+      clearInterval(this.silenceKeepaliveTimer);
+      this.silenceKeepaliveTimer = null;
+    }
   }
 }
 

@@ -222,6 +222,52 @@ test('an error after ready never opens a fallback candidate', async (t) => {
   resetRealtimeAsrPreconnection();
 });
 
+test('external PCM sessions keep the ASR stream alive across input gaps', async (t) => {
+  FakeWebSocket.instances = [];
+  global.WebSocket = FakeWebSocket;
+  global.window = runtimeWindow({
+    realtime_asr_url: 'wss://asr.example/realtime',
+    realtime_asr_token: 'runtime-token',
+  });
+  t.after(() => {
+    delete global.WebSocket;
+    delete global.window;
+  });
+
+  const {
+    ExternalPCMRealtimeSession,
+    resetRealtimeAsrPreconnection,
+  } = await loadBackendApi(t);
+  const clientEvents = [];
+  const session = new ExternalPCMRealtimeSession({
+    onClientEvent: (event) => clientEvents.push(event),
+    silenceKeepaliveAfterMs: 5,
+    silenceKeepaliveIntervalMs: 5,
+  });
+  const started = session.start();
+  await tick();
+  const socket = FakeWebSocket.instances[0];
+  socket.emitOpen();
+  await tick();
+  socket.emitMessage({ type: 'ready', success: true });
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.ok(
+    socket.sent.some((value) =>
+      value instanceof ArrayBuffer &&
+      value.byteLength === 640
+    )
+  );
+  assert.ok(
+    clientEvents.some(
+      (event) => event.type === 'external_pcm_silence_keepalive'
+    )
+  );
+  session.cancel();
+  resetRealtimeAsrPreconnection();
+});
+
 test('an authenticated gateway preconnection is reused without sending start early', async (t) => {
   FakeWebSocket.instances = [];
   global.WebSocket = FakeWebSocket;

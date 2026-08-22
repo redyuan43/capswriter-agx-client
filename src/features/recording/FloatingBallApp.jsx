@@ -24,6 +24,7 @@ import {
   extractASRText,
   isUsableASRPayload,
   selectRealtimeFinalTimeoutFallback,
+  selectRealtimeStreamFailureFallback,
 } from "../../helpers/asrResultPolicy.mjs";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -2145,6 +2146,15 @@ export default function FloatingBallApp() {
             });
           }
         },
+        onClientEvent: (event) => {
+          if (event?.type === "external_pcm_silence_keepalive") {
+            logRuntime("warn", "External M5 PCM silence keepalive sent", {
+              sessionId,
+              idleMs: event.idleMs,
+              bytes: event.bytes,
+            });
+          }
+        },
       });
       externalRealtimeSessionRef.current = realtimeSession;
       for (const pendingChunk of externalPCMChunksRef.current) {
@@ -2283,7 +2293,25 @@ export default function FloatingBallApp() {
       const realtimeSession = externalRealtimeSessionRef.current;
       if (realtimeSession) {
         if (realtimeSession.isPcmStalled?.()) {
-          realtimeError = new Error("实时语音识别失败：发送到 18011 的 PCM 音频流已停滞");
+          const stalledError = new Error(
+            "实时语音识别失败：发送到 18011 的 PCM 音频流已停滞"
+          );
+          stalledError.realtimeReason = "client_pcm_stalled";
+          const partialFallback = selectRealtimeStreamFailureFallback(
+            stalledError,
+            realtimeSession.getLatestTextPayload?.()
+          );
+          if (partialFallback) {
+            finalPayload = partialFallback;
+            resultSource = "realtime_partial_stream_fallback";
+            logRuntime("warn",
+              "External M5 PCM stalled; latest partial selected", {
+                sessionId,
+                textLength: extractASRText(partialFallback).length,
+              });
+          } else {
+            realtimeError = stalledError;
+          }
         } else {
           const finishStartedAt = performance.now();
           try {
@@ -2305,17 +2333,24 @@ export default function FloatingBallApp() {
               );
             }
           } catch (error) {
-            const partialFallback = selectRealtimeFinalTimeoutFallback(
-              error,
-              realtimeSession.getLatestTextPayload?.()
-            );
+            const latestPayload =
+              realtimeSession.getLatestTextPayload?.();
+            const partialFallback =
+              selectRealtimeFinalTimeoutFallback(error, latestPayload) ||
+              selectRealtimeStreamFailureFallback(error, latestPayload);
             if (partialFallback) {
               finalPayload = partialFallback;
-              resultSource = "realtime_partial_timeout_fallback";
+              resultSource =
+                partialFallback.partial_fallback_reason ===
+                "audio_idle_without_finish"
+                  ? "realtime_partial_stream_fallback"
+                  : "realtime_partial_timeout_fallback";
               realtimeError = null;
-              logRuntime("warn", "External M5 realtime final timed out; latest partial selected", {
+              logRuntime("warn", "External M5 final unavailable; latest partial selected", {
                 sessionId,
                 textLength: extractASRText(partialFallback).length,
+                fallbackReason: partialFallback.partial_fallback_reason ||
+                  "final_timeout",
                 error: error?.message || String(error),
               });
             } else {

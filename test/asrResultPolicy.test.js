@@ -69,3 +69,44 @@ test("final timeout falls back to the latest usable partial only", async () => {
     null
   );
 });
+
+test("interrupted realtime audio falls back to the latest usable partial", async () => {
+  const { createRealtimeProtocolError, selectRealtimeStreamFailureFallback } =
+    await policyPromise;
+  const partial = { type: "partial", success: true, text: "latest partial" };
+  const streamError = createRealtimeProtocolError({
+    type: "error",
+    error: "realtime ASR audio stopped without finish or cancel",
+    reason: "audio_idle_without_finish",
+  }, "realtime error");
+  const stalledError = new Error("PCM stalled");
+  stalledError.realtimeReason = "client_pcm_stalled";
+
+  assert.deepEqual(
+    selectRealtimeStreamFailureFallback(streamError, partial),
+    {
+      ...partial,
+      partial_fallback: true,
+      partial_fallback_reason: "audio_idle_without_finish",
+    }
+  );
+  assert.deepEqual(
+    selectRealtimeStreamFailureFallback(stalledError, partial),
+    {
+      ...partial,
+      partial_fallback: true,
+      partial_fallback_reason: "client_pcm_stalled",
+    }
+  );
+  assert.equal(
+    selectRealtimeStreamFailureFallback(
+      createRealtimeProtocolError({
+        type: "error",
+        error: "upstream overload",
+        reason: "server_busy",
+      }, "realtime error"),
+      partial
+    ),
+    null
+  );
+});
