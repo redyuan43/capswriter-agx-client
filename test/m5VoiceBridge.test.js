@@ -1238,7 +1238,7 @@ test("MiniJoy host capture with no PCM records an audio failure but remains retr
   );
 });
 
-test("MiniJoy capture validates only Bluetooth PCM and retries invalid transport audio", async (t) => {
+test("host capture validates Bluetooth and USB PCM before streaming to ASR", async (t) => {
   const { bridge } = await startBridge(t);
   const bluetoothSession = {
     id: "bluetooth-quality",
@@ -1266,7 +1266,13 @@ test("MiniJoy capture validates only Bluetooth PCM and retries invalid transport
     quietChanging.writeInt16LE((offset / 2) % 17 - 8, offset);
   }
   assert.equal(bluetoothOptions.validateInitialAudio(quietChanging).valid, true);
-  assert.equal("initialAudioBytes" in usbOptions, false);
+  assert.equal(usbOptions.initialAudioBytes, 12288);
+  assert.equal(usbOptions.maxInitialAudioBytes, 32000);
+  assert.deepEqual(
+    usbOptions.deferredInvalidAudioReasons,
+    ["all_zero", "frozen", "sparse_frozen"]
+  );
+  assert.equal(usbOptions.validateInitialAudio(Buffer.alloc(12288)).valid, false);
 });
 
 test("failed ASR marks frozen MiniJoy PCM unhealthy and queues Bluetooth recovery", async (t) => {
@@ -1327,6 +1333,37 @@ test("failed ASR does not reset Bluetooth for valid quiet PCM", async (t) => {
     status: "transcription_failed",
   });
 
+  assert.equal(recoveryQueued, false);
+});
+
+test("failed ASR marks frozen USB PCM unhealthy without Bluetooth recovery", async (t) => {
+  const { bridge } = await startBridge(t);
+  const sourceId = "pipewire:alsa_input.usb-mi-speakphone";
+  const session = bridge.recordingSessions.create({
+    id: "frozen-usb-pcm",
+    intent: "dictation",
+    triggerId: "keyboard",
+  });
+  session.captureMode = "host_capture";
+  session.sourceId = sourceId;
+  bridge.recordingSessions.appendAudio(session, Buffer.alloc(8192));
+  let recoveryQueued = false;
+  bridge.queueBluetoothAudioRecovery = () => {
+    recoveryQueued = true;
+    return true;
+  };
+
+  await bridge.handleRendererResult({
+    session_id: session.id,
+    success: false,
+    status: "transcription_failed",
+  });
+
+  assert.equal(bridge.audioRouting.captureHealthFor(sourceId).status, "failed");
+  assert.equal(
+    bridge.audioRouting.captureHealthFor(sourceId).failure_reason,
+    "audio_input_invalid"
+  );
   assert.equal(recoveryQueued, false);
 });
 

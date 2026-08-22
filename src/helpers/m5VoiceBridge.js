@@ -1443,18 +1443,42 @@ loadBluetoothDevices();
     };
     const match = String(session?.sourceId || "")
       .match(/bluez_input\.([0-9a-f_:-]{12,17})/i);
-    if (!match) return base;
-    const compactMac = match[1].replace(/[^0-9a-f]/gi, "").toUpperCase();
-    const mac = compactMac.length === 12 ? compactMac.match(/.{2}/g).join(":") : "";
-    return {
+    const validateInput = {
       ...base,
-      firstChunkRetryMs: 3000,
-      maxStartAttempts: 2,
       initialAudioBytes: 12288,
       maxInitialAudioBytes: 32000,
       deferredInvalidAudioReasons: ["all_zero", "frozen", "sparse_frozen"],
       validateInitialAudio: classifyPcmTransport,
       onInvalidAudio: (details) => this.abortSession(session, "audio_input_invalid", details),
+    };
+    if (!match) {
+      return {
+        ...validateInput,
+        beforeRetry: async () => {
+          const route = this.audioRouting.activateTrigger(session.triggerId, {
+            fallbackToAvailable: false,
+          });
+          if (route.available && route.source?.node_name) {
+            session.audioRoute = route;
+            this.applyAudioRoute(route);
+          }
+          this.logger?.[route.available ? "info" : "warn"]?.(
+            "PipeWire input route refreshed before capture retry",
+            {
+              sessionId: session.id,
+              sourceId: session.sourceId,
+              available: route.available,
+            }
+          );
+        },
+      };
+    }
+    const compactMac = match[1].replace(/[^0-9a-f]/gi, "").toUpperCase();
+    const mac = compactMac.length === 12 ? compactMac.match(/.{2}/g).join(":") : "";
+    return {
+      ...validateInput,
+      firstChunkRetryMs: 3000,
+      maxStartAttempts: 2,
       beforeRetry: async () => {
         const reset = await this.bluetoothDevices.resetAudioProfile(mac, 8);
         const route = this.audioRouting.activateTrigger(session.triggerId, {
@@ -2211,9 +2235,10 @@ loadBluetoothDevices();
     }
     const rendererFailed = payload.success === false ||
       String(payload.status || "") === "transcription_failed";
-    const bluetoothHostCapture = session.captureMode === "host_capture" &&
+    const hostCapture = session.captureMode === "host_capture";
+    const bluetoothHostCapture = hostCapture &&
       String(session.sourceId || "").startsWith("pipewire:bluez_input.");
-    if (rendererFailed && bluetoothHostCapture && session.pcmFile) {
+    if (rendererFailed && hostCapture && session.pcmFile) {
       try {
         const quality = classifyPcmTransport(fs.readFileSync(session.pcmFile));
         if (!quality.valid) {
@@ -2226,15 +2251,17 @@ loadBluetoothDevices();
             "audio_input_invalid",
             details
           );
-          this.logger?.warn?.("MiniJoy ASR failed with invalid Bluetooth PCM", {
+          this.logger?.warn?.("Host ASR failed with invalid PCM", {
             sessionId: session.id,
             sourceId: session.sourceId,
             ...details,
           });
-          this.queueBluetoothAudioRecovery(session, "audio_input_invalid");
+          if (bluetoothHostCapture) {
+            this.queueBluetoothAudioRecovery(session, "audio_input_invalid");
+          }
         }
       } catch (error) {
-        this.logger?.warn?.("Unable to inspect failed MiniJoy PCM", {
+        this.logger?.warn?.("Unable to inspect failed host PCM", {
           sessionId: session.id,
           error: error?.message || String(error),
         });
