@@ -77,6 +77,39 @@ test("OTA service keeps Cardputer-Adv firmware on its own board target", (t) => 
   });
 });
 
+test("OTA service keeps StickC Plus SE firmware independent", (t) => {
+  const otaDir = fs.mkdtempSync(path.join(os.tmpdir(), "m5-ota-plus-se-"));
+  t.after(() => fs.rmSync(otaDir, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(otaDir, "stickc_plus_se.json"),
+    JSON.stringify({
+      version: "0.1.1",
+      file_name: "stickc_plus_se.bin",
+    })
+  );
+  fs.writeFileSync(
+    path.join(otaDir, "stickc_plus_se.bin"),
+    Buffer.from([13, 14, 15])
+  );
+
+  const service = new M5OtaService({ otaDir });
+  assert.deepEqual(service.manifest("stickc_plus_se"), {
+    version: "0.1.1",
+    file_name: "stickc_plus_se.bin",
+    available: true,
+    board: "stickc_plus_se",
+    url: "/ota/bin?board=stickc_plus_se",
+  });
+  assert.deepEqual(service.binary("stickc_plus_se"), {
+    binaryPath: path.join(otaDir, "stickc_plus_se.bin"),
+    size: 3,
+  });
+  assert.deepEqual(service.manifest("stickc_plus"), {
+    available: false,
+    board: "stickc_plus",
+  });
+});
+
 test("OTA service keeps MiniJoy firmware independent from StickC Plus", (t) => {
   const otaDir = fs.mkdtempSync(path.join(os.tmpdir(), "m5-ota-minijoy-"));
   t.after(() => fs.rmSync(otaDir, { recursive: true, force: true }));

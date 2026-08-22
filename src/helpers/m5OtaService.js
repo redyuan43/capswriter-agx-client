@@ -5,6 +5,7 @@ const OTA_BOARDS = new Set([
   "sticks3",
   "cardputer_adv",
   "stickc_plus",
+  "stickc_plus_se",
   "stickc_plus_minijoy_bt",
 ]);
 
