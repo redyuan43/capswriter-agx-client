@@ -30,7 +30,9 @@ class M5DeviceRegistry {
     }
 
     const now = this.now();
-    const clientIp = normalizeRemoteAddress(req.socket?.remoteAddress || "");
+    const clientIp = normalizeRemoteAddress(
+      req.headers["x-vibe-ingress-client-ip"] || req.socket?.remoteAddress || ""
+    );
     const key = deviceId || clientIp || "unknown-device";
     const previous = this.devices.get(key) || {};
     const device = {

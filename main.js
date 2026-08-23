@@ -126,10 +126,19 @@ const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
+const M5BridgeIngressManager = require("./src/helpers/m5BridgeIngressManager");
 const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles");
 const HostTriggerOperationQueue = require("./src/helpers/hostTriggerOperationQueue");
 const PipeWirePlaybackController = require("./src/helpers/pipeWirePlaybackController");
 const { KnobMapperManager } = require("./src/helpers/knobMapperManager");
+
+const m5BridgePublicHost = process.env.M5_VOICE_BRIDGE_HOST || "0.0.0.0";
+const m5BridgePublicPort = Number(process.env.M5_VOICE_BRIDGE_PORT || 8765);
+const m5BridgeInternalPort = Number(
+  process.env.M5_VOICE_BRIDGE_INTERNAL_PORT || 8766
+);
+process.env.M5_VOICE_BRIDGE_HOST = "127.0.0.1";
+process.env.M5_VOICE_BRIDGE_PORT = String(m5BridgeInternalPort);
 
 // Setup production PATH for Python
 function setupProductionPath() {
@@ -436,6 +445,13 @@ const m5VoiceBridge = new M5VoiceBridge({
   databaseManager,
   asrConnectionProfiles,
   sendToRenderer: safeSendToMainWindow,
+});
+const m5BridgeIngress = new M5BridgeIngressManager({
+  logger,
+  host: m5BridgePublicHost,
+  port: m5BridgePublicPort,
+  internalPort: m5BridgeInternalPort,
+  onAudio: (payload) => m5VoiceBridge.ingestIngressAudio(payload),
 });
 const mappedVoiceTriggers = new Set();
 m5VoiceBridge.deviceMapping.setActionExecutor(async (action, phase, context = {}) => {
@@ -1144,6 +1160,7 @@ async function startApp() {
     });
   }
   m5VoiceBridge.start();
+  m5BridgeIngress.start();
 
   if (process.platform === "linux" && knobMapperManager.isEnabled()) {
     const mapperStatus = await knobMapperManager.start({ automatic: true });
@@ -1200,6 +1217,7 @@ app.on("will-quit", () => {
   app.isQuitting = true;
   stopClipboardWatch();
   pipeWirePlayback.stop("app_quit");
+  m5BridgeIngress.stop();
   m5VoiceBridge.stop();
   void knobMapperManager.stop();
   globalShortcut.unregisterAll();
@@ -1214,5 +1232,6 @@ module.exports = {
   clipboardManager,
   trayManager,
   hotkeyManager,
-  logger
+  logger,
+  m5BridgeIngress,
 };

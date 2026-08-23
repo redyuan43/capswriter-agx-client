@@ -697,7 +697,9 @@ loadBluetoothDevices();
   }
 
   isLoopbackRequest(req) {
-    const remoteAddress = String(req?.socket?.remoteAddress || "").trim().toLowerCase();
+    const remoteAddress = String(
+      req?.headers?.["x-vibe-ingress-client-ip"] || req?.socket?.remoteAddress || ""
+    ).trim().toLowerCase();
     return remoteAddress === "127.0.0.1" ||
       remoteAddress === "::1" ||
       remoteAddress === "::ffff:127.0.0.1";
@@ -1759,6 +1761,38 @@ loadBluetoothDevices();
       success: true,
       recording,
     });
+  }
+
+  ingestIngressAudio(payload = {}) {
+    const sessionId = String(payload.session_id || "").trim();
+    const session = this.sessions.get(sessionId);
+    if (!session || session.done) {
+      return { accepted: false, error: "recording session not found" };
+    }
+    const body = Buffer.isBuffer(payload.audio)
+      ? payload.audio
+      : Buffer.from(payload.audio?.data || payload.audio || []);
+    if (body.length === 0) {
+      return { accepted: false, error: "audio chunk is empty" };
+    }
+    const chunkId = Number(payload.chunk_id);
+    if (session.protocolVersion >= 2) {
+      if (!Number.isInteger(chunkId) || chunkId < session.expectedChunkId) {
+        return { accepted: false, error: "invalid ingress chunk id" };
+      }
+      if (chunkId > session.expectedChunkId) {
+        return { accepted: false, error: "ingress chunk out of order" };
+      }
+    }
+    if (!this.appendRecordingAudio(session, body)) {
+      return { accepted: false, error: "audio append failed" };
+    }
+    if (session.protocolVersion >= 2) {
+      session.expectedChunkId += 1;
+    } else if (payload.chunk_id) {
+      session.seenChunkIds.add(String(payload.chunk_id));
+    }
+    return { accepted: true };
   }
 
   async handleRecordingStop(req, res) {

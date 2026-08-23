@@ -1,26 +1,65 @@
 const fs = require('fs');
 const path = require('path');
 
+const DEFAULT_MAX_LOG_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
+
 class LogManager {
-  constructor() {
+  constructor({
+    fsModule = fs,
+    pathModule = path,
+    userDataPath = "",
+    consoleRef = console,
+    consoleEnabled = process.env.CAPSWRITER_CONSOLE_LOGS === "1",
+    maxLogBytes = DEFAULT_MAX_LOG_BYTES,
+    maxPendingBytes = DEFAULT_MAX_PENDING_BYTES,
+  } = {}) {
+    this.fs = fsModule;
+    this.path = pathModule;
+    this.userDataPath = userDataPath;
+    this.console = consoleRef;
+    this.consoleEnabled = consoleEnabled;
+    this.maxLogBytes = maxLogBytes;
+    this.maxPendingBytes = maxPendingBytes;
+    this.pendingLines = [];
+    this.pendingBytes = 0;
+    this.writeInFlight = false;
+    this.flushScheduled = false;
+    this.droppedEntries = 0;
     this.logDir = this.getLogDirectory();
-    this.logFile = path.join(this.logDir, 'app.log');
+    this.logFile = this.path.join(this.logDir, 'app.log');
     this.ensureLogDirectory();
+    this.rotateOversizedLog();
   }
 
   getLogDirectory() {
-    // 在用户目录下创建日志文件夹
-    const userDataPath = require('electron').app.getPath('userData');
-    return path.join(userDataPath, 'logs');
+    const userDataPath = this.userDataPath || require('electron').app.getPath('userData');
+    return this.path.join(userDataPath, 'logs');
   }
 
   ensureLogDirectory() {
     try {
-      if (!fs.existsSync(this.logDir)) {
-        fs.mkdirSync(this.logDir, { recursive: true });
+      if (!this.fs.existsSync(this.logDir)) {
+        this.fs.mkdirSync(this.logDir, { recursive: true });
       }
     } catch (error) {
       console.error('创建日志目录失败:', error);
+    }
+  }
+
+  rotateOversizedLog() {
+    try {
+      if (!this.fs.existsSync(this.logFile) ||
+          this.fs.statSync(this.logFile).size < this.maxLogBytes) {
+        return;
+      }
+      const rotated = `${this.logFile}.1`;
+      if (this.fs.existsSync(rotated)) {
+        this.fs.unlinkSync(rotated);
+      }
+      this.fs.renameSync(this.logFile, rotated);
+    } catch (error) {
+      console.error('轮转日志文件失败:', error);
     }
   }
 
@@ -34,16 +73,59 @@ class LogManager {
       pid: process.pid
     };
 
-    // 输出到控制台
-    console[level](`[${timestamp}] ${message}`, data || '');
-
-    // 写入日志文件
-    try {
-      const logLine = JSON.stringify(logEntry) + '\n';
-      fs.appendFileSync(this.logFile, logLine);
-    } catch (error) {
-      console.error('写入日志文件失败:', error);
+    if (this.consoleEnabled) {
+      const output = this.console[level] || this.console.log;
+      output.call(this.console, `[${timestamp}] ${message}`, data || '');
     }
+
+    const logLine = JSON.stringify(logEntry) + '\n';
+    const bytes = Buffer.byteLength(logLine);
+    if (this.pendingBytes + bytes > this.maxPendingBytes &&
+        (level === 'info' || level === 'debug')) {
+      this.droppedEntries += 1;
+      return;
+    }
+    this.pendingLines.push(logLine);
+    this.pendingBytes += bytes;
+    this.scheduleFlush();
+  }
+
+  scheduleFlush() {
+    if (this.flushScheduled || this.writeInFlight) {
+      return;
+    }
+    this.flushScheduled = true;
+    setImmediate(() => {
+      this.flushScheduled = false;
+      this.flush();
+    });
+  }
+
+  flush() {
+    if (this.writeInFlight || this.pendingLines.length === 0) {
+      return;
+    }
+    const lines = this.pendingLines;
+    this.pendingLines = [];
+    this.pendingBytes = 0;
+    if (this.droppedEntries > 0) {
+      lines.unshift(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        message: 'Log entries dropped while asynchronous writer was busy',
+        data: { count: this.droppedEntries },
+        pid: process.pid,
+      }) + '\n');
+      this.droppedEntries = 0;
+    }
+    this.writeInFlight = true;
+    this.fs.appendFile(this.logFile, lines.join(''), (error) => {
+      this.writeInFlight = false;
+      if (error) {
+        this.console.error('写入日志文件失败:', error);
+      }
+      this.scheduleFlush();
+    });
   }
 
   info(message, data) {
@@ -65,11 +147,16 @@ class LogManager {
   // 获取最近的日志
   getRecentLogs(lines = 100) {
     try {
-      if (!fs.existsSync(this.logFile)) {
+      if (!this.fs.existsSync(this.logFile)) {
         return [];
       }
-
-      const content = fs.readFileSync(this.logFile, 'utf8');
+      const stats = this.fs.statSync(this.logFile);
+      const readBytes = Math.min(stats.size, Math.max(64 * 1024, lines * 4096));
+      const fd = this.fs.openSync(this.logFile, 'r');
+      const buffer = Buffer.alloc(readBytes);
+      this.fs.readSync(fd, buffer, 0, readBytes, stats.size - readBytes);
+      this.fs.closeSync(fd);
+      const content = buffer.toString('utf8');
       const logLines = content.trim().split('\n').filter(line => line.trim());
       
       return logLines
@@ -92,10 +179,10 @@ class LogManager {
     try {
       const cutoffTime = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
 
-      if (fs.existsSync(this.logFile)) {
-        const stats = fs.statSync(this.logFile);
+      if (this.fs.existsSync(this.logFile)) {
+        const stats = this.fs.statSync(this.logFile);
         if (stats.mtime.getTime() < cutoffTime) {
-          fs.unlinkSync(this.logFile);
+          this.fs.unlinkSync(this.logFile);
           this.info(`清理旧日志文件: ${this.logFile}`);
         }
       }
