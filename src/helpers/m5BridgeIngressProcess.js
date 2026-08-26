@@ -1,4 +1,5 @@
 const http = require("http");
+const { decodeVibeAudioBody } = require("./imaAdpcm");
 
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_AUDIO_CHUNK_BYTES = 256 * 1024;
@@ -82,7 +83,48 @@ class M5BridgeIngress {
     this.internalPort = internalPort;
     this.token = token;
     this.sessions = new Map();
+    this.pendingDrains = new Map();
+    this.nextDrainId = 1;
     this.server = null;
+  }
+
+  waitForParentDrain(sessionId, timeoutMs = 5000) {
+    if (!process.send) {
+      return Promise.resolve();
+    }
+    const requestId = `${process.pid}-${this.nextDrainId++}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingDrains.delete(requestId);
+        reject(Object.assign(new Error("recording audio drain timed out"), {
+          statusCode: 503,
+        }));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingDrains.set(requestId, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      process.send({
+        type: "recording-drain",
+        request_id: requestId,
+        session_id: sessionId,
+      });
+    });
+  }
+
+  handleParentMessage(message) {
+    if (message?.type === "recording-drain-ack") {
+      const resolve = this.pendingDrains.get(String(message.request_id || ""));
+      if (resolve) {
+        this.pendingDrains.delete(String(message.request_id || ""));
+        resolve();
+      }
+      return;
+    }
+    if (message?.type === "shutdown") {
+      this.stop();
+    }
   }
 
   log(level, message, data) {
@@ -147,6 +189,9 @@ class M5BridgeIngress {
     this.sessions.set(sessionId, {
       deviceId: String(req.headers["x-vibe-stick-device-id"] || request.device_id || "").trim(),
       protocolVersion: Math.max(1, Number(request.protocol_version || 1)),
+      transportEncoding: String(
+        payload?.recording?.accepted_transport_encoding || "pcm16"
+      ).trim().toLowerCase(),
       expectedChunkId: 0,
       bytes: 0,
       chunks: 0,
@@ -171,7 +216,7 @@ class M5BridgeIngress {
       sendJson(res, 403, { success: false, error: "recording session belongs to another device" });
       return;
     }
-    const body = await readBody(req, MAX_AUDIO_CHUNK_BYTES);
+    const wireBody = await readBody(req, MAX_AUDIO_CHUNK_BYTES);
     const chunkId = String(url.searchParams.get("chunk_id") || "").trim();
     const numericChunkId = chunkId === "" ? null : Number(chunkId);
     if (session.protocolVersion >= 2) {
@@ -190,11 +235,20 @@ class M5BridgeIngress {
       const expectedCrc = String(
         req.headers["x-vibe-stick-chunk-crc32"] || url.searchParams.get("chunk_crc32") || ""
       ).trim().toLowerCase().replace(/^0x/, "");
-      if (!expectedCrc || expectedCrc !== crc32Hex(body)) {
+      if (!expectedCrc || expectedCrc !== crc32Hex(wireBody)) {
         sendJson(res, 422, { success: false, error: "audio chunk checksum mismatch" });
         return;
       }
     }
+    const decoded = decodeVibeAudioBody(req.headers, wireBody);
+    if (decoded.encoding !== session.transportEncoding) {
+      sendJson(res, 415, {
+        success: false,
+        error: "audio encoding does not match recording session",
+      });
+      return;
+    }
+    const body = decoded.audio;
     const duplicate = session.protocolVersion >= 2
       ? numericChunkId < session.expectedChunkId
       : false;
@@ -222,6 +276,8 @@ class M5BridgeIngress {
           session_id: sessionId,
           chunk_id: numericChunkId,
           audio: body,
+          transport_encoding: decoded.encoding,
+          wire_bytes: decoded.wireBytes,
         },
       });
     }
@@ -236,6 +292,19 @@ class M5BridgeIngress {
     const body = req.method === "GET" || req.method === "HEAD"
       ? Buffer.alloc(0)
       : await readBody(req, MAX_JSON_BYTES);
+    if (req.method === "POST" && url.pathname === "/recording/stop") {
+      let sessionId = "";
+      try {
+        sessionId = String(
+          JSON.parse(body.toString("utf8")).session_id || ""
+        ).trim();
+      } catch {
+        // The internal bridge remains authoritative for malformed JSON.
+      }
+      if (sessionId && this.sessions.has(sessionId)) {
+        await this.waitForParentDrain(sessionId);
+      }
+    }
     const response = await this.proxy(req, body);
     if (req.method === "POST" && url.pathname === "/recording/start") {
       this.rememberStartedSession(req, body, response);
@@ -285,8 +354,4 @@ class M5BridgeIngress {
 
 const ingress = new M5BridgeIngress();
 ingress.start();
-process.on("message", (message) => {
-  if (message?.type === "shutdown") {
-    ingress.stop();
-  }
-});
+process.on("message", (message) => ingress.handleParentMessage(message));

@@ -44,6 +44,14 @@ class M5BridgeIngressManager {
         }
         return;
       }
+      if (message?.type === "recording-drain") {
+        this.child?.send({
+          type: "recording-drain-ack",
+          request_id: message.request_id,
+          session_id: message.session_id,
+        });
+        return;
+      }
       if (message?.type === "log") {
         const write = this.logger?.[message.level] || this.logger?.info;
         write?.call(this.logger, message.message, message.data);
