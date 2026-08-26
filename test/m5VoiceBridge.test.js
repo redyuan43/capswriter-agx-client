@@ -468,10 +468,19 @@ test("M5 audio chunks are idempotent by chunk_id", async (t) => {
   const started = await requestJson(port, "/recording/start", {
     method: "POST",
     headers,
-    body: { session_id: "idempotent-audio", intent: "dictation" },
+    body: {
+      session_id: "idempotent-audio",
+      intent: "dictation",
+      transport_encoding: "pcm16",
+    },
   });
   const startPayload = JSON.parse(started.body);
   assert.equal(startPayload.recording.capture_mode, "device_upload");
+  assert.deepEqual(startPayload.recording.audio_encodings, [
+    "pcm16",
+    "ima-adpcm-v1",
+  ]);
+  assert.equal(startPayload.recording.accepted_transport_encoding, "pcm16");
   assert.equal("state" in startPayload, false);
   assert.ok(Buffer.byteLength(started.body) < 1024);
 

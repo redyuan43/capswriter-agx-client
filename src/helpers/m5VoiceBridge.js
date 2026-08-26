@@ -20,6 +20,10 @@ const PipeWireUnifiedSourceController = require("./pipeWireUnifiedSourceControll
 const BluetoothDeviceManager = require("./bluetoothDeviceManager");
 const { classifyPcmTransport } = require("./pcmSignalQuality");
 const {
+  IMA_ADPCM_ENCODING,
+  decodeVibeAudioBody,
+} = require("./imaAdpcm");
+const {
   MainRealtimeAsrSession,
   extractText: extractMainAsrText,
   usablePayload: isUsableMainAsrPayload,
@@ -1269,6 +1273,11 @@ loadBluetoothDevices();
     session.source = body.source || "m5stickc_plus";
     session.audioSource = body.audio_source || "stickc_plus_pcm";
     session.protocolVersion = Math.max(1, Number(body.protocol_version || 1));
+    session.transportEncoding =
+      String(body.transport_encoding || "").trim().toLowerCase() ===
+      IMA_ADPCM_ENCODING
+        ? IMA_ADPCM_ENCODING
+        : "pcm16";
     session.seenChunkIds = new Set();
     this.armSessionWatchdogs(session);
     if (captureMode === "host_capture") {
@@ -1685,7 +1694,7 @@ loadBluetoothDevices();
       return;
     }
     session.lastUploadAttemptAt = Date.now();
-    const body = await readRequestBody(req, MAX_AUDIO_CHUNK_BYTES);
+    const wireBody = await readRequestBody(req, MAX_AUDIO_CHUNK_BYTES);
     const strictProtocol = session.protocolVersion >= 2;
     const numericChunkId = chunkId === "" ? null : Number(chunkId);
     const duplicate = strictProtocol
@@ -1724,7 +1733,7 @@ loadBluetoothDevices();
       const expectedCrc = String(
         req.headers["x-vibe-stick-chunk-crc32"] || url.searchParams.get("chunk_crc32") || ""
       ).trim().toLowerCase().replace(/^0x/, "");
-      const actualCrc = crc32Hex(body);
+      const actualCrc = crc32Hex(wireBody);
       if (!expectedCrc || expectedCrc !== actualCrc) {
         this.logger?.warn?.("M5 audio chunk rejected", {
           sessionId,
@@ -1743,6 +1752,15 @@ loadBluetoothDevices();
         return;
       }
     }
+    const decoded = decodeVibeAudioBody(req.headers, wireBody);
+    if (decoded.encoding !== (session.transportEncoding || "pcm16")) {
+      this.sendJson(res, 415, {
+        success: false,
+        error: "audio encoding does not match recording session",
+      });
+      return;
+    }
+    const body = decoded.audio;
     if (!duplicate) {
       this.appendRecordingAudio(session, body);
       if (strictProtocol) session.expectedChunkId += 1;
@@ -2316,6 +2334,8 @@ loadBluetoothDevices();
       expected_chunk_id: session.expectedChunkId,
       bridge_instance_id: this.bridgeInstanceId,
       audio_format: { codec: "pcm_s16le", sample_rate: 16000, channels: 1 },
+      audio_encodings: ["pcm16", IMA_ADPCM_ENCODING],
+      accepted_transport_encoding: session.transportEncoding || "pcm16",
     };
   }
 
