@@ -1,5 +1,5 @@
 import backendConfig from '../config/backend.js';
-import { apiClient, getBaseURL, inferAudioUploadFilename } from './sharedClient.js';
+import { apiClient, getBaseURL, getAsrBaseURL, inferAudioUploadFilename } from './sharedClient.js';
 
 export async function transcribeAudio(audioBlob, options = {}) {
   const { useVad = true, usePunc = true, hotword = '' } = options;
@@ -9,7 +9,8 @@ export async function transcribeAudio(audioBlob, options = {}) {
   formData.append('use_punc', usePunc);
   formData.append('hotword', hotword);
 
-  const response = await apiClient.post(`${await getBaseURL()}${backendConfig.endpoints.transcribe}`, formData, {
+  const response = await apiClient.post(`${await getAsrBaseURL()}${backendConfig.endpoints.transcribe}`, formData, {
+    timeout: 120000,
     headers: { 'Content-Type': 'multipart/form-data' }
   });
   return response.data;
@@ -27,7 +28,7 @@ export async function transcribeAudioStream(audioBlob, options = {}) {
     formData.append('translate_target', translateTarget || 'zh');
   }
 
-  const response = await fetch(`${await getBaseURL()}${backendConfig.endpoints.transcribeAndOptimizeStream}`, {
+  const response = await fetch(`${await getAsrBaseURL()}${backendConfig.endpoints.transcribeAndOptimizeStream}`, {
     method: 'POST',
     body: formData,
     headers: { Accept: 'text/event-stream' }
@@ -110,20 +111,21 @@ export async function transcribeAndOptimize(audioBlob, options = {}) {
   formData.append('hotword', hotword);
   formData.append('optimize_mode', optimizeMode);
 
-  const response = await apiClient.post(`${await getBaseURL()}${backendConfig.endpoints.transcribeAndOptimize}`, formData, {
+  const response = await apiClient.post(`${await getAsrBaseURL()}${backendConfig.endpoints.transcribeAndOptimize}`, formData, {
+    timeout: 120000,
     headers: { 'Content-Type': 'multipart/form-data' }
   });
   return response.data;
 }
 
 export async function getBackendStatus() {
-  const response = await apiClient.get(`${await getBaseURL()}${backendConfig.endpoints.status}`);
+  const response = await apiClient.get(`${await getAsrBaseURL()}${backendConfig.endpoints.status}`);
   return response.data;
 }
 
 export async function healthCheck() {
   try {
-    const response = await apiClient.get(`${await getBaseURL()}${backendConfig.endpoints.health}`);
+    const response = await apiClient.get(`${await getAsrBaseURL()}${backendConfig.endpoints.health}`);
     return response.status === 200;
   } catch {
     return false;

@@ -6,6 +6,7 @@ const SECRET_FILE_NAME = "asr-connection-secrets.json";
 const PUBLIC_ASR_URL = "wss://asr.yuanspaces.com/api/asr/realtime";
 
 const PRESETS = [
+  { id: "tencent", name: "腾讯云·中国直连", url: "ws://ai-x10drg.taild500c8.ts.net:18011/api/asr/realtime", httpBaseUrl: "http://ai-x10drg.taild500c8.ts.net:18011", auth: "none", preset: true },
   { id: "spark", name: "Spark", url: "ws://spark-31d6.taild500c8.ts.net:18011/api/asr/realtime", auth: "none", preset: true },
   { id: "public", name: "公网", url: PUBLIC_ASR_URL, auth: "token", preset: true },
   { id: "agx", name: "AGX", url: "ws://agx.taild500c8.ts.net:18011/api/asr/realtime", auth: "none", preset: true },
@@ -38,7 +39,18 @@ function normalizeProfile(profile, existing = null) {
   const url = cleanUrl(profile?.url ?? existing?.url);
   if (!url) throw new Error("ASR 地址必须是有效的 ws:// 或 wss:// 地址");
   const auth = preset ? preset.auth : (profile?.auth === "token" ? "token" : "none");
-  return { id, name, url, auth, preset: Boolean(preset) };
+  const result = { id, name, url, auth, preset: Boolean(preset) };
+  const httpBaseUrl = String(profile?.httpBaseUrl ?? existing?.httpBaseUrl ?? "").trim();
+  if (profile?.httpBaseUrl === "" || existing?.httpBaseUrl === "") result.httpBaseUrl = "";
+  if (httpBaseUrl) {
+    let parsed;
+    try { parsed = new URL(httpBaseUrl); } catch { throw new Error("ASR HTTP 地址无效"); }
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error("ASR HTTP 地址必须是无认证信息的 http:// 或 https:// 地址");
+    }
+    result.httpBaseUrl = parsed.toString().replace(/\/+$/, "");
+  }
+  return result;
 }
 
 function normalizeConfig(value) {
@@ -214,7 +226,7 @@ class AsrConnectionProfiles {
         secrets.cleared[profile.id] ? "" : String(this.env.CAPSWRITER_REALTIME_ASR_TOKEN || "").trim()
       );
     }
-    return { id: profile.id, name: profile.name, url: profile.url, token };
+    return { id: profile.id, name: profile.name, url: profile.url, token, ...(profile.httpBaseUrl ? { httpBaseUrl: profile.httpBaseUrl } : {}) };
   }
 
   getConnectionForProfile(profile, { token, clearToken = false } = {}) {
@@ -227,7 +239,7 @@ class AsrConnectionProfiles {
     const resolvedToken = normalized.auth === "token"
       ? (suppliedToken || (clearToken ? "" : this.readStoredToken(normalized.id)) || ((clearToken || secrets.cleared[normalized.id]) ? "" : String(this.env.CAPSWRITER_REALTIME_ASR_TOKEN || "").trim()))
       : "";
-    return { id: normalized.id, name: normalized.name, url: normalized.url, token: resolvedToken };
+    return { id: normalized.id, name: normalized.name, url: normalized.url, token: resolvedToken, ...(normalized.httpBaseUrl ? { httpBaseUrl: normalized.httpBaseUrl } : {}) };
   }
 
   save(profile, { token, clearToken = false } = {}) {

@@ -33,7 +33,7 @@ function createManager({ settings, env = {} } = {}) {
   return { manager, dataDirectory };
 }
 
-test("seeds the three editable presets and encrypts a migrated public token", () => {
+test("seeds the editable presets and encrypts a migrated public token", () => {
   const { manager, dataDirectory } = createManager({
     env: {
       CAPSWRITER_REALTIME_ASR_URL: "wss://asr.yuanspaces.com/api/asr/realtime",
@@ -42,7 +42,7 @@ test("seeds the three editable presets and encrypts a migrated public token", ()
   });
   const list = manager.list();
   assert.equal(list.activeProfileId, "public");
-  assert.deepEqual(list.profiles.map((item) => item.id), ["spark", "public", "agx"]);
+  assert.deepEqual(list.profiles.map((item) => item.id), ["tencent", "spark", "public", "agx"]);
   assert.equal(list.profiles.find((item) => item.id === "public").hasToken, true);
   assert.equal(JSON.stringify(list).includes("runtime-token"), false);
   assert.equal(manager.getActiveConnection().token, "runtime-token");

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import backendConfig from '../config/backend.js';
+import { resolveAsrHttpBaseURL } from '../helpers/asrHttpConnection.mjs';
 
 export const TTS_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TTS_REQUEST_TIMEOUT_MS || 120000);
 export const TRANSLATE_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_TRANSLATE_REQUEST_TIMEOUT_MS || 20000);
@@ -39,6 +40,12 @@ export async function getTtsBaseURL() {
     // Silently fallback
   }
   return backendConfig.ttsBaseURL;
+}
+
+export function getAsrBaseURL() {
+  const getActive = typeof window !== 'undefined' && window.electronAPI?.getActiveAsrConnection
+    ? () => window.electronAPI.getActiveAsrConnection() : null;
+  return resolveAsrHttpBaseURL(getActive, getBaseURL);
 }
 
 apiClient.interceptors.request.use(

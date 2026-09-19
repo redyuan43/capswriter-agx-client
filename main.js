@@ -1204,6 +1204,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  // Window close handlers must allow closing before Electron can emit will-quit.
+  app.isQuitting = true;
   codexTerminalManager.stop();
 });
 

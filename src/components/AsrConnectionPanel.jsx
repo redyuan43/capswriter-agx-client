@@ -18,6 +18,7 @@ function sameDraft(left, right) {
     && left.id === right.id
     && left.name === right.name
     && left.url === right.url
+    && (left.httpBaseUrl || "") === (right.httpBaseUrl || "")
     && left.auth === right.auth;
 }
 
@@ -31,6 +32,7 @@ export default function AsrConnectionPanel() {
   const [busy, setBusy] = useState(false);
   const [testedDraft, setTestedDraft] = useState(null);
   const [probeMetrics, setProbeMetrics] = useState("");
+  const [cloudStatus, setCloudStatus] = useState(null);
 
   const selected = useMemo(
     () => state?.profiles?.find((item) => item.id === selectedId) || null,
@@ -60,6 +62,26 @@ export default function AsrConnectionPanel() {
   useEffect(() => {
     load().catch((error) => toast.error("加载 ASR 配置失败", { description: error?.message || String(error) }));
   }, [load]);
+
+  useEffect(() => {
+    const base = draft?.id === "tencent" ? draft.httpBaseUrl : "";
+    if (!base) { setCloudStatus(null); return; }
+    let disposed = false;
+    const controller = new AbortController();
+    const refresh = async () => {
+      try {
+        const response = await fetch(`${base}/api/status`, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) });
+        if (!response.ok) throw new Error('ASR status unavailable');
+        const data = await response.json();
+        if (!disposed) setCloudStatus(data);
+      } catch {
+        if (!disposed) setCloudStatus(null);
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, 15000);
+    return () => { disposed = true; controller.abort(); clearInterval(timer); };
+  }, [draft?.id, draft?.httpBaseUrl]);
 
   const selectProfile = (profile) => {
     selectedIdRef.current = profile.id;
@@ -217,6 +239,16 @@ export default function AsrConnectionPanel() {
           <label className="block text-xs text-gray-600">实时 ASR WebSocket 地址
             <input value={draft.url} disabled={busy} onChange={(event) => changeDraft("url", event.target.value)} placeholder="wss://example.com/api/asr/realtime" className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
           </label>
+          <label className="block text-xs text-gray-600">ASR HTTP 地址（可选，用于文件上传和状态查询）
+            <input value={draft.httpBaseUrl || ""} disabled={busy} onChange={(event) => changeDraft("httpBaseUrl", event.target.value)} placeholder="留空沿用现有后端地址" className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
+          </label>
+          {draft.id === "tencent" && <div className="rounded-md bg-blue-50 p-3 text-xs text-blue-900" aria-live="polite">
+            <p>中国直连 · 普通版免费额度优先，耗尽或无法确认时使用 2.0。</p>
+            {cloudStatus?.quota ? <>
+              <p className="mt-1">下一次录音：{cloudStatus.engine === "16k_zh" ? "普通 ASR" : "ASR 2.0"} · {cloudStatus.quota.message}</p>
+              <p className="mt-1">2.0 参考价格：1 元/音频小时。额度在每次录音开始时判断。</p>
+            </> : <p className="mt-1">暂未取得服务状态。</p>}
+          </div>}
           {!draft.preset && <label className="block text-xs text-gray-600">认证方式
             <select value={draft.auth} disabled={busy} onChange={(event) => changeDraft("auth", event.target.value)} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md bg-white">
               <option value="none">无认证</option><option value="token">令牌认证</option>

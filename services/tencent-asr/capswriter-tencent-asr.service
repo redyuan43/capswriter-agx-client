@@ -1,0 +1,21 @@
+[Unit]
+Description=CapsWriter Tencent ASR (China direct)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/services/capswriter-tencent-asr
+EnvironmentFile=%h/.config/video-analyzer/tencentcloud.env
+Environment=ASR_BIND_HOST=100.91.42.28
+Environment=ASR_PORT=18011
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/services/capswriter-tencent-asr/.venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
