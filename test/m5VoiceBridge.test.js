@@ -1693,3 +1693,28 @@ test("M5 cancellation remains successful when it arrives before recording stop",
   assert.equal(JSON.parse(stop.body).recording.status, "cancelled");
   assert.equal(commands.length, 0);
 });
+
+test("only opted-in StickS3 uploads get bounded buffer recovery grace", async (t) => {
+  const { bridge, port } = await startBridge(t);
+  for (const [board, requested, expected] of [
+    ["sticks3", 8000, 8000], ["sticks3", 999999, 8000],
+    ["sticks3", -1, 0], ["sticks3", "NaN", 0], ["sticks3", undefined, 0],
+    ["cardputer_adv", 8000, 0], ["stickc_plus", 8000, 0], ["stickc_plus_se", 8000, 0],
+  ]) {
+    const id = "buffer-" + board + "-" + String(requested);
+    const result = await requestJson(port, "/recording/start", {
+      method: "POST",
+      headers: { "X-Vibe-Stick-Device-Id": id, "X-Vibe-Stick-Board": board },
+      body: { session_id: id, protocol_version: 2, upload_retry_ms: requested },
+    });
+    assert.equal(result.statusCode, 200);
+    assert.equal(JSON.parse(result.body).recording.upload_retry_ms, expected);
+    const session = bridge.sessions.get(id);
+    session.lastAudioAt = session.createdAt + 100;
+    assert.equal(bridge.sessionTimeoutReason(session, session.lastAudioAt + 10000),
+      expected ? "" : "audio_input_stalled");
+    assert.equal(bridge.sessionTimeoutReason(session, session.lastAudioAt + 13000),
+      "audio_input_stalled");
+    bridge.finishSession(session, { success: false, status: "cancelled" });
+  }
+});

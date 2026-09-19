@@ -453,6 +453,7 @@ const m5BridgeIngress = new M5BridgeIngressManager({
   internalPort: m5BridgeInternalPort,
   onAudio: (payload) => m5VoiceBridge.ingestIngressAudio(payload),
 });
+m5VoiceBridge.onSessionFinished = (sessionId) => m5BridgeIngress.endSession(sessionId);
 const mappedVoiceTriggers = new Set();
 m5VoiceBridge.deviceMapping.setActionExecutor(async (action, phase, context = {}) => {
   const triggerId = `cardputer-map:${context.deviceId || "unknown"}:${action.type}`;

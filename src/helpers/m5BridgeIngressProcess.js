@@ -114,6 +114,10 @@ class M5BridgeIngress {
   }
 
   handleParentMessage(message) {
+    if (message?.type === "recording-ended") {
+      this.sessions.delete(String(message.session_id || ""));
+      return;
+    }
     if (message?.type === "recording-drain-ack") {
       const resolve = this.pendingDrains.get(String(message.request_id || ""));
       if (resolve) {
@@ -186,6 +190,9 @@ class M5BridgeIngress {
     if (!sessionId) {
       return;
     }
+    // The control process treats start retries as idempotent. Preserve its
+    // matching ingress counters too, including audio received during a retry.
+    if (this.sessions.has(sessionId) && payload?.recording?.duplicate) return;
     this.sessions.set(sessionId, {
       deviceId: String(req.headers["x-vibe-stick-device-id"] || request.device_id || "").trim(),
       protocolVersion: Math.max(1, Number(request.protocol_version || 1)),
@@ -193,6 +200,7 @@ class M5BridgeIngress {
         payload?.recording?.accepted_transport_encoding || "pcm16"
       ).trim().toLowerCase(),
       expectedChunkId: 0,
+      legacyChunkIds: new Set(),
       bytes: 0,
       chunks: 0,
     });
@@ -251,11 +259,12 @@ class M5BridgeIngress {
     const body = decoded.audio;
     const duplicate = session.protocolVersion >= 2
       ? numericChunkId < session.expectedChunkId
-      : false;
+      : Boolean(chunkId && session.legacyChunkIds.has(chunkId));
     if (!duplicate) {
       session.expectedChunkId += session.protocolVersion >= 2 ? 1 : 0;
       session.bytes += body.length;
       session.chunks += 1;
+      if (session.protocolVersion < 2 && chunkId) session.legacyChunkIds.add(chunkId);
     }
     sendJson(res, 200, {
       success: true,

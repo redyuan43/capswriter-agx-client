@@ -41,6 +41,7 @@ class M5BridgeIngressManager {
         const result = this.onAudio(message.payload || {});
         if (result?.accepted === false) {
           this.logger?.warn?.("M5 ingress audio delivery rejected", result);
+          this.endSession(message.payload?.session_id);
         }
         return;
       }
@@ -75,6 +76,12 @@ class M5BridgeIngressManager {
     const timer = setTimeout(() => child.kill("SIGTERM"), 2000);
     timer.unref?.();
     child.once("exit", () => clearTimeout(timer));
+  }
+
+  endSession(sessionId) {
+    if (sessionId && this.child?.connected) {
+      this.child.send({ type: "recording-ended", session_id: sessionId });
+    }
   }
 }
 

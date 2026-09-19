@@ -70,6 +70,7 @@ function waitForMessage(child, predicate, timeoutMs = 1000) {
 }
 
 test("ingress acknowledges known recording chunks without waiting for the control process", async (t) => {
+  const startedSessions = new Set();
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -79,12 +80,14 @@ test("ingress acknowledges known recording chunks without waiting for the contro
         success: true,
         recording: {
           session_id: body.session_id,
+          duplicate: startedSessions.has(body.session_id),
           accepted_transport_encoding:
             body.transport_encoding === "ima-adpcm-v1"
               ? "ima-adpcm-v1"
               : "pcm16",
         },
       }));
+      startedSessions.add(body.session_id);
       res.writeHead(200, { "Content-Type": "application/json", "Content-Length": payload.length });
       res.end(payload);
       return;
@@ -101,8 +104,8 @@ test("ingress acknowledges known recording chunks without waiting for the contro
       res.end(payload);
       return;
     }
-    res.writeHead(500);
-    res.end("audio should not be proxied");
+    res.writeHead(404);
+    res.end("recording session not found");
   });
   upstream.listen(0, "127.0.0.1");
   await once(upstream, "listening");
@@ -147,6 +150,11 @@ test("ingress acknowledges known recording chunks without waiting for the contro
   assert.equal(message.payload.session_id, sessionId);
   assert.ok(Buffer.isBuffer(message.payload.audio));
   assert.equal(message.payload.audio.length, 3840);
+  const legacyDuplicate = await request(port, `/recording/audio?session_id=${sessionId}&chunk_id=0`, {
+    body: Buffer.alloc(3840, 3),
+  });
+  assert.equal(JSON.parse(legacyDuplicate.body).recording.duplicate, true);
+  assert.equal(JSON.parse(legacyDuplicate.body).recording.bytes, 3840);
 
   const adpcmSessionId = "ingress-adpcm-session";
   const deviceHeaders = { "X-Vibe-Stick-Device-Id": "cardputer-a" };
@@ -200,6 +208,29 @@ test("ingress acknowledges known recording chunks without waiting for the contro
     decodedMessage.payload.audio.readInt16LE(PCM_BYTES_PER_BLOCK),
     -2345
   );
+
+  const startRetry = await request(port, "/recording/start", {
+    headers: deviceHeaders,
+    body: Buffer.from(JSON.stringify({ session_id: adpcmSessionId, protocol_version: 2,
+      transport_encoding: "ima-adpcm-v1" })),
+  });
+  assert.equal(startRetry.statusCode, 200);
+  const nextChunk = await request(port, `/recording/audio?session_id=${adpcmSessionId}&chunk_id=1`, {
+    headers: { ...deviceHeaders, "Content-Type": IMA_ADPCM_CONTENT_TYPE,
+      "X-Vibe-Stick-Audio-Encoding": "ima-adpcm-v1", "X-Vibe-Stick-Audio-Sample-Rate": "16000",
+      "X-Vibe-Stick-Audio-Channels": "1", "X-Vibe-Stick-Audio-Block-Samples": "960",
+      "X-Vibe-Stick-Chunk-CRC32": crc32Hex(encoded) }, body: encoded,
+  });
+  assert.equal(nextChunk.statusCode, 200);
+  assert.equal(JSON.parse(nextChunk.body).recording.expected_chunk_id, 2);
+
+  child.send({ type: "recording-ended", session_id: sessionId });
+  // A subsequent control request is an IPC/network barrier for the cleanup.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const lateAudio = await request(port, `/recording/audio?session_id=${sessionId}&chunk_id=1`, {
+    body: Buffer.alloc(3840, 3),
+  });
+  assert.equal(lateAudio.statusCode, 404);
 
   const drainMessage = waitForMessage(
     child,

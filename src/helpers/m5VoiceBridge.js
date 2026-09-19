@@ -1273,6 +1273,12 @@ loadBluetoothDevices();
     session.source = body.source || "m5stickc_plus";
     session.audioSource = body.audio_source || "stickc_plus_pcm";
     session.protocolVersion = Math.max(1, Number(body.protocol_version || 1));
+    // Opt in per device/session; legacy and host-capture watchdogs stay unchanged.
+    const requestedRetryMs = Number(body.upload_retry_ms);
+    session.uploadRetryMs = captureMode === "device_upload" &&
+      req.vibeDevice?.board === "sticks3" && session.protocolVersion >= 2 &&
+      Number.isFinite(requestedRetryMs) && requestedRetryMs > 0
+      ? Math.min(8000, Math.floor(requestedRetryMs)) : 0;
     session.transportEncoding =
       String(body.transport_encoding || "").trim().toLowerCase() ===
       IMA_ADPCM_ENCODING
@@ -2336,6 +2342,7 @@ loadBluetoothDevices();
       audio_format: { codec: "pcm_s16le", sample_rate: 16000, channels: 1 },
       audio_encodings: ["pcm16", IMA_ADPCM_ENCODING],
       accepted_transport_encoding: session.transportEncoding || "pcm16",
+      upload_retry_ms: session.uploadRetryMs || 0,
     };
   }
 
@@ -2440,10 +2447,12 @@ loadBluetoothDevices();
     }
     if (session.lastAudioAt) {
       const activityAt = Math.max(session.lastAudioAt, session.lastUploadAttemptAt || 0);
-      return now - activityAt >= this.recordingStallTimeoutMs ? "audio_input_stalled" : "";
+      const timeoutMs = Math.max(this.recordingStallTimeoutMs, (session.uploadRetryMs || 0) + 5000);
+      return now - activityAt >= timeoutMs ? "audio_input_stalled" : "";
     }
     const firstChunkActivityAt = session.lastUploadAttemptAt || session.createdAt;
-    return now - firstChunkActivityAt >= this.recordingFirstChunkTimeoutMs
+    const timeoutMs = Math.max(this.recordingFirstChunkTimeoutMs, (session.uploadRetryMs || 0) + 5000);
+    return now - firstChunkActivityAt >= timeoutMs
       ? "first_audio_chunk_timeout"
       : "";
   }
@@ -2906,7 +2915,10 @@ loadBluetoothDevices();
       bytes: session.bytes,
       chunks: session.chunks,
       success: session.result.success !== false,
+      reason: session.result.reason || session.result.error || null,
+      details: session.result.details || null,
     });
+    this.onSessionFinished?.(session.id);
     if (this.rendererSessionId === session.id) {
       this.rendererSessionId = "";
       if (!this.rendererRecovery) this.advanceRendererQueue();
