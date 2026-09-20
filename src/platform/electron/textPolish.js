@@ -63,8 +63,10 @@ function resolveRulePath(dataDirectory, fsImpl) {
 }
 
 class TextPolisher {
-  constructor({ dataDirectory, logger = null } = {}) {
+  constructor({ dataDirectory, logger = null, longFormatter = null } = {}) {
     this.logger = logger;
+    // 长文本整理器（可选）：去口水词 + 分段。没注入时阶段三整体跳过。
+    this.longFormatter = longFormatter;
     this.rulePath = resolveRulePath(dataDirectory, fs);
     this.replacer = new HotRuleReplacer({
       filePath: this.rulePath,
@@ -159,10 +161,54 @@ class TextPolisher {
       }
     }
 
+    // 阶段三：长文本整理（默认关；需要显式传 longFormat.enabled）
+    // 放在最后，因为它会引入换行——必须建立在已规范化的文本之上。
+    const longFormat = options.longFormat || null;
+    if (longFormat?.enabled && this.longFormatter) {
+      const decision = this.shouldRunLongFormat(current, longFormat);
+      if (decision.run) {
+        const stageStart = Date.now();
+        try {
+          const applied = await this.longFormatter.format(current);
+          if (applied.changed) {
+            result.stages.push({
+              stage: "long_format",
+              elapsed_ms: Date.now() - stageStart,
+              ratio: applied.ratio,
+            });
+            current = applied.text;
+          }
+          if (applied.degraded) {
+            result.degraded = `long_format:${applied.degraded}`;
+          }
+        } catch (error) {
+          // 整理失败绝不影响已完成的阶段一/二
+          result.degraded = `long_format:${error?.message || String(error)}`;
+          this.logger?.warn("长文本整理异常，保留前序结果", {
+            error: error?.message || String(error),
+          });
+        }
+      }
+    }
+
     result.text = current;
     result.changed = current !== rawText;
     result.total_ms = Date.now() - started;
     return result;
+  }
+
+  /**
+   * 决定是否值得为这段文本做长文本整理。
+   *
+   * 两道否决：
+   *   - 终端场景：整理会插换行，而终端里换行 = 回车执行命令，必须避让
+   *   - 太短：一两句话不需要分段，白等一次推理
+   */
+  shouldRunLongFormat(text, { minChars = 40, isTerminal = false } = {}) {
+    if (isTerminal) return { run: false, reason: "terminal" };
+    const contentChars = String(text || "").replace(/[\s\p{P}\p{S}]/gu, "").length;
+    if (contentChars < minChars) return { run: false, reason: "below_min_chars" };
+    return { run: true, reason: null, contentChars };
   }
 
   ensureChild() {

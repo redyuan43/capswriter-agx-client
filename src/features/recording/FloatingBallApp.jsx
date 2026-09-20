@@ -42,6 +42,11 @@ const DEFAULT_CAPS_MIN_HOLD_MS = 150;
 const SETTING_TEXT_POLISH_ENABLED = "text_polish_enabled";
 const SETTING_TEXT_POLISH_HOT_RULE = "text_polish_hot_rule";
 const SETTING_TEXT_POLISH_PUNCTUATION = "text_polish_punctuation";
+// 长文本整理：超长口述自动去口水词并按逻辑分段
+const SETTING_LONG_TEXT_FORMAT_ENABLED = "long_text_format_enabled";
+// 触发整理的最小字数（去标点后计）。短句分段没有意义，白等一次推理。
+const SETTING_LONG_TEXT_FORMAT_MIN_CHARS = "long_text_format_min_chars";
+const DEFAULT_LONG_TEXT_FORMAT_MIN_CHARS = 40;
 // 标点恢复实测在腾讯 ASR 之后是净退化，默认关闭（详见 services/text-postprocess/README.md）
 const DEFAULT_TEXT_POLISH_PUNCTUATION = "off";
 const DICTATION_CONTROL_STATUSES = ["recording", "processing", "preview_ready", "pasting", "optimizing"];
@@ -458,7 +463,12 @@ export default function FloatingBallApp() {
   const ttsControlEffectInitializedRef = useRef(false);
   const translateModeRef = useRef("transcribe");
   const fastInputModeRef = useRef(true);
-  const textPolishRef = useRef({ enabled: true, hotRule: true, punctuation: "off" });
+  const textPolishRef = useRef({
+    enabled: true,
+    hotRule: true,
+    punctuation: "off",
+    longFormat: { enabled: true, minChars: DEFAULT_LONG_TEXT_FORMAT_MIN_CHARS },
+  });
   const pendingStopTimerRef = useRef(null);
   const isRecordingRef = useRef(false);
   const recordingModeRef = useRef("dictation");
@@ -1855,6 +1865,9 @@ export default function FloatingBallApp() {
       const result = await window.electronAPI.polishText(rawText, {
         hotRule: settings.hotRule,
         punctuation: settings.punctuation,
+        // 长文本整理：主进程会再判断一次目标窗口是不是终端，
+        // 是终端就跳过（换行会被当成回车执行）
+        longFormat: settings.longFormat,
       });
       if (result && typeof result.text === "string" && result.text.trim()) {
         logRuntime("info", "Text polish finished", {
@@ -2593,7 +2606,7 @@ export default function FloatingBallApp() {
         return;
       }
       try {
-        const [savedMode, savedTarget, savedTtsEnabled, savedTtsSpeed, savedTtsSpeaker, savedTtsInstruction, savedReleaseGraceMs, savedFastInputMode, savedCapsMinHoldMs, savedPolishEnabled, savedPolishHotRule, savedPolishPunctuation] = await Promise.all([
+        const [savedMode, savedTarget, savedTtsEnabled, savedTtsSpeed, savedTtsSpeaker, savedTtsInstruction, savedReleaseGraceMs, savedFastInputMode, savedCapsMinHoldMs, savedPolishEnabled, savedPolishHotRule, savedPolishPunctuation, savedLongFormatEnabled, savedLongFormatMinChars] = await Promise.all([
           window.electronAPI.getSetting(SETTING_VOICE_TRANSLATE_MODE, "transcribe"),
           window.electronAPI.getSetting(SETTING_VOICE_TRANSLATE_TARGET, "zh"),
           window.electronAPI.getSetting(SETTING_VOICE_TTS_ENABLED, false),
@@ -2605,7 +2618,9 @@ export default function FloatingBallApp() {
           window.electronAPI.getSetting(SETTING_CAPS_MIN_HOLD_MS, DEFAULT_CAPS_MIN_HOLD_MS),
           window.electronAPI.getSetting(SETTING_TEXT_POLISH_ENABLED, true),
           window.electronAPI.getSetting(SETTING_TEXT_POLISH_HOT_RULE, true),
-          window.electronAPI.getSetting(SETTING_TEXT_POLISH_PUNCTUATION, DEFAULT_TEXT_POLISH_PUNCTUATION)
+          window.electronAPI.getSetting(SETTING_TEXT_POLISH_PUNCTUATION, DEFAULT_TEXT_POLISH_PUNCTUATION),
+          window.electronAPI.getSetting(SETTING_LONG_TEXT_FORMAT_ENABLED, true),
+          window.electronAPI.getSetting(SETTING_LONG_TEXT_FORMAT_MIN_CHARS, DEFAULT_LONG_TEXT_FORMAT_MIN_CHARS)
         ]);
         if (cancelled) return;
         setTranslateMode(savedMode === "translate" ? "translate" : "transcribe");
@@ -2628,10 +2643,17 @@ export default function FloatingBallApp() {
           ? Math.max(0, Number(savedCapsMinHoldMs))
           : DEFAULT_CAPS_MIN_HOLD_MS;
         window.electronAPI?.setCapsMinHoldMs?.(holdMs);
+        const minCharsValue = Number(savedLongFormatMinChars);
         textPolishRef.current = {
           enabled: savedPolishEnabled !== false,
           hotRule: savedPolishHotRule !== false,
           punctuation: savedPolishPunctuation === "full" ? "full" : "off",
+          longFormat: {
+            enabled: savedLongFormatEnabled !== false,
+            minChars: Number.isFinite(minCharsValue) && minCharsValue > 0
+              ? Math.floor(minCharsValue)
+              : DEFAULT_LONG_TEXT_FORMAT_MIN_CHARS,
+          },
         };
         setTtsControlSyncReady(true);
       } catch (error) {

@@ -125,6 +125,7 @@ const VoiceActionManager = require("./src/helpers/voiceActionManager");
 const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
+const { LongTextFormatter } = require("./src/helpers/longTextFormatter");
 const { TextPolisher } = require("./src/platform/electron/textPolish");
 const { HotWordsStore } = require("./src/platform/electron/hotWordsStore");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
@@ -436,7 +437,14 @@ const asrConnectionProfiles = new AsrConnectionProfiles({
 });
 clipboardManager.setDatabaseManager(databaseManager);
 const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.getPath("documents"), logger });
-const textPolisher = new TextPolisher({ dataDirectory, logger });
+// 长文本整理（去口水词 + 分段）。走本机 ollama，模型是 Qwen2.5:3B ——
+// 必须是原生非思考的模型，Qwen3 系列实测会陷入停不下来的思考链。
+const longTextFormatter = new LongTextFormatter({
+  endpoint: process.env.CAPS_LONG_TEXT_ENDPOINT || undefined,
+  model: process.env.CAPS_LONG_TEXT_MODEL || undefined,
+  logger,
+});
+const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter });
 const hotWordsStore = new HotWordsStore({ dataDirectory, logger });
 const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory });
 const nx1QwenRouter = new Nx1QwenRouter({ logger, databaseManager });
