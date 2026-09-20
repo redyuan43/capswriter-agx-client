@@ -289,7 +289,7 @@ DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority \
 8 条真实长句全部触发整理且保真、终端场景跳过、窗口未知跳过、无窗口跳过、
 短句跳过、ollama 挂掉降级不丢字。退出码非 0 就是有 case 不符预期。
 
-## M5 录音的传输失败抢救（2026-09-20，v1.0.27）
+## M5 录音的传输失败抢救（2026-09-20，v1.0.27，v1.0.29 改成黑名单）
 
 **问题**：20:10:49 那次会话，用户说了 45 秒，前 33 秒音频正常上传，设备最后
 在 stop 请求里报 `upload_failed: true`。客户端把它当"录音失败"处理，主进程发
@@ -300,11 +300,23 @@ DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority \
 
 **修法**（`src/helpers/m5VoiceBridge.js`）：
 
-- `shouldSalvageSession()` 判定是否值得抢救：失败原因是传输/协议类
-  （`device_audio_upload_failed` / `audio_integrity_mismatch` /
-  `audio_input_stalled` / `recording_duration_exceeded`）、已收到 ≥1 秒音频、
-  且音频已经派发给渲染层（渲染层手上才有实时转写文本）、限 `device_upload` 路径
-  （本机采集另有一套蓝牙/音频路由恢复逻辑，不去插队）
+- `shouldSalvageSession()` 判定是否值得抢救，三个条件缺一不可：
+  ① **不是"主动放弃"类的中断**（见下）② 已收到 ≥1 秒音频
+  ③ 音频已经派发给渲染层（渲染层手上才有实时转写文本，主进程只有 PCM）。
+  另外限 `device_upload` 路径（本机采集另有一套蓝牙/音频路由恢复逻辑，不去插队）。
+
+  ⚠️ **判定是黑名单（`NON_SALVAGEABLE_FAILURE_REASONS`），不是白名单。**
+  v1.0.27 第一版写成了白名单（只认 4 个错误码），那样每遇到一个新的失败原因
+  就要补一个字符串——补漏一次就等于把这个 bug 又放回来一次。而用户的判断标准
+  是"**只要已经产出过内容就不能整段丢**"，那是一**类**问题。
+  黑名单只列明确不该救的：
+
+  | 不救的原因 | 为什么 |
+  |---|---|
+  | `bridge_recovery` / `renderer_recovery` | 渲染层正在重建，拿着文本的那一方已经不在了，发 stop 过去没人接 |
+  | `session_preempted` / `user_cancelled` / `recording_cancelled` | 主动放弃，不是意外中断（用户取消本来也不走 `abortSession`，这里是防御性兜底） |
+
+  没见过的失败原因**默认救**——有测试钉住（`some_future_failure_mode` 必须返回 true）。
 - `salvageSession()` 做和正常收尾一样的资源清理，**只改一处：不发 cancel，
   改发带 `salvage: true` 的 stop**，让渲染层交出手上的文本
 - 渲染层收到 `salvage` 标记时用 `selectSalvagePayload()` 取最近一次 partial 当结果

@@ -57,21 +57,30 @@ const HOST_AUDIO_FAILURE_REASONS = new Set([
 ]);
 
 /**
- * 这些失败说明"传输/协议没走完"，而不是"内容无效"。
+ * 只有这几种中断才允许**不抢救**地整段丢掉。
  *
  * 典型场景（2026-09-20 实测）：M5 说了 45 秒话，前 33 秒音频正常上传，
  * 最后 12 秒设备侧上传失败并在 stop 请求里带 upload_failed=true。
  * 此时客户端手上已有 137 个音频块，渲染层那边实时 ASR 也已经转出 173 字。
  * 把它当"录音失败"整段丢掉，用户就白说了一整段话。
  *
- * 只要还有音频，就按"能救多少救多少"处理：让渲染层把已有文本交出来，
- * 走正常的粘贴/留存链路，结果标记 recovered。
+ * 判定写成**黑名单**而不是白名单，是刻意的：
+ * 用户的判断标准是"只要已经产出过内容就不能整段丢"，那是一**类**问题，
+ * 不是"这几个错误码才不能丢"。白名单写法每遇到一个新的失败原因就要补一个
+ * 字符串，补漏一次就等于把这个 bug 又放回来一次（v1.0.27 第一版就是这么写的）。
+ * 所以这里只列**明确不该救**的：接收方已经不在的，以及用户自己不要的。
+ *
+ * 用户主动取消本来就不走 abortSession（走 terminateSession 的 cancelled 分支），
+ * 这里列 user_cancelled 只是防御性兜底。
  */
-const SALVAGEABLE_FAILURE_REASONS = new Set([
-  "device_audio_upload_failed",
-  "audio_integrity_mismatch",
-  "audio_input_stalled",
-  "recording_duration_exceeded",
+const NON_SALVAGEABLE_FAILURE_REASONS = new Set([
+  // 渲染层正在被重建：拿着实时转写文本的那一方已经不在了，发 stop 过去没人接
+  "bridge_recovery",
+  "renderer_recovery",
+  // 会话被顶掉/用户不要了：这是"主动放弃"，不是"意外中断"
+  "session_preempted",
+  "user_cancelled",
+  "recording_cancelled",
 ]);
 
 // 少于 1 秒音频没有抢救价值（人还没来得及说出一句完整的话）。
@@ -2520,15 +2529,16 @@ loadBluetoothDevices();
   /**
    * 判断这次失败值不值得抢救。
    *
-   * 两个条件缺一不可：
-   *   - 失败原因是传输/协议类（音频已经收到一部分，只是没传完）
+   * 三个条件缺一不可：
+   *   - 不是"主动放弃"类的中断（见 NON_SALVAGEABLE_FAILURE_REASONS）
    *   - 音频已经派发给渲染层（渲染层手里才有实时转写文本，主进程只有 PCM）
+   *   - 已经收到至少 1 秒音频（还没来得及说话，没有抢救价值）
    */
   shouldSalvageSession(session, reason) {
     if (!session || session.done || session.terminationStarted) {
       return false;
     }
-    if (!SALVAGEABLE_FAILURE_REASONS.has(reason)) {
+    if (NON_SALVAGEABLE_FAILURE_REASONS.has(reason)) {
       return false;
     }
     // 只抢救"设备上传"这条路。本机采集（host_capture）的失败另有音频路由

@@ -1827,20 +1827,35 @@ test("音频太少时不抢救——没有内容可救，按原样失败", async
   assert.equal(bridge.sessions.get("tiny").done, true);
 });
 
-test("抢救只针对设备上传路径，不影响本机采集的失败恢复", async (t) => {
+test("抢救判定：只排除\"主动放弃/接收方已不在\"，其余一律救", async (t) => {
   const { bridge } = await startBridge(t);
   const session = bridge.recordingSessions.create({ id: "salvage-policy", intent: "dictation" });
   session.bytes = 100000;
   session.rendererDispatched = true;
   session.captureMode = "device_upload";
 
+  // 传输/协议类失败一律抢救
   assert.equal(bridge.shouldSalvageSession(session, "device_audio_upload_failed"), true);
   assert.equal(bridge.shouldSalvageSession(session, "audio_integrity_mismatch"), true);
-  // 没内容 / 非传输类原因 / 没派发给渲染层 → 都不抢救
-  assert.equal(bridge.shouldSalvageSession(session, "audio_input_empty"), false);
+  assert.equal(bridge.shouldSalvageSession(session, "audio_input_stalled"), true);
+  assert.equal(bridge.shouldSalvageSession(session, "recording_duration_exceeded"), true);
+
+  // 关键：**没见过的**失败原因也必须救。
+  // 判定写成白名单时这里会返回 false，于是每新增一个失败原因就复发一次
+  // "整段丢"——那正是用户要求修掉的那类问题，不能靠补字符串解决。
+  assert.equal(bridge.shouldSalvageSession(session, "some_future_failure_mode"), true);
+  assert.equal(bridge.shouldSalvageSession(session, "audio_capture_exited"), true);
+
+  // 渲染层正在重建（拿着文本的那一方没了）/ 用户主动不要 → 不救
   assert.equal(bridge.shouldSalvageSession(session, "bridge_recovery"), false);
+  assert.equal(bridge.shouldSalvageSession(session, "renderer_recovery"), false);
+  assert.equal(bridge.shouldSalvageSession(session, "user_cancelled"), false);
+  assert.equal(bridge.shouldSalvageSession(session, "session_preempted"), false);
+
+  // 没派发给渲染层 → 不救（实时转写文本在主进程这边根本不存在）
   session.rendererDispatched = false;
   assert.equal(bridge.shouldSalvageSession(session, "device_audio_upload_failed"), false);
+
   // 本机采集走原有的 recordCaptureFailure / 蓝牙恢复，不从这里插队
   session.rendererDispatched = true;
   session.captureMode = "host_capture";
