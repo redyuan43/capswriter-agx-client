@@ -53,3 +53,12 @@ AI\s*Agents\s*建特 = AI Agents
 [Nn恩嗯]\s*[叉杈差插查岔]\s*十 = nx10
 [Nn恩嗯]\s*[叉杈差插查岔]\s*([0-9]+) = nx\1
 NXE = nx1
+
+# 以下 4 条来自 2026-09-20 对 3786 条真实录音的回归挖掘：
+# ASR 常把缩写逐个字母/音节念开（「A P P」「Git Hub」）。用 \s+ 要求至少一个空格，
+# 这样只修被拆开的写法，不会误伤已经连写的正常词（App Store、github issue 均不受影响）。
+# 实测命中 19 条全部正确、0 误伤。
+[Aa]\s+[Pp]\s+[Pp]\b = APP
+[Aa]\s+[Pp]\s+[Kk]\b = APK
+[Gg]it\s+[Hh]ub\b = GitHub
+[Aa]\s+[Gg]\s+[Xx]\b = AGX

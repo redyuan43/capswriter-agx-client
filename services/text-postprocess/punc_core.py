@@ -12,6 +12,11 @@ CT-Punc 能重新判断句读，但它会顺手吞掉英文单词间的空格
 
 import re
 
+def _is_ascii_alnum(ch):
+    """是否为 ASCII 字母或数字（CJK 字符一律返回 False）。"""
+    return bool(ch) and ("a" <= ch <= "z" or "A" <= ch <= "Z" or "0" <= ch <= "9")
+
+
 # CT-Punc 的输出类别（config.yaml 的 punc_list）
 PUNCS = "，。？、"
 
@@ -109,6 +114,12 @@ def restore_punctuation(original, punctuated):
                 j += 1
                 continue
             if prev_ch == "." and next_ch.isdigit():
+                j += 1
+                continue
+            # 硬保护：绝不在英文单词内部插入标点
+            # 实测踩到过「empty response」被切成「empty respons。e」——
+            # 相邻两个 ASCII 字母/数字之间一定属于同一个 token（真正的词边界处原文有空格）。
+            if _is_ascii_alnum(prev_ch) and _is_ascii_alnum(next_ch):
                 j += 1
                 continue
             result.append(pch)
