@@ -7,6 +7,7 @@ const { registerMiscHandlers } = require("./miscHandlers");
 const { registerSettingsHandlers } = require("./settingsHandlers");
 const { registerAsrConnectionHandlers } = require("./asrConnectionHandlers");
 const { registerVoiceDatasetHandlers } = require("./voiceDatasetHandlers");
+const { registerTextPolishHandlers } = require("./textPolishHandlers");
 const { registerWindowHandlers } = require("./windowHandlers");
 
 function registerIpcHandlers(ctx) {
@@ -20,6 +21,7 @@ function registerIpcHandlers(ctx) {
   registerWindowHandlers(ctx);
   registerMiscHandlers(ctx);
   registerVoiceDatasetHandlers(ctx);
+  registerTextPolishHandlers(ctx);
 }
 
 module.exports = { registerIpcHandlers };

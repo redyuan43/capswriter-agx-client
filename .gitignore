@@ -160,3 +160,6 @@ python
 !python/knob-mapper/
 !python/knob-mapper/*.py
 !python/knob-mapper/config.yaml
+
+# Assistant workspace data (memory, skills, local session state)
+.workbuddy/

@@ -1,6 +1,6 @@
 {
   "name": "speech-transcription",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "语音转写-基于HTTP后端和可配置AI模型的中文语音转文字应用",
   "main": "main.js",
   "private": true,
@@ -139,6 +139,9 @@
       "src/platform/**/*",
       "src/utils/**/*",
       "assets/**/*",
+      "services/text-postprocess/**/*",
+      "!services/text-postprocess/models/**/*",
+      "!services/text-postprocess/**/__pycache__/**/*",
       "!node_modules/.cache/**/*",
       "!src/node_modules/**/*",
       "!python/**/*.pyc",
@@ -151,7 +154,8 @@
       "node_modules/**/*bindings*/**/*",
       "node_modules/**/*uiohook-napi*/**/*",
       "src/helpers/cardputer_uinput.py",
-      "src/helpers/cardputer_pointer_uinput.py"
+      "src/helpers/cardputer_pointer_uinput.py",
+      "services/text-postprocess/**/*"
     ],
     "mac": {
       "category": "public.app-category.productivity",

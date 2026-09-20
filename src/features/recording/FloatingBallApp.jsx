@@ -38,6 +38,12 @@ const SETTING_VOICE_FAST_INPUT_MODE = "voice_fast_input_mode";
 const DEFAULT_VOICE_RELEASE_GRACE_MS = 300;
 const SETTING_CAPS_MIN_HOLD_MS = "caps_min_hold_ms";
 const DEFAULT_CAPS_MIN_HOLD_MS = 150;
+// 转写文本整理开关：总开关 / 自定义规则 / 标点恢复
+const SETTING_TEXT_POLISH_ENABLED = "text_polish_enabled";
+const SETTING_TEXT_POLISH_HOT_RULE = "text_polish_hot_rule";
+const SETTING_TEXT_POLISH_PUNCTUATION = "text_polish_punctuation";
+// 标点恢复实测在腾讯 ASR 之后是净退化，默认关闭（详见 services/text-postprocess/README.md）
+const DEFAULT_TEXT_POLISH_PUNCTUATION = "off";
 const DICTATION_CONTROL_STATUSES = ["recording", "processing", "preview_ready", "pasting", "optimizing"];
 const CODEX_FLOATING_PREVIEW_MAX_CHARS = 420;
 const CODEX_COMPLETION_CHIME_COOLDOWN_MS = 1200;
@@ -452,6 +458,7 @@ export default function FloatingBallApp() {
   const ttsControlEffectInitializedRef = useRef(false);
   const translateModeRef = useRef("transcribe");
   const fastInputModeRef = useRef(true);
+  const textPolishRef = useRef({ enabled: true, hotRule: true, punctuation: "off" });
   const pendingStopTimerRef = useRef(null);
   const isRecordingRef = useRef(false);
   const recordingModeRef = useRef("dictation");
@@ -1822,6 +1829,41 @@ export default function FloatingBallApp() {
     }
   }, [clearCodexUpdateHideTimer, hideFloatingBall, logRuntime, resetUI, setAnimatedRealtimeTarget, transitionStatus]);
 
+  /**
+   * 转写文本整理：腾讯 ASR 原文 → 自定义规则替换 → [可选]标点恢复。
+   * 任何异常一律回退原文，绝不因为整理把用户说的话弄丢或改坏。
+   */
+  const polishRecognizedText = useCallback(async (rawText) => {
+    const settings = textPolishRef.current;
+    if (!settings.enabled || !rawText || typeof window.electronAPI?.polishText !== "function") {
+      return { text: rawText, changed: false, degraded: null };
+    }
+    try {
+      const result = await window.electronAPI.polishText(rawText, {
+        hotRule: settings.hotRule,
+        punctuation: settings.punctuation,
+      });
+      if (result && typeof result.text === "string" && result.text.trim()) {
+        logRuntime("info", "Text polish finished", {
+          changed: result.changed === true,
+          stages: result.stages || [],
+          totalMs: result.total_ms || 0,
+          degraded: result.degraded || null,
+        });
+        return { text: result.text, changed: result.changed === true, degraded: result.degraded || null };
+      }
+      if (result?.degraded) {
+        logRuntime("warn", "Text polish degraded, fallback to raw", { degraded: result.degraded });
+      }
+      return { text: rawText, changed: false, degraded: result?.degraded || null };
+    } catch (error) {
+      logRuntime("warn", "Text polish failed, fallback to raw", {
+        error: error?.message || String(error),
+      });
+      return { text: rawText, changed: false, degraded: error?.message || String(error) };
+    }
+  }, [logRuntime]);
+
   const handleRecordingComplete = useCallback(async (transcriptionResult) => {
     const queuedConfirm = pendingDictationConfirmRef.current;
     pendingDictationConfirmRef.current = false;
@@ -1863,26 +1905,47 @@ export default function FloatingBallApp() {
           fastInputMode: fastMode,
         });
       }
+
+      // 整理只作用于识别结果：翻译输出、语音命令不进此流程
+      let finalText = recognizedText;
+      let polishDegraded = null;
+      if (postprocessMode !== 'translate' && recognizedText) {
+        const polished = await polishRecognizedText(recognizedText);
+        finalText = polished.text;
+        polishDegraded = polished.degraded;
+        // 整理是异步的：期间可能已被取消或切换任务，迟到结果不得粘贴
+        if (!isCurrentOutputGeneration(outputGeneration)) {
+          logRuntime("info", "Discard polished text after output interruption", {
+            reason: outputControlRef.current.reason,
+          });
+          return;
+        }
+        if (polished.changed && finalText !== recognizedText && !fastMode) {
+          setAnimatedRealtimeTarget(finalText, { immediate: true });
+        }
+      }
+
       if (!fastMode) {
-        setAnimatedRealtimeTarget(recognizedText, { immediate: true });
+        setAnimatedRealtimeTarget(finalText, { immediate: true });
       }
 
       const triggerVoiceTts = () => {
-        if (!ttsEnabledRef.current || !recognizedText) return;
-        lastClipboardTextRef.current = recognizedText;
+        if (!ttsEnabledRef.current || !finalText) return;
+        lastClipboardTextRef.current = finalText;
         const skipTranslate = postprocessMode === 'cleanup' || postprocessMode === 'translate';
         logRuntime("info", "TTS trigger from voice recognition", {
-          textLength: recognizedText.length,
+          textLength: finalText.length,
           postprocessMode,
           skipTranslate,
           fastInputMode: fastMode,
+          polishDegraded,
         });
-        playClipboardText(recognizedText, 'voice', { skipTranslate }).catch(() => { });
+        playClipboardText(finalText, 'voice', { skipTranslate }).catch(() => { });
       };
 
       if (fastMode) {
         const pasteStartedAt = performance.now();
-        const pasteResult = await safePaste(recognizedText, outputGeneration);
+        const pasteResult = await safePaste(finalText, outputGeneration);
         if (!isCurrentOutputGeneration(outputGeneration)) {
           return;
         }
@@ -1892,8 +1955,9 @@ export default function FloatingBallApp() {
         }
         logRuntime("info", "Fast input paste completed", {
           fastInputMode: true,
-          textLength: recognizedText.length,
+          textLength: finalText.length,
           pasteMs,
+          polishDegraded,
           totalMs: Math.round(performance.now() - completionStartedAt),
           pasteMode: pasteResult.mode,
           pasteOk: pasteResult.ok,
@@ -1934,7 +1998,7 @@ export default function FloatingBallApp() {
       }
       triggerVoiceTts();
 
-      const pasteTask = safePaste(recognizedText, outputGeneration);
+      const pasteTask = safePaste(finalText, outputGeneration);
       await transitionStatus("preview_ready");
       if (!isCurrentOutputGeneration(outputGeneration)) {
         return;
@@ -1975,7 +2039,53 @@ export default function FloatingBallApp() {
       resetUI();
       hideFloatingBall();
     }, 1200);
-  }, [handleCodexRecordingComplete, logRuntime, safePaste, setAnimatedRealtimeTarget, transitionStatus, hideFloatingBall, resetUI, playClipboardText]);
+  }, [handleCodexRecordingComplete, logRuntime, safePaste, setAnimatedRealtimeTarget, transitionStatus, hideFloatingBall, resetUI, playClipboardText, polishRecognizedText]);
+
+  /**
+   * M5 / 外部设备录音的数据集采集。
+   * 客户端键盘录音由 useRecording 内部采集，M5 路径此前缺失，这里补齐。
+   * 保存的是 ASR 原文（未经本地整理），便于后续评估整理链路的真实收益。
+   */
+  const recordExternalVoiceSample = useCallback(({ wavBlob, transcriptionResult, stats, source }) => {
+    const recordSample = window.electronAPI?.recordVoiceDatasetSample;
+    if (typeof recordSample !== "function" || !wavBlob) return;
+    const text = String(transcriptionResult?.text || "").trim();
+    if (!text) return;
+
+    Promise.resolve(wavBlob.arrayBuffer())
+      .then((audioBuffer) => recordSample({
+        audio: audioBuffer,
+        audioMimeType: wavBlob.type || "audio/wav",
+        source: source || "external_m5",
+        mode: translateMode === "translate" ? "translate" : "transcribe",
+        translate_target: translateTarget || "zh",
+        hotword: sessionHotwordsRef.current.join("\n"),
+        request_id: transcriptionResult?.request_id || "",
+        text,
+        final_text: transcriptionResult?.text || text,
+        asr_text: transcriptionResult?.asr_text || "",
+        raw_asr_text: transcriptionResult?.raw_asr_text || "",
+        duration: transcriptionResult?.duration || stats?.durationSec || 0,
+        language: transcriptionResult?.language || "zh-CN",
+        confidence: transcriptionResult?.confidence || 0,
+        postprocess_mode: transcriptionResult?.postprocess_mode || "none",
+        voice_command_applied: transcriptionResult?.voice_command_applied === true,
+        voice_command_type: transcriptionResult?.voice_command_type || "",
+        voice_intent_id: transcriptionResult?.voice_intent_id || "",
+        server_audio_stats: stats || {},
+        result_payload: transcriptionResult || {},
+      }))
+      .then((result) => {
+        if (result?.success === false && result?.error !== "empty_audio") {
+          logRuntime("warn", "External voice dataset sample was not recorded", result);
+        }
+      })
+      .catch((error) => {
+        logRuntime("warn", "External voice dataset sample record failed", {
+          error: error?.message || String(error),
+        });
+      });
+  }, [logRuntime, translateMode, translateTarget]);
 
   const handleTranscriptionProgress = useCallback((payload) => {
     const stage = (payload?.stage || '').toLowerCase();
@@ -2392,6 +2502,13 @@ export default function FloatingBallApp() {
       if (session.cancelled) {
         return;
       }
+      // 采集 M5 录音样本（保存 ASR 原文，不阻塞粘贴流程）
+      recordExternalVoiceSample({
+        wavBlob,
+        transcriptionResult,
+        stats,
+        source: "external_m5",
+      });
       reportExternalRecordingResult({
         session_id: sessionId,
         success: hasUsableResult,
@@ -2434,7 +2551,7 @@ export default function FloatingBallApp() {
         externalPCMChunksRef.current = [];
       }
     }
-  }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, reportExternalRecordingResult, resetUI, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
+  }, [handleRecordingComplete, handleTranscriptionProgress, hideFloatingBall, logRuntime, recordExternalVoiceSample, reportExternalRecordingResult, resetUI, setAnimatedRealtimeTarget, stopInitialLoadingTimer, transitionStatus, translateMode, translateTarget]);
 
   const handleAIOptimizationComplete = useCallback(() => {
   }, []);
@@ -2463,7 +2580,7 @@ export default function FloatingBallApp() {
         return;
       }
       try {
-        const [savedMode, savedTarget, savedTtsEnabled, savedTtsSpeed, savedTtsSpeaker, savedTtsInstruction, savedReleaseGraceMs, savedFastInputMode, savedCapsMinHoldMs] = await Promise.all([
+        const [savedMode, savedTarget, savedTtsEnabled, savedTtsSpeed, savedTtsSpeaker, savedTtsInstruction, savedReleaseGraceMs, savedFastInputMode, savedCapsMinHoldMs, savedPolishEnabled, savedPolishHotRule, savedPolishPunctuation] = await Promise.all([
           window.electronAPI.getSetting(SETTING_VOICE_TRANSLATE_MODE, "transcribe"),
           window.electronAPI.getSetting(SETTING_VOICE_TRANSLATE_TARGET, "zh"),
           window.electronAPI.getSetting(SETTING_VOICE_TTS_ENABLED, false),
@@ -2472,7 +2589,10 @@ export default function FloatingBallApp() {
           window.electronAPI.getSetting(SETTING_VOICE_TTS_INSTRUCTION, DEFAULT_TTS_INSTRUCTION),
           window.electronAPI.getSetting(SETTING_VOICE_RELEASE_GRACE_MS, DEFAULT_VOICE_RELEASE_GRACE_MS),
           window.electronAPI.getSetting(SETTING_VOICE_FAST_INPUT_MODE, true),
-          window.electronAPI.getSetting(SETTING_CAPS_MIN_HOLD_MS, DEFAULT_CAPS_MIN_HOLD_MS)
+          window.electronAPI.getSetting(SETTING_CAPS_MIN_HOLD_MS, DEFAULT_CAPS_MIN_HOLD_MS),
+          window.electronAPI.getSetting(SETTING_TEXT_POLISH_ENABLED, true),
+          window.electronAPI.getSetting(SETTING_TEXT_POLISH_HOT_RULE, true),
+          window.electronAPI.getSetting(SETTING_TEXT_POLISH_PUNCTUATION, DEFAULT_TEXT_POLISH_PUNCTUATION)
         ]);
         if (cancelled) return;
         setTranslateMode(savedMode === "translate" ? "translate" : "transcribe");
@@ -2495,6 +2615,11 @@ export default function FloatingBallApp() {
           ? Math.max(0, Number(savedCapsMinHoldMs))
           : DEFAULT_CAPS_MIN_HOLD_MS;
         window.electronAPI?.setCapsMinHoldMs?.(holdMs);
+        textPolishRef.current = {
+          enabled: savedPolishEnabled !== false,
+          hotRule: savedPolishHotRule !== false,
+          punctuation: savedPolishPunctuation === "full" ? "full" : "off",
+        };
         setTtsControlSyncReady(true);
       } catch (error) {
         logRuntime("warn", "Failed to load runtime settings, fallback to defaults", {

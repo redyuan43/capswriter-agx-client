@@ -11,6 +11,7 @@ class IPCHandlers {
     this.hotkeyManager = managers.hotkeyManager;
     this.logger = managers.logger;
     this.voiceDatasetRecorder = managers.voiceDatasetRecorder;
+    this.textPolisher = managers.textPolisher;
     this.asrConnectionProfiles = managers.asrConnectionProfiles;
     this.m5VoiceBridge = managers.m5VoiceBridge;
     this.knobMapperManager = managers.knobMapperManager;

@@ -1,0 +1,55 @@
+# 在此文件放置自定义规则，每行一条正则表达式，
+# 左边是查找模式，右边是替换式，中间用带空格的等号分开
+# 以 # 开头的会被忽略，将查找和匹配用等号隔开，文本两边的空格会被省略。例如：
+
+毫安时     =      mAh
+赫兹      =      Hz
+伏特      =        V
+二、      =        二
+负一      =    -1
+(艾特)\s*(QQ)\s*点\s*            =     @qq.
+(艾特)\s*([一幺]六三)\s*点\s*     =     @163.
+(艾特)\s*(\w+)\s*(点)\s*(\w+)    =     @\2.\4
+奥拉玛 = ollama
+欧拉玛 = ollama
+科舍 = Cursor
+千文山 = Qwen3
+千文三 = Qwen3
+千问三 = Qwen3
+千问 = Qwen
+[Aa][Gg][Ee][Nn][Tt][Ss]\s*[\.。点]\s*[Mm][Dd] = AGENTS.md
+[Aa][Gg][Ee][Nn][Tt][Ss]\s*[\.。点]\s*[Mm]\s*[Dd] = AGENTS.md
+[Aa][Gg][Ee][Nn][Tt][Ss]\s*[\.。点]\s*[Dd]\s*[Mm]\s*[Dd]\.? = AGENTS.md
+[Aa][Ii][Jj][Ss]\s*[\.。点]\s*[Mm][Dd] = AGENTS.md
+[AaＡａ]\s*[键建件]\s*(是|十)?\s*[\.。点]\s*[Mm][Dd] = AGENTS.md
+[AaＡａ]\s*[键建件]\s*(是|十|四)?\s*[\.。点]\s*[Mm]\s*[Dd] = AGENTS.md
+[AaＡａ]\s*[键建件]\s*[词辞]\s*[Mm]\s*[Dd] = AGENTS.md
+[AaＡａ]\s*(杠|横杠|短横线|-)\s*(是|十)?\s*(杠|横杠|短横线|-)?\s*[Mm][Dd] = AGENTS.md
+AI\s*是?\s*[\.。点]\s*[Pp] = AGENTS.md
+[Ss]tar\s*数 = star数
+[Vv]ibe\s*[Cc]oding = VibeCoding
+[Rr]eadme = README
+[Ww]eb\s*UI = WebUI
+\b[Bb]UI\b = WebUI
+[Tt](ile|ell)\s*[Ss]cale = Tailscale
+[Cc]loud\s*[Cc]ode = claude code
+[Aa][Ii]\s*[Aa]gent = AI Agent
+AIA\s*建图 = AI Agent
+AIA\s*建特 = AI Agents
+AI\s*Agents\s*建特 = AI Agents
+[《“"']?\s*紫禁城\s*[》”"']? = 子进程
+[Oo]pen[\s_-]*[Cc]lone = OpenClaw
+子\s*[AaＡａ]?\s*建的 = subagent
+筛选 = session
+[Nn恩嗯]\s*[叉杈差插查岔]\s*一 = nx1
+[Nn恩嗯]\s*[叉杈差插查岔]\s*二 = nx2
+[Nn恩嗯]\s*[叉杈差插查岔]\s*三 = nx3
+[Nn恩嗯]\s*[叉杈差插查岔]\s*四 = nx4
+[Nn恩嗯]\s*[叉杈差插查岔]\s*五 = nx5
+[Nn恩嗯]\s*[叉杈差插查岔]\s*六 = nx6
+[Nn恩嗯]\s*[叉杈差插查岔]\s*七 = nx7
+[Nn恩嗯]\s*[叉杈差插查岔]\s*八 = nx8
+[Nn恩嗯]\s*[叉杈差插查岔]\s*九 = nx9
+[Nn恩嗯]\s*[叉杈差插查岔]\s*十 = nx10
+[Nn恩嗯]\s*[叉杈差插查岔]\s*([0-9]+) = nx\1
+NXE = nx1

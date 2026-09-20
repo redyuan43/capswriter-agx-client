@@ -125,6 +125,7 @@ const VoiceActionManager = require("./src/helpers/voiceActionManager");
 const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
+const { TextPolisher } = require("./src/platform/electron/textPolish");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
 const M5BridgeIngressManager = require("./src/helpers/m5BridgeIngressManager");
 const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles");
@@ -434,6 +435,7 @@ const asrConnectionProfiles = new AsrConnectionProfiles({
 });
 clipboardManager.setDatabaseManager(databaseManager);
 const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.getPath("documents"), logger });
+const textPolisher = new TextPolisher({ dataDirectory, logger });
 const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory });
 const nx1QwenRouter = new Nx1QwenRouter({ logger, databaseManager });
 const voiceLearningManager = new VoiceLearningManager({ logger });
@@ -584,6 +586,7 @@ const ipcHandlers = new IPCHandlers({
   hotkeyManager,
   logger,
   voiceDatasetRecorder,
+  textPolisher,
   asrConnectionProfiles,
   m5VoiceBridge,
   knobMapperManager,
