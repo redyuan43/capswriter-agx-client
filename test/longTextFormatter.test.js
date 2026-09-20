@@ -605,7 +605,7 @@ test("小数和年份不会被当成序号", () => {
 });
 
 test("序号嵌在同一句话里（前面是逗号）不切开", () => {
-  const text = "第十条讲的是缓存，第十一条讲的是并发。";
+  const text = "第十条，讲的是缓存，第十一条，讲的是并发。";
   assert.equal(normalizeEnumerations(text), text, "逗号后面的序号是句子的一部分，不是列表项");
 });
 
@@ -616,8 +616,41 @@ test("已经分好行的列举不会被重复插换行（幂等）", () => {
 });
 
 test("findEnumerationMarkers 能给出中文序数的数值", () => {
-  const markers = findEnumerationMarkers("第三条讲缓存，第十一条讲并发。");
-  assert.deepEqual(markers.map((m) => m.ordinal), [3, 11]);
+  const markers = findEnumerationMarkers("第一条，讲缓存；第十一条，讲并发。");
+  assert.deepEqual(markers.map((m) => m.ordinal), [1, 11]);
+});
+
+/**
+ * 下面三个是拿 3819 条真实口述语料量出来的假阳性，必须钉住。
+ *
+ * 原规则里"第X"后面只要跟 条/点/项/款 就算列举项开头，语料里这样做
+ * 命中的 6 次**全是同一句话内部的引用**：真正的列举项后面一定还跟着
+ * 句读标点。不收紧的话"第四条和第五条都要改一下"会被从中间劈成两行 ——
+ * 把一句话切开比漏切更糟。
+ */
+test("同句内的条/项引用不会被劈成列表", () => {
+  for (const text of [
+    "第四条和第五条都要改一下。",
+    "如果我先选择第二条路，最后才接到第一条，因为我现在还没用公网域名。",
+    "你可以在长按右侧的键，第四项或者第五项里面切换进去。",
+    "对你直接帮我改逻辑吧，在第二项里面，是不是有一个配置文件可以改？",
+  ]) {
+    assert.equal(normalizeEnumerations(text), text, `不该改动：${text}`);
+    // 不变量是"凑不齐 2 个不同序号就绝不动手"，不是"一个都不许识别"：
+    // 上面第 2 条句尾的"第一条，"确实是一个序号，但它孤零零一个，构不成列举。
+    assert.ok(
+      findEnumerationMarkers(text).length < 2,
+      `不该凑够 2 个序号：${text} → ${JSON.stringify(findEnumerationMarkers(text))}`,
+    );
+  }
+});
+
+test("量词后面跟句读标点才算列举项开头", () => {
+  const text = "我说两件事。第一点。你是需要判断标点符号。第二点，你需要判断断句。";
+  assert.equal(
+    normalizeEnumerations(text),
+    "我说两件事。\n\n第一点。你是需要判断标点符号。\n\n第二点，你需要判断断句。",
+  );
 });
 
 test("textPolish 在整理服务不可用时也做列举排版", async () => {

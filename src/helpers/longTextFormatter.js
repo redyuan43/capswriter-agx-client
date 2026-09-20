@@ -151,16 +151,28 @@ function cjkOrdinalValue(token) {
  * 找出文本里所有"列举序号"的位置。
  *
  * 三种形态：
- *   中文序数    第一，/ 第二、/ 第三条：/ 第一点
+ *   中文序数    第一，/ 第二、/ 第一条，/ 第二点。
  *   中文"X是"   一是…/ 二是…（前面必须不是汉字，"统一是"不算）
  *   阿拉伯数字  1. / 2、/ 3)（前面必须是句读或行首，"1.5 倍"不算）
+ *
+ * 边界是拿 3819 条真实口述语料量出来的，改之前先看这组数：
+ *   「第X + 句读标点」        30 次   ← 主战场（第一，×20 / 第二，×7）
+ *   「第X + 条点项款 + 句读」   2 次   ← 保留（第一条，/ 第二点，）
+ *   「第X + 条点项款 + 别的东西」 6 次   ← 全是同句引用，必须排除：
+ *        "选择第二条路"、"第四项或者第五项里面切换"
+ *        否则"第四条和第五条都要改一下"会被劈成两行
+ *   「第X + 其他」（第二天/第一次/第三方） 103 次 ← 一个都不能切
+ *
+ * 所以量词后面也必须跟句读标点（或到行尾）才算列举项开头。
  */
+const CLAUSE_PUNCT = "[，,、；;：:。！？!?]";
+
 function findEnumerationMarkers(text) {
   const src = String(text || "");
   const markers = [];
 
   const cjkPattern = new RegExp(
-    `第([${CJK_ORDINAL_CHARS}]{1,3})(?=[，,、；;：:]|[条点项款])`,
+    `第([${CJK_ORDINAL_CHARS}]{1,3})(?=${CLAUSE_PUNCT}|[条点项款](?:${CLAUSE_PUNCT}|$))`,
     "g",
   );
   for (const match of src.matchAll(cjkPattern)) {
@@ -172,17 +184,18 @@ function findEnumerationMarkers(text) {
     });
   }
 
+  // "X是"：用 lookbehind 而不是吃掉前缀字符，省掉 index 补偿。
+  // 条件是"前面不是汉字"——这样行首、标点、空白、英文数字都能起头。
   const listPattern = new RegExp(
-    `(^|[\\s，。！？；：、])([${CJK_ORDINAL_CHARS}])(?=是)`,
+    `(?<![\\u4e00-\\u9fff])([${CJK_ORDINAL_CHARS}])(?=是)`,
     "g",
   );
   for (const match of src.matchAll(listPattern)) {
-    const prefixLength = match[1] ? match[1].length : 0;
     markers.push({
-      index: match.index + prefixLength,
-      length: match[2].length,
-      ordinal: cjkOrdinalValue(match[2]),
-      token: match[2],
+      index: match.index,
+      length: match[1].length,
+      ordinal: cjkOrdinalValue(match[1]),
+      token: match[1],
       kind: "list",
     });
   }
