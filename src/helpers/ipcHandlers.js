@@ -12,6 +12,7 @@ class IPCHandlers {
     this.logger = managers.logger;
     this.voiceDatasetRecorder = managers.voiceDatasetRecorder;
     this.textPolisher = managers.textPolisher;
+    this.hotWordsStore = managers.hotWordsStore;
     this.asrConnectionProfiles = managers.asrConnectionProfiles;
     this.m5VoiceBridge = managers.m5VoiceBridge;
     this.knobMapperManager = managers.knobMapperManager;

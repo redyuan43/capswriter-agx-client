@@ -8,6 +8,7 @@ const { registerSettingsHandlers } = require("./settingsHandlers");
 const { registerAsrConnectionHandlers } = require("./asrConnectionHandlers");
 const { registerVoiceDatasetHandlers } = require("./voiceDatasetHandlers");
 const { registerTextPolishHandlers } = require("./textPolishHandlers");
+const { registerHotWordsHandlers } = require("./hotWordsHandlers");
 const { registerWindowHandlers } = require("./windowHandlers");
 
 function registerIpcHandlers(ctx) {
@@ -22,6 +23,7 @@ function registerIpcHandlers(ctx) {
   registerMiscHandlers(ctx);
   registerVoiceDatasetHandlers(ctx);
   registerTextPolishHandlers(ctx);
+  registerHotWordsHandlers(ctx);
 }
 
 module.exports = { registerIpcHandlers };

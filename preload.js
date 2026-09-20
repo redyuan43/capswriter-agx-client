@@ -45,6 +45,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("record-voice-dataset-sample", sample),
   polishText: (text, options) => ipcRenderer.invoke("polish-text", text, options),
   reloadHotRules: () => ipcRenderer.invoke("reload-hot-rules"),
+  getHotWords: () => ipcRenderer.invoke("get-hot-words"),
+  reloadHotWords: () => ipcRenderer.invoke("reload-hot-words"),
+  addHotWords: (terms) => ipcRenderer.invoke("add-hot-words", terms),
   getTranscriptions: (limit, offset) =>
     ipcRenderer.invoke("get-transcriptions", limit, offset),
   deleteTranscription: (id) =>
