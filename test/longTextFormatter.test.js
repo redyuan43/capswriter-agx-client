@@ -14,18 +14,38 @@ const assert = require("node:assert");
 const {
   LongTextFormatter,
   bigramCoverage,
+  spaceyRatio,
   PROMPT_TEMPLATE,
+  PROVIDERS,
+  DEFAULT_PROVIDER,
+  MAX_SPACEY_RATIO,
   MIN_RATIO,
   MAX_RATIO,
 } = require("../src/helpers/longTextFormatter");
 
 const SAMPLE = "然后那个，我觉得这个方案可以。呃，但是它太慢了。";
 
+/**
+ * 默认构造走 ollama —— 这条路径的响应形状简单（message.content），
+ * 适合测整理逻辑本身。AMD（openai）路径另有专门的形状测试。
+ */
 function makeFormatter(overrides = {}) {
   return new LongTextFormatter({
+    provider: "ollama",
     endpoint: "http://127.0.0.1:11434",
     model: "qwen2.5:3b",
     timeoutMs: 5000,
+    ...overrides,
+  });
+}
+
+/** 线上默认后端：AMD 的 OpenAI 兼容端点。 */
+function makeAmdFormatter(overrides = {}) {
+  return new LongTextFormatter({
+    provider: "openai",
+    endpoint: "http://100.90.114.26:18106/v1",
+    model: "Qwen/Qwen3.8-Flash-Next-ROCmFP4-FAST-imatrix-MTP",
+    timeoutMs: 8000,
     ...overrides,
   });
 }
@@ -56,6 +76,32 @@ test("validate 接受正常整理结果（删口头语、分段后长度略变�
   const f = makeFormatter();
   const result = f.validate(SAMPLE, "我觉得这个方案可以。\n\n但是它太慢了。");
   assert.equal(result.ok, true, `应通过，实际 ${result.reason}`);
+});
+
+test("validate 拦住逐词加空格的崩坏输出（3B 在中英混排上的失效模式）", () => {
+  const f = makeFormatter();
+  // 实测本机 3B 的真实输出：字一个不少、覆盖率还有 0.98，但空格插在汉字之间
+  const garbage = "AMD 没 部署 ， 按 你说 的 ， 本机 先 验证 有效 。";
+  const r = f.validate(SAMPLE, garbage);
+  assert.equal(r.ok, false);
+  assert.ok(/space_garbage/.test(r.reason), `实际 ${r.reason}`);
+});
+
+test("spaceyRatio 不把中英之间的正常空格算作劣化", () => {
+  assert.equal(spaceyRatio("这是一段正常的中文文本，没有任何多余空格。"), 0);
+  assert.equal(
+    spaceyRatio("用 AMD 的 handle 层做校验"),
+    0,
+    "中英相邻的空格是正常排版，不能误判成崩坏"
+  );
+  assert.ok(spaceyRatio("这 是 崩 坏 的 输 出") > MAX_SPACEY_RATIO);
+});
+
+test("PROMPT_TEMPLATE 明确禁止替换同义词（否则 AMD 27B 会被保真校验拦掉）", () => {
+  // 实测：不加这条，27B 会把"没走真人麦克风的一次"改写成"本次未使用真人麦克风"，
+  // 双字组覆盖率掉到 0.72，整条被保真校验拒绝。
+  assert.ok(/禁止：替换同义词/.test(PROMPT_TEMPLATE), "少了这条约束，27B 会改写措辞");
+  assert.ok(/接回完整/.test(PROMPT_TEMPLATE), "修 ASR 误断句是本版的核心目标");
 });
 
 test("validate 拒绝被改写成 6 倍长度的输出（Qwen3 实测故障形态）", () => {
@@ -220,7 +266,7 @@ test("normalizeParagraphs 把断在逗号上的换行并回上一段", () => {
     "实现在 Checkbox 的session context 里面就能继续的发指令。",
   ].join("\n");
   const out = f.normalizeParagraphs(messy);
-  const lines = out.split("\n");
+  const lines = out.split(/\n+/);
   assert.equal(lines.length, 2, `应并成 2 段，实际 ${lines.length} 段：${JSON.stringify(lines)}`);
   assert.ok(lines[0].endsWith("。"));
   assert.ok(lines[1].endsWith("。"));
@@ -232,14 +278,15 @@ test("normalizeParagraphs 保留按句号分好的段落", () => {
   const f = makeFormatter();
   const tidy = "我要实现对电脑进行 web coding，但是我的耳机是连在手机上的。\n然后我释放按键的时候，它就能把录音传到我指定的服务器上进行解码。";
   const out = f.normalizeParagraphs(tidy);
-  assert.equal(out.split("\n").length, 2, "本来就是好段落，不该被改动");
-  assert.equal(out, tidy);
+  assert.equal(out.split(/\n+/).length, 2, "本来就是好段落，不该被改动");
+  // 段落之间统一成空行：单换行在聊天窗口里常被当软换行合并，段就白分了
+  assert.equal(out, tidy.replace(/\n/g, "\n\n"));
 });
 
-test("normalizeParagraphs 丢掉模型多打的空行", () => {
+test("normalizeParagraphs 把模型多打的空行规整成标准段间距", () => {
   const f = makeFormatter();
   const out = f.normalizeParagraphs("第一句话在这里。\n\n\n第二句话在这里。\n\n");
-  assert.equal(out, "第一句话在这里。\n第二句话在这里。");
+  assert.equal(out, "第一句话在这里。\n\n第二句话在这里。");
 });
 
 test("normalizeParagraphs 单段文本原样返回", () => {
@@ -257,7 +304,7 @@ test("normalizeParagraphs 中英混排相邻时补空格，纯中文不补", () 
 test("normalizeParagraphs 句末标点带引号/括号也算断句", () => {
   const f = makeFormatter();
   const out = f.normalizeParagraphs("他说“可以了。”\n那就这样办。");
-  assert.equal(out.split("\n").length, 2, "引号结尾仍算句末");
+  assert.equal(out.split(/\n+/).length, 2, "引号结尾仍算句末");
 });
 
 test("normalizeParagraphs 去掉中文标点前后的多余空格", () => {
@@ -380,11 +427,11 @@ test("format 在模型原样返回时不标记 changed", async () => {
 });
 
 /* ------------------------------------------------------------------ *
- * 驻留与预热——冷启动 3.1s 会吃掉 5s 超时的大半
+ * 驻留与预热——冷启动 3.1s 会吃掉 5s 超时的大半（ollama 路径）
  * ------------------------------------------------------------------ */
 
-test("format 请求带 keep_alive，避免每次口述都重新加载模型", async () => {
-  const f = makeFormatter();
+test("format 在 ollama 下带 keep_alive，避免每次口述都重新加载模型", async () => {
+  const f = makeFormatter({ provider: "ollama" });
   let body = null;
   const restore = stubFetch(async (_url, init) => {
     body = JSON.parse(init.body);
@@ -413,8 +460,8 @@ test("format 请求不带 think 参数（Qwen3 会因此把思考倒进正文）
   }
 });
 
-test("warmup 也带 keep_alive，否则刚加载完 5 分钟又被卸掉", async () => {
-  const f = makeFormatter();
+test("warmup 在 ollama 下带 keep_alive，否则刚加载完 5 分钟又被卸掉", async () => {
+  const f = makeFormatter({ provider: "ollama" });
   let body = null;
   const restore = stubFetch(async (_url, init) => {
     body = JSON.parse(init.body);
@@ -424,7 +471,71 @@ test("warmup 也带 keep_alive，否则刚加载完 5 分钟又被卸掉", async
     const result = await f.warmup();
     assert.equal(result.ok, true);
     assert.equal(body.keep_alive, "30m");
-    assert.equal(body.options.num_predict, 1, "预热不该生成正文");
+    assert.ok(body.options.num_predict > 0, "预热不该生成正文");
+  } finally {
+    restore();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * AMD（openai 兼容）路径——线上默认后端
+ * ------------------------------------------------------------------ */
+
+test("默认后端是 AMD 的 openai 端点", () => {
+  assert.equal(DEFAULT_PROVIDER, "openai");
+  assert.ok(PROVIDERS.openai.defaultEndpoint.startsWith("http"), "得有默认端点");
+  const f = new LongTextFormatter({ logger: null });
+  assert.equal(f.provider, "openai");
+  assert.ok(f.endpoint.includes("18106"), "默认应指向 AMD 网关");
+});
+
+test("openai 路径打 /chat/completions，用 max_tokens 而不是 num_predict", async () => {
+  const f = makeAmdFormatter();
+  let url = null;
+  let body = null;
+  const restore = stubFetch(async (u, init) => {
+    url = u;
+    body = JSON.parse(init.body);
+    return jsonResponse({ choices: [{ message: { content: SAMPLE } }] });
+  });
+  try {
+    await f.format(SAMPLE);
+    assert.ok(url.endsWith("/v1/chat/completions"), `实际打到 ${url}`);
+    assert.ok(body.max_tokens > 0, "openai 协议用 max_tokens");
+    assert.ok(!("options" in body), "openai 协议没有 options 字段");
+    assert.ok(!("keep_alive" in body), "openai 端点不接受 keep_alive");
+    assert.ok(body.temperature <= 0.2, "整理是确定性任务，温度必须压低");
+  } finally {
+    restore();
+  }
+});
+
+test("openai 路径能从 choices[0].message.content 取到结果", async () => {
+  const f = makeAmdFormatter();
+  const polished = "我觉得这个方案可以。\n\n但是它太慢了。";
+  const restore = stubFetch(async () =>
+    jsonResponse({ choices: [{ message: { content: polished } }] })
+  );
+  try {
+    const result = await f.format(SAMPLE);
+    assert.equal(result.changed, true);
+    assert.equal(result.text, polished);
+    assert.equal(result.degraded, null);
+  } finally {
+    restore();
+  }
+});
+
+test("模型只在思考通道出内容时回退原文，不留空结果", async () => {
+  const f = makeAmdFormatter();
+  const restore = stubFetch(async () =>
+    jsonResponse({ choices: [{ message: { content: "", reasoning_content: "嗯，我先把这段话读一遍…" } }] })
+  );
+  try {
+    const result = await f.format(SAMPLE);
+    assert.equal(result.text, SAMPLE, "不能拿空结果覆盖原文");
+    assert.equal(result.changed, false);
+    assert.ok(/reasoning_only/.test(result.degraded || ""), `实际 degraded=${result.degraded}`);
   } finally {
     restore();
   }

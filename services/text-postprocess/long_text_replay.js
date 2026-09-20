@@ -30,13 +30,14 @@ const { execSync, spawn } = require("child_process");
 const ROOT = path.resolve(__dirname, "../..");
 
 const { TextPolisher } = require(path.join(ROOT, "src/platform/electron/textPolish"));
-const { LongTextFormatter, bigramCoverage } = require(path.join(ROOT, "src/helpers/longTextFormatter"));
+const { LongTextFormatter, bigramCoverage, PROVIDERS, DEFAULT_PROVIDER } = require(path.join(ROOT, "src/helpers/longTextFormatter"));
 const { registerTextPolishHandlers } = require(path.join(ROOT, "src/platform/electron/ipc/textPolishHandlers"));
 const { isTerminalWindow } = require(path.join(ROOT, "src/helpers/terminalFocus"));
 const ClipboardManager = require(path.join(ROOT, "src/helpers/clipboard"));
 
-const ENDPOINT = process.env.CAPS_LONG_TEXT_ENDPOINT || "http://127.0.0.1:11434";
-const MODEL = process.env.CAPS_LONG_TEXT_MODEL || "qwen2.5:3b";
+const PROVIDER = process.env.CAPS_LONG_TEXT_PROVIDER || DEFAULT_PROVIDER;
+const ENDPOINT = process.env.CAPS_LONG_TEXT_ENDPOINT || PROVIDERS[PROVIDER].defaultEndpoint;
+const MODEL = process.env.CAPS_LONG_TEXT_MODEL || PROVIDERS[PROVIDER].defaultModel;
 const DATASET = path.join(os.homedir(), "Documents/CapsWriter-Voice-Dataset/metadata.jsonl");
 const MIN_CHARS = 40;
 
@@ -148,7 +149,7 @@ function buildPipeline() {
     debug: () => {},
   };
   const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "caps-replay-"));
-  const longFormatter = new LongTextFormatter({ endpoint: ENDPOINT, model: MODEL, logger });
+  const longFormatter = new LongTextFormatter({ provider: PROVIDER, endpoint: ENDPOINT, model: MODEL, logger });
   const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter });
   const clipboardManager = new ClipboardManager(logger);
 
@@ -186,14 +187,15 @@ function stageOf(res, name) {
 async function main() {
   console.log("=".repeat(78));
   console.log("长文本整理 · 端到端回放");
-  console.log(`  端点 ${ENDPOINT}   模型 ${MODEL}   DISPLAY ${DISPLAY}`);
+  console.log(`  provider ${PROVIDER}   端点 ${ENDPOINT}`);
+  console.log(`  模型 ${MODEL}   DISPLAY ${DISPLAY}`);
   console.log("=".repeat(78));
 
   const { ctx, handlers, longFormatter, dataDirectory } = buildPipeline();
 
   // ---- 0. 服务探活
   const probe = await longFormatter.probe();
-  record("ollama 服务与模型可用", probe.available === true, JSON.stringify(probe));
+  record("整理后端可用且模型在位", probe.available === true, JSON.stringify(probe));
   if (!probe.available) {
     console.log("\n服务不可用，后面的 case 没有意义，直接退出。");
     process.exit(1);
@@ -250,7 +252,9 @@ async function main() {
   if (normalWindow && longSamples.length) {
     console.log(`\n--- 正向：目标窗口 ${normalWindow.windowClass}（非终端）---`);
     let ran = 0;
-    let segmented = 0;
+    let appliedCount = 0;
+    let shredded = 0;
+    let maxSegs = 0;
     let degraded = 0;
     const elapsedList = [];
     for (const [i, sample] of longSamples.entries()) {
@@ -259,27 +263,36 @@ async function main() {
         targetWindowId: normalWindow.id,
       });
       const st = stageOf(res, "long_format");
+      const lines = String(res.text).trim().split(/\n+/).filter(Boolean);
       if (st) {
         ran += 1;
         elapsedList.push(st.elapsed_ms ?? wallMs);
-        const lines = String(res.text).trim().split(/\n+/).filter(Boolean);
-        if (lines.length >= 2) segmented += 1;
+        if (st.applied) appliedCount += 1;
+        // 碎段判定："一句话一行"。段数多、平均段长又短，就是被切碎了。
+        // 2026-09-20 之前本机 3B 的形态是 183 字切 7~9 段（平均 20 字）。
+        const avgSeg = contentLength(res.text) / Math.max(1, lines.length);
+        if (lines.length > 5 && avgSeg < 30) shredded += 1;
+        maxSegs = Math.max(maxSegs, lines.length);
       }
       if (res.degraded) degraded += 1;
       const cover = bigramCoverage(sample.text, res.text);
       console.log(
         `  [${i + 1}] ${contentLength(sample.text)}字 → ${contentLength(res.text)}字  ` +
-          `段数=${String(res.text).trim().split(/\n+/).filter(Boolean).length}  ` +
-          `覆盖=${cover.toFixed(3)}  ${st ? `${st.elapsed_ms}ms` : "未整理"}  ` +
+          `段数=${lines.length}  覆盖=${cover.toFixed(3)}  ` +
+          `${st ? `${st.elapsed_ms}ms${st.applied ? "" : "(模型认为无需改动)"}` : "未送入整理"}  ` +
           `${res.degraded || ""}`
       );
     }
-    record("长句全部触发了整理", ran === longSamples.length, `${ran}/${longSamples.length} 触发`);
-    record("整理结果确实分段了", segmented >= Math.ceil(longSamples.length * 0.75), `${segmented}/${longSamples.length} 分了段`);
+    record("长句都被送进整理器", ran === longSamples.length, `${ran}/${longSamples.length}`);
+    record(
+      "没有一条被切成碎段（无'一句话一行'）",
+      shredded === 0,
+      `最多 ${maxSegs} 段，碎段 ${shredded} 条（其中 ${appliedCount}/${ran} 条有实际改动）`
+    );
     record("长句无降级回退", degraded === 0, degraded ? `${degraded} 条降级` : "0 条降级");
     if (elapsedList.length) {
       const avg = elapsedList.reduce((a, b) => a + b, 0) / elapsedList.length;
-      console.log(`  平均推理耗时 ${avg.toFixed(0)}ms（上限 ${(await longFormatter.probe()).timeout_ms ?? "—"}ms）`);
+      console.log(`  平均推理耗时 ${avg.toFixed(0)}ms（超时上限 ${longFormatter.timeoutMs}ms）`);
     }
   }
 
@@ -327,7 +340,13 @@ async function main() {
 
   // ---- 6. 服务挂掉：不能崩、不能丢字
   if (normalWindow) {
-    const deadFormatter = new LongTextFormatter({ endpoint: "http://127.0.0.1:1", model: MODEL, timeoutMs: 1500 });
+    const deadFormatter = new LongTextFormatter({
+      provider: PROVIDER,
+      // 指向必然不可达的端口：验证服务挂掉时链路的行为
+      endpoint: "http://127.0.0.1:1",
+      model: MODEL,
+      timeoutMs: 1500,
+    });
     const dead = new TextPolisher({ dataDirectory, longFormatter: deadFormatter });
     const deadCtx = {
       textPolisher: dead,
@@ -343,7 +362,7 @@ async function main() {
       longFormat: { enabled: true, minChars: MIN_CHARS },
     });
     record(
-      "ollama 不可用时降级且不丢字",
+      "整理后端不可用时降级且不丢字",
       res.degraded && String(res.text).length > 0,
       `degraded=${res.degraded} 文本长度=${String(res.text).length}`
     );

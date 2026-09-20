@@ -170,12 +170,17 @@ class TextPolisher {
         const stageStart = Date.now();
         try {
           const applied = await this.longFormatter.format(current);
+          // 无论有没有改动都记 stage：'跑了但模型认为无需改' 与 '压根没跑'
+          // 是两件事，日志和回放要靠这个区分。
+          // （2026-09-20 回放里 8 条长句有 2 条显示"未触发"，实际是模型
+          //   原样返回 —— 那条文本本来就没有口水词和误断句。）
+          result.stages.push({
+            stage: "long_format",
+            elapsed_ms: Date.now() - stageStart,
+            applied: applied.changed === true,
+            ...(applied.changed ? { ratio: applied.ratio } : {}),
+          });
           if (applied.changed) {
-            result.stages.push({
-              stage: "long_format",
-              elapsed_ms: Date.now() - stageStart,
-              ratio: applied.ratio,
-            });
             current = applied.text;
           }
           if (applied.degraded) {

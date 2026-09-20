@@ -437,9 +437,13 @@ const asrConnectionProfiles = new AsrConnectionProfiles({
 });
 clipboardManager.setDatabaseManager(databaseManager);
 const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.getPath("documents"), logger });
-// 长文本整理（去口水词 + 分段）。走本机 ollama，模型是 Qwen2.5:3B ——
-// 必须是原生非思考的模型，Qwen3 系列实测会陷入停不下来的思考链。
+// 长文本整理（去口水词 + 修错别字 + 接回被误断的句子 + 分段）。
+// 默认走 AMD 上的 Qwen3.8-Flash-Next（OpenAI 兼容端点）。
+// 为什么不用本机小模型：qwen2.5:3b 只会把 ASR 的句号机械换成换行
+// （183 字 → 7~9 行），且在中英混排长文本上会崩成逐词加空格。
+// 详见 src/helpers/longTextFormatter.js 顶部的实测记录。
 const longTextFormatter = new LongTextFormatter({
+  provider: process.env.CAPS_LONG_TEXT_PROVIDER || undefined,
   endpoint: process.env.CAPS_LONG_TEXT_ENDPOINT || undefined,
   model: process.env.CAPS_LONG_TEXT_MODEL || undefined,
   logger,
