@@ -110,3 +110,18 @@ test("interrupted realtime audio falls back to the latest usable partial", async
     null
   );
 });
+
+test("salvage takes the latest partial after a device upload failure", async () => {
+  const { selectSalvagePayload } = await policyPromise;
+  const partial = { success: true, text: "已经转出来的那一段话" };
+
+  assert.deepEqual(selectSalvagePayload(partial, "device_audio_upload_failed"), {
+    ...partial,
+    partial_fallback: true,
+    partial_fallback_reason: "salvage:device_audio_upload_failed",
+  });
+  // 没有可用文本时返回 null，由调用方走失败分支——不能拿空结果覆盖原文
+  assert.equal(selectSalvagePayload(null, "device_audio_upload_failed"), null);
+  assert.equal(selectSalvagePayload({ success: true, text: "" }, "x"), null);
+  assert.equal(selectSalvagePayload({ success: false, text: "有字也没用" }, "x"), null);
+});

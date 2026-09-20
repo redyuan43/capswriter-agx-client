@@ -55,3 +55,25 @@ export function createRealtimeProtocolError(payload, fallbackMessage) {
   error.realtimePayload = payload || null;
   return error;
 }
+
+/**
+ * 设备侧音频上传中断后的抢救取词。
+ *
+ * 场景（2026-09-20 实测）：M5 说了 45 秒，前 33 秒音频正常，设备在 stop
+ * 请求里报 upload_failed。此时实时识别其实已经转出 173 字，但主进程原来
+ * 直接发 cancel，渲染层连文本带 PCM 一起扔了，用户说完一整段什么也没有。
+ *
+ * 现在主进程改发带 salvage 标记的 stop，渲染层用这个函数取最近一次 partial
+ * 当结果，走正常的粘贴/留存链路。**不做任何"等 final"的尝试**：设备已经
+ * 不再上传音频，等下去只会拖到超时。
+ */
+export function selectSalvagePayload(latestPayload, reason = "device_upload_failed") {
+  if (!isUsableASRPayload(latestPayload)) {
+    return null;
+  }
+  return {
+    ...latestPayload,
+    partial_fallback: true,
+    partial_fallback_reason: `salvage:${reason}`,
+  };
+}

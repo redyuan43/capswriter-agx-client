@@ -119,6 +119,128 @@ const SPACE_BEFORE_PUNCT = /\s+([，。！？；：、）】」』”’])/g;
 const SPACE_AFTER_OPEN = /([（【「『“‘])\s+/g;
 
 /**
+ * 口述里的序号列举。
+ *
+ * 用户说"第一…第二…第三…"时期望看到分行的列表，而不是挤成一整段。
+ * 这件事**不需要语义理解**——序号本身就是结构信号——所以用确定性规则做，
+ * 模型（3B 也好 27B 也好）不参与。这样即使整理服务不可用，排版照样生效。
+ *
+ * 防误伤的核心是"至少两个不同的序号"：只出现一个"第一"时，它多半是
+ * "第一次/第一版/第一台"这类普通词，而不是一个列表的开头。序号后面还
+ * 必须是标点或列举量词（条/点/项/款），"第一次""第三方"因此天然被排除。
+ */
+const CJK_ORDINAL_CHARS = "一二三四五六七八九十";
+const CJK_DIGIT_VALUES = {
+  一: 1, 二: 2, 三: 3, 四: 4, 五: 5,
+  六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
+};
+
+function cjkOrdinalValue(token) {
+  const s = String(token || "");
+  if (!s) return 0;
+  if (s.length === 1) return CJK_DIGIT_VALUES[s] || 0;
+  const tenIndex = s.indexOf("十");
+  if (tenIndex === -1) return 0;
+  const tens = tenIndex === 0 ? 1 : (CJK_DIGIT_VALUES[s[0]] || 0);
+  const rest = s.slice(tenIndex + 1);
+  const ones = rest ? (CJK_DIGIT_VALUES[rest[0]] || 0) : 0;
+  return tens * 10 + ones;
+}
+
+/**
+ * 找出文本里所有"列举序号"的位置。
+ *
+ * 三种形态：
+ *   中文序数    第一，/ 第二、/ 第三条：/ 第一点
+ *   中文"X是"   一是…/ 二是…（前面必须不是汉字，"统一是"不算）
+ *   阿拉伯数字  1. / 2、/ 3)（前面必须是句读或行首，"1.5 倍"不算）
+ */
+function findEnumerationMarkers(text) {
+  const src = String(text || "");
+  const markers = [];
+
+  const cjkPattern = new RegExp(
+    `第([${CJK_ORDINAL_CHARS}]{1,3})(?=[，,、；;：:]|[条点项款])`,
+    "g",
+  );
+  for (const match of src.matchAll(cjkPattern)) {
+    markers.push({
+      index: match.index,
+      length: match[0].length,
+      ordinal: cjkOrdinalValue(match[1]),
+      token: match[0],
+    });
+  }
+
+  const listPattern = new RegExp(
+    `(^|[\\s，。！？；：、])([${CJK_ORDINAL_CHARS}])(?=是)`,
+    "g",
+  );
+  for (const match of src.matchAll(listPattern)) {
+    const prefixLength = match[1] ? match[1].length : 0;
+    markers.push({
+      index: match.index + prefixLength,
+      length: match[2].length,
+      ordinal: cjkOrdinalValue(match[2]),
+      token: match[2],
+      kind: "list",
+    });
+  }
+
+  // (?<!\d) 是必要的：不然 "2026." 里的 "26." 会被当成第 26 项
+  const numberPattern = /(?<!\d)(\d{1,2})\s*[、.．)）](?!\d)/g;
+  for (const match of src.matchAll(numberPattern)) {
+    markers.push({
+      index: match.index,
+      length: match[0].length,
+      ordinal: Number(match[1]) || 0,
+      token: match[0],
+    });
+  }
+
+  return markers
+    .filter((marker) => marker.ordinal > 0)
+    .sort((a, b) => a.index - b.index);
+}
+
+/**
+ * 把序号列举排成分行的列表。
+ *
+ * 只加换行，一个字符都不改——不重排语序、不改标点、不改用词。
+ * 已经独立成行的序号（原文或上游已经分好段）不再重复插换行。
+ */
+function normalizeEnumerations(text) {
+  const src = String(text || "");
+  const markers = findEnumerationMarkers(src).filter((marker) => {
+    // 序号前面是逗号/顿号时跳过：那说明它嵌在同一句话里
+    // （"第十条讲的是缓存，第十一条讲的是并发"），不是列表项的开头。
+    // 宁可少切，也不要把一句话从中间劈开——和终端避让同一个取舍。
+    // "一是/二是"例外：它前面必须不是汉字（"统一是"不匹配），本身就已经
+    // 是纯列举信号，不受这条约束。
+    if (marker.kind === "list") return true;
+    const prev = src[marker.index - 1] || "";
+    return !/[，,、]/.test(prev);
+  });
+  if (markers.length < 2) return src;
+  // 同一个序数出现两次（"第一个…第一个…"）不构成列举
+  if (new Set(markers.map((marker) => marker.ordinal)).size < 2) return src;
+
+  const parts = [];
+  let cursor = 0;
+  for (const marker of markers) {
+    const before = src.slice(cursor, marker.index).replace(/\s+$/, "");
+    parts.push(before);
+    if (before !== "" && !before.endsWith("\n")) {
+      parts.push("\n\n");
+    }
+    parts.push(src.slice(marker.index, marker.index + marker.length));
+    cursor = marker.index + marker.length;
+  }
+  parts.push(src.slice(cursor));
+  return parts.join("");
+}
+
+/**
  * prompt 的形态是实测出来的，改动前先看这段历史：
  *
  * v1.0.24 初版让模型"按意思分成几段"，示例写成"原文两句 / 整理后两行"。
@@ -480,6 +602,8 @@ module.exports = {
   LongTextFormatter,
   bigramCoverage,
   spaceyRatio,
+  normalizeEnumerations,
+  findEnumerationMarkers,
   PROMPT_TEMPLATE,
   PROVIDERS,
   MIN_RATIO,

@@ -103,6 +103,7 @@ async function startBridge(t, sendToRenderer = () => {}, options = {}) {
     clipboardManager: { setTargetWindow() {} },
     databaseManager: options.databaseManager,
     asrSessionFactory: options.asrSessionFactory,
+    dataDirectory: options.dataDirectory,
     sendToRenderer,
   });
   bridge.port = 0;
@@ -1717,4 +1718,131 @@ test("only opted-in StickS3 uploads get bounded buffer recovery grace", async (t
       "audio_input_stalled");
     bridge.finishSession(session, { success: false, status: "cancelled" });
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * 传输失败时的抢救（salvage）
+ *
+ * 2026-09-20 实测：M5 说了 45 秒话，前 33 秒音频正常上传，设备侧在 stop
+ * 请求里报 upload_failed，客户端随即把整段会话连同渲染层已经转出的 173 字
+ * 一起丢掉，数据集里留下 45 秒空白。用户原话："不能因为最后没有收到
+ * Finish 指令，就把所有的会话全都不要了。"
+ * ------------------------------------------------------------------ */
+
+test("设备上传失败时抢救会话，而不是让渲染层丢弃已识别的文本", async (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "caps-salvage-"));
+  const rendererEvents = [];
+  const { bridge, port } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  }, { dataDirectory });
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "wifi-salvage",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+  };
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    headers,
+    body: { session_id: "salvage-me", intent: "dictation", protocol_version: 2 },
+  });
+  // 5 × 7680 字节 ≈ 1.2 秒，过抢救门槛（1 秒）。v2 协议要求带 CRC32。
+  const chunk = Buffer.alloc(7680, 7);
+  const audioHeaders = { ...headers, "X-Vibe-Stick-Chunk-CRC32": crc32Hex(chunk) };
+  for (let index = 0; index < 5; index += 1) {
+    const uploaded = await requestBuffer(
+      port,
+      `/recording/audio?session_id=salvage-me&chunk_id=${index}`,
+      chunk,
+      audioHeaders
+    );
+    assert.equal(uploaded.statusCode, 200, `第 ${index} 块音频应被接受：${uploaded.body}`);
+  }
+  assert.equal(bridge.sessions.get("salvage-me").rendererDispatched, true);
+  rendererEvents.length = 0;
+
+  const stop = await requestJson(port, "/recording/stop", {
+    method: "POST",
+    headers,
+    body: { session_id: "salvage-me", upload_failed: true },
+  });
+  // 对设备仍报 422（不改协议），但客户端内部走抢救
+  assert.equal(stop.statusCode, 422);
+
+  const stopEvent = rendererEvents.find((event) => event.eventName === "external-recording-stop");
+  assert.ok(stopEvent, "应当发 stop 让渲染层把已识别文本交出来");
+  assert.equal(stopEvent.payload.salvage, true);
+  assert.equal(stopEvent.payload.salvage_reason, "device_audio_upload_failed");
+  assert.equal(
+    rendererEvents.some((event) => event.eventName === "external-recording-cancel"),
+    false,
+    "发 cancel 会让渲染层把已有文本一起丢掉"
+  );
+
+  const session = bridge.sessions.get("salvage-me");
+  assert.equal(session.done, false, "会话不能就此结束——渲染层还要回传抢救结果");
+  assert.equal(session.status, "processing");
+
+  const salvaged = fs.readdirSync(path.join(dataDirectory, "salvaged-recordings"));
+  assert.equal(salvaged.length, 1, "已收到的 PCM 必须落盘，不能 60 秒后被删掉");
+  assert.ok(salvaged[0].endsWith(".wav"));
+  bridge.abortAllSessions("test_cleanup");
+});
+
+test("音频太少时不抢救——没有内容可救，按原样失败", async (t) => {
+  const rendererEvents = [];
+  const { bridge, port } = await startBridge(t, (eventName, payload) => {
+    rendererEvents.push({ eventName, payload });
+  });
+  const headers = {
+    "X-Vibe-Stick-Device-Id": "wifi-tiny",
+    "X-Vibe-Stick-Firmware-Name": "vibestick",
+  };
+  await requestJson(port, "/recording/start", {
+    method: "POST",
+    headers,
+    body: { session_id: "tiny", intent: "dictation", protocol_version: 2 },
+  });
+  const tiny = Buffer.alloc(100, 1);
+  await requestBuffer(
+    port,
+    "/recording/audio?session_id=tiny&chunk_id=0",
+    tiny,
+    { ...headers, "X-Vibe-Stick-Chunk-CRC32": crc32Hex(tiny) }
+  );
+  assert.equal(bridge.sessions.get("tiny").bytes, 100);
+  rendererEvents.length = 0;
+
+  await requestJson(port, "/recording/stop", {
+    method: "POST",
+    headers,
+    body: { session_id: "tiny", upload_failed: true },
+  });
+  assert.equal(
+    rendererEvents.some((event) => event.eventName === "external-recording-cancel"),
+    true,
+    "100 字节不值得跑一遍抢救流程"
+  );
+  assert.equal(bridge.sessions.get("tiny").done, true);
+});
+
+test("抢救只针对设备上传路径，不影响本机采集的失败恢复", async (t) => {
+  const { bridge } = await startBridge(t);
+  const session = bridge.recordingSessions.create({ id: "salvage-policy", intent: "dictation" });
+  session.bytes = 100000;
+  session.rendererDispatched = true;
+  session.captureMode = "device_upload";
+
+  assert.equal(bridge.shouldSalvageSession(session, "device_audio_upload_failed"), true);
+  assert.equal(bridge.shouldSalvageSession(session, "audio_integrity_mismatch"), true);
+  // 没内容 / 非传输类原因 / 没派发给渲染层 → 都不抢救
+  assert.equal(bridge.shouldSalvageSession(session, "audio_input_empty"), false);
+  assert.equal(bridge.shouldSalvageSession(session, "bridge_recovery"), false);
+  session.rendererDispatched = false;
+  assert.equal(bridge.shouldSalvageSession(session, "device_audio_upload_failed"), false);
+  // 本机采集走原有的 recordCaptureFailure / 蓝牙恢复，不从这里插队
+  session.rendererDispatched = true;
+  session.captureMode = "host_capture";
+  assert.equal(bridge.shouldSalvageSession(session, "audio_input_stalled"), false);
 });

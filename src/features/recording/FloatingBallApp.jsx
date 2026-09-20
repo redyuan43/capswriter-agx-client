@@ -25,6 +25,7 @@ import {
   isUsableASRPayload,
   selectRealtimeFinalTimeoutFallback,
   selectRealtimeStreamFailureFallback,
+  selectSalvagePayload,
 } from "../../helpers/asrResultPolicy.mjs";
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -2343,6 +2344,7 @@ export default function FloatingBallApp() {
       externalRealtimeSessionRef.current.cancel();
       externalRealtimeSessionRef.current = null;
     }
+    const discardedChunks = externalPCMChunksRef.current.length;
     externalPCMChunksRef.current = [];
     cancelCurrentOutput(payload.reason || "m5_followup_cancel");
     if (!session.cancelReported) {
@@ -2358,7 +2360,14 @@ export default function FloatingBallApp() {
     if (externalRecordingRef.current === session) {
       externalRecordingRef.current = null;
     }
-    logRuntime("info", "External M5 recording cancelled", { sessionId });
+    // 取消会连实时转写结果一起丢掉。记下丢了多少字：2026-09-20 排查
+    // "说了一大段却什么也没留下" 时，就是靠这条日志确认当时的识别结果的。
+    logRuntime("info", "External M5 recording cancelled", {
+      sessionId,
+      reason: payload.reason || null,
+      discardedTextLength: extractASRText(session.latestRealtimePartial).length,
+      discardedChunks,
+    });
   }, [cancelCurrentOutput, logRuntime, reportExternalRecordingResult]);
 
   const stopExternalRecording = useCallback(async (payload = {}) => {
@@ -2427,7 +2436,34 @@ export default function FloatingBallApp() {
         return;
       }
       const realtimeSession = externalRealtimeSessionRef.current;
-      if (realtimeSession) {
+      const salvageMode = payload.salvage === true;
+      if (salvageMode) {
+        // 设备侧音频上传中途断掉（主进程会带 salvage 标记发 stop）。
+        // 不能再去等 final：18011 那边等不到后续音频，只会一路拖到超时，
+        // 而实时识别其实早就把用户说的话转出来了。
+        // 所以直接取最近一次 partial 当结果，走后面的正常粘贴/留存链路。
+        const latestPayload =
+          session.latestRealtimePartial ||
+          realtimeSession?.getLatestTextPayload?.() ||
+          null;
+        const salvaged = selectSalvagePayload(
+          latestPayload,
+          payload.salvage_reason || "device_upload_failed"
+        );
+        if (salvaged) {
+          finalPayload = salvaged;
+          resultSource = "salvage_partial";
+          logRuntime("warn", "External M5 salvaged after transport failure", {
+            sessionId,
+            salvageReason: payload.salvage_reason || "device_upload_failed",
+            textLength: extractASRText(finalPayload).length,
+          });
+        } else {
+          realtimeError = new Error(
+            `录音上传失败（${payload.salvage_reason || "device_upload_failed"}），且没有可用的实时识别结果`
+          );
+        }
+      } else if (realtimeSession) {
         if (realtimeSession.isPcmStalled?.()) {
           const stalledError = new Error(
             "实时语音识别失败：发送到 18011 的 PCM 音频流已停滞"

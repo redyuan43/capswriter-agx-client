@@ -15,6 +15,7 @@ const os = require("os");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const { HotRuleReplacer } = require("../../helpers/hotRuleReplace");
+const { normalizeEnumerations } = require("../../helpers/longTextFormatter");
 
 const DEFAULT_PYTHON = process.env.CAPS_PUNC_PYTHON || "";
 // __dirname = src/platform/electron，需上溯三级才到项目根（打包后即 app.asar 根）
@@ -163,10 +164,29 @@ class TextPolisher {
 
     // 阶段三：长文本整理（默认关；需要显式传 longFormat.enabled）
     // 放在最后，因为它会引入换行——必须建立在已规范化的文本之上。
+    //
+    // 这一阶段里有两件事，性质不同，别混在一起看：
+    //   ① 序号列举排版 —— 确定性规则，只有加换行的动作，不依赖任何模型
+    //   ② 长文本整理   —— 调本地/远程 LLM，做去口水词、修断句
+    // ① 先跑，这样即使 ② 的服务挂掉、或文本没到模型门槛（<40 字），
+    // 用户说"第一…第二…第三…"依然能看到分好行的列表。
     const longFormat = options.longFormat || null;
-    if (longFormat?.enabled && this.longFormatter) {
+    if (longFormat?.enabled) {
       const decision = this.shouldRunLongFormat(current, longFormat);
-      if (decision.run) {
+      // 终端/未知窗口下换行是危险动作（终端里换行=回车执行），一律不排版
+      const blocked = decision.reason === "terminal" || decision.reason === "unknown_window";
+      if (!blocked) {
+        const enumerated = normalizeEnumerations(current);
+        if (enumerated !== current) {
+          result.stages.push({
+            stage: "enumeration_format",
+            elapsed_ms: 0,
+            applied: true,
+          });
+          current = enumerated;
+        }
+      }
+      if (decision.run && this.longFormatter) {
         const stageStart = Date.now();
         try {
           const applied = await this.longFormatter.format(current);

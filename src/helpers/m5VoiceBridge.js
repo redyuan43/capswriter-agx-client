@@ -56,6 +56,30 @@ const HOST_AUDIO_FAILURE_REASONS = new Set([
   "first_audio_chunk_timeout",
 ]);
 
+/**
+ * 这些失败说明"传输/协议没走完"，而不是"内容无效"。
+ *
+ * 典型场景（2026-09-20 实测）：M5 说了 45 秒话，前 33 秒音频正常上传，
+ * 最后 12 秒设备侧上传失败并在 stop 请求里带 upload_failed=true。
+ * 此时客户端手上已有 137 个音频块，渲染层那边实时 ASR 也已经转出 173 字。
+ * 把它当"录音失败"整段丢掉，用户就白说了一整段话。
+ *
+ * 只要还有音频，就按"能救多少救多少"处理：让渲染层把已有文本交出来，
+ * 走正常的粘贴/留存链路，结果标记 recovered。
+ */
+const SALVAGEABLE_FAILURE_REASONS = new Set([
+  "device_audio_upload_failed",
+  "audio_integrity_mismatch",
+  "audio_input_stalled",
+  "recording_duration_exceeded",
+]);
+
+// 少于 1 秒音频没有抢救价值（人还没来得及说出一句完整的话）。
+const SALVAGE_MIN_BYTES = 16000 * 2;
+// 渲染层收到 salvage stop 后要跑识别+粘贴，给足时间；超时则兜底收尾，
+// 避免会话挂在 "salvaging" 状态上不释放。
+const SALVAGE_SETTLE_TIMEOUT_MS = 20000;
+
 function cleanToken(value) {
   const token = String(value || "").trim();
   if (!token || [
@@ -287,6 +311,8 @@ class M5VoiceBridge {
     this.asrConnectionProfiles = asrConnectionProfiles;
     this.asrSessionFactory = asrSessionFactory;
     this.sendToRenderer = sendToRenderer;
+    // 抢救音频的落盘位置（见 preserveSessionPcm）。没传就退回临时目录。
+    this.dataDirectory = String(dataDirectory || "").trim();
     this.server = null;
     this.recordingSessions = new M5RecordingSessions();
     this.sessions = this.recordingSessions.sessions;
@@ -2325,7 +2351,16 @@ loadBluetoothDevices();
         });
       }
     }
-    this.finishSession(session, payload);
+    this.finishSession(
+      session,
+      session.salvage
+        ? {
+            ...payload,
+            recovered: true,
+            recovered_reason: session.salvage.reason,
+          }
+        : payload
+    );
     return { success: true };
   }
 
@@ -2482,7 +2517,148 @@ loadBluetoothDevices();
     return this.abortSession(session, reason);
   }
 
+  /**
+   * 判断这次失败值不值得抢救。
+   *
+   * 两个条件缺一不可：
+   *   - 失败原因是传输/协议类（音频已经收到一部分，只是没传完）
+   *   - 音频已经派发给渲染层（渲染层手里才有实时转写文本，主进程只有 PCM）
+   */
+  shouldSalvageSession(session, reason) {
+    if (!session || session.done || session.terminationStarted) {
+      return false;
+    }
+    if (!SALVAGEABLE_FAILURE_REASONS.has(reason)) {
+      return false;
+    }
+    // 只抢救"设备上传"这条路。本机采集（host_capture）的失败另有音频路由
+    // 恢复逻辑（recordCaptureFailure / 蓝牙重连），从 abortSession 最前面插一杠
+    // 会把那套恢复流程跳过，不在本次改动范围内。
+    if (session.captureMode !== "device_upload") {
+      return false;
+    }
+    if (!(session.bytes >= SALVAGE_MIN_BYTES)) {
+      return false;
+    }
+    return session.rendererDispatched === true;
+  }
+
+  /**
+   * 抢救一个传输失败的会话。
+   *
+   * 与 terminateSession 的区别只有一处，但很关键：**不发 external-recording-cancel**。
+   * cancel 的语义是"这次不要了"，渲染层收到就会把实时转写结果连同 PCM 缓冲一起扔掉
+   * （见 FloatingBallApp 的 cancelExternalRecording）——已经转出来的上百字就没了。
+   * 这里改发带 salvage 标记的 stop，让渲染层把手上的文本交出来走正常收尾。
+   */
+  salvageSession(session, reason, details = {}) {
+    session.salvage = {
+      reason,
+      details: details || {},
+      startedAt: Date.now(),
+    };
+    session.status = "salvaging";
+    if (session.watchdogTimer) {
+      clearTimeout(session.watchdogTimer);
+      session.watchdogTimer = null;
+    }
+    session.mainAsrSession?.cancel?.();
+    this.pipeWireCapture.stop(session.id);
+    for (const [triggerId, sessionId] of this.hostTriggerSessions.entries()) {
+      if (sessionId === session.id) this.hostTriggerSessions.delete(triggerId);
+    }
+    this.audioRouting.clearActiveRoute(session.triggerId);
+
+    const preservedAudio = this.preserveSessionPcm(session);
+    this.logger?.warn?.("M5 recording salvaged instead of discarded", {
+      sessionId: session.id,
+      reason,
+      bytes: session.bytes,
+      chunks: session.chunks,
+      audioMs: Math.round(session.bytes / 32),
+      preservedAudio: preservedAudio || null,
+    });
+
+    this.dispatchRendererSalvage(session, reason);
+
+    session.salvageTimer = setTimeout(() => {
+      session.salvageTimer = null;
+      if (session.done || session.terminationStarted) {
+        return;
+      }
+      this.logger?.warn?.("M5 salvaged recording did not settle in time", {
+        sessionId: session.id,
+        reason,
+        preservedAudio: preservedAudio || null,
+      });
+      this.terminateSession(session, {
+        reason: `${reason}_salvaged`,
+        success: false,
+        status: "salvage_timeout",
+        error: reason,
+      });
+      this.windowManager?.hideFloatingBall?.();
+    }, SALVAGE_SETTLE_TIMEOUT_MS);
+    session.salvageTimer.unref?.();
+    return true;
+  }
+
+  dispatchRendererSalvage(session, reason) {
+    if (!session || session.done) {
+      return false;
+    }
+    session.stopDispatched = true;
+    session.status = "processing";
+    this.sendToRenderer("external-recording-stop", {
+      session_id: session.id,
+      paste: session.paste !== false,
+      mode: session.intent,
+      trigger_mode: session.mode,
+      intent: session.intent,
+      bytes: session.bytes,
+      chunks: session.chunks,
+      salvage: true,
+      salvage_reason: reason,
+    });
+    return true;
+  }
+
+  /**
+   * 把已收到的 PCM 转成 WAV 落盘。
+   *
+   * spool 目录是 tmpdir 下的临时文件，且会话收尾 60 秒后就会被删（见
+   * M5RecordingSessions.finish 的 cleanupTimer）。抢救场景下这就是最后一份
+   * 原始音频，丢掉就再没有第二次识别的机会，所以复制到一个持久目录。
+   */
+  preserveSessionPcm(session) {
+    try {
+      if (!session?.pcmFile || !fs.existsSync(session.pcmFile)) {
+        return "";
+      }
+      const pcm = fs.readFileSync(session.pcmFile);
+      if (!pcm.length) {
+        return "";
+      }
+      const baseDir = String(this.dataDirectory || "").trim() || os.tmpdir();
+      const dir = path.join(baseDir, "salvaged-recordings");
+      fs.mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const file = path.join(dir, `salvaged-${stamp}-${session.id}.wav`);
+      fs.writeFileSync(file, createPcmWavBuffer([pcm], session.sampleRate || 16000));
+      return file;
+    } catch (error) {
+      this.logger?.warn?.("Unable to preserve salvaged M5 audio", {
+        sessionId: session?.id,
+        error: error?.message || String(error),
+      });
+      return "";
+    }
+  }
+
   abortSession(session, reason, details = {}) {
+    if (this.shouldSalvageSession(session, reason)) {
+      return this.salvageSession(session, reason, details);
+    }
     const recoverBluetooth = session?.captureMode === "host_capture" &&
       HOST_AUDIO_FAILURE_REASONS.has(reason) &&
       String(session?.sourceId || "").startsWith("pipewire:bluez_input.");
@@ -2905,10 +3081,15 @@ loadBluetoothDevices();
       clearTimeout(session.watchdogTimer);
       session.watchdogTimer = null;
     }
+    if (session?.salvageTimer) {
+      clearTimeout(session.salvageTimer);
+      session.salvageTimer = null;
+    }
     const completion = this.recordingSessions.finish(session, result);
     if (!completion.finished) {
       return;
     }
+    const salvage = session.salvage || null;
     this.logger?.info?.("M5 recording finished", {
       sessionId: session.id,
       status: session.status,
@@ -2917,6 +3098,8 @@ loadBluetoothDevices();
       success: session.result.success !== false,
       reason: session.result.reason || session.result.error || null,
       details: session.result.details || null,
+      recoveredFrom: salvage?.reason || null,
+      recoveredTextLength: salvage ? String(session.result.text || "").length : null,
     });
     this.onSessionFinished?.(session.id);
     if (this.rendererSessionId === session.id) {

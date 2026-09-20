@@ -15,6 +15,8 @@ const {
   LongTextFormatter,
   bigramCoverage,
   spaceyRatio,
+  normalizeEnumerations,
+  findEnumerationMarkers,
   PROMPT_TEMPLATE,
   PROVIDERS,
   DEFAULT_PROVIDER,
@@ -539,4 +541,116 @@ test("模型只在思考通道出内容时回退原文，不留空结果", async
   } finally {
     restore();
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * 序号列举排版（normalizeEnumerations）
+ *
+ * 用户说"第一…第二…第三…"时期望看到分行的列表。这是纯规则，
+ * 不依赖模型——所以边界必须钉死，尤其是"不要误伤普通词"这一侧。
+ * ------------------------------------------------------------------ */
+
+test("口述列举序号会被排成分行列表", () => {
+  const text = "另外，我之前说了，你有些回复。第一，怎么样？第二，怎么样？第三，怎么样的时候，你能把格式排好就已经不错了。";
+  const out = normalizeEnumerations(text);
+  const lines = out.split(/\n+/).filter(Boolean);
+  assert.equal(lines.length, 4, `应切成 4 段（引言 + 3 项），实际 ${lines.length}`);
+  assert.ok(lines[1].startsWith("第一，"));
+  assert.ok(lines[2].startsWith("第二，"));
+  assert.ok(lines[3].startsWith("第三，"));
+});
+
+test("列举排版只加换行，不增删任何字符", () => {
+  const text = "我说三件事。第一，甲。第二，乙。";
+  const out = normalizeEnumerations(text);
+  const strip = (s) => s.replace(/\s/g, "");
+  assert.equal(strip(out), strip(text), "除了空白，一个字符都不该变");
+});
+
+test("只出现一个序号时不算列举", () => {
+  const text = "第一，这个事情我是这么想的，后面还有别的安排。";
+  assert.equal(normalizeEnumerations(text), text);
+});
+
+test("第一次/第三方/第一版这类词不会被误判成列表", () => {
+  for (const text of [
+    "第一次做这个事的时候我还没想明白。",
+    "这是第三方库，第一版的时候用的是旧的 API。",
+    "他第一时间就通知我了，第一台机器也是他装的。",
+  ]) {
+    assert.equal(normalizeEnumerations(text), text, `不该改动：${text}`);
+  }
+});
+
+test("阿拉伯数字列举会被切开", () => {
+  const out = normalizeEnumerations("我准备了三件事1. 修客户端2. 加排版3. 提交部署");
+  const lines = out.split(/\n+/).filter(Boolean);
+  assert.equal(lines.length, 4);
+  assert.ok(lines[1].startsWith("1."));
+  assert.ok(lines[3].startsWith("3."));
+});
+
+test("一是/二是会被识别成列举", () => {
+  const out = normalizeEnumerations("原因有两个，一是没接线，二是模型太小。");
+  assert.equal(out.split(/\n+/).filter(Boolean).length, 3, `实际：${JSON.stringify(out)}`);
+});
+
+test("小数和年份不会被当成序号", () => {
+  for (const text of [
+    "速度提升到 1.5 倍左右，效果还可以。",
+    "2026. 这一年我们做了很多事。",
+  ]) {
+    assert.equal(normalizeEnumerations(text), text, `不该改动：${text}`);
+  }
+});
+
+test("序号嵌在同一句话里（前面是逗号）不切开", () => {
+  const text = "第十条讲的是缓存，第十一条讲的是并发。";
+  assert.equal(normalizeEnumerations(text), text, "逗号后面的序号是句子的一部分，不是列表项");
+});
+
+test("已经分好行的列举不会被重复插换行（幂等）", () => {
+  const text = "第一，甲。\n\n第二，乙。";
+  assert.equal(normalizeEnumerations(text), text);
+  assert.equal(normalizeEnumerations(normalizeEnumerations(text)), text);
+});
+
+test("findEnumerationMarkers 能给出中文序数的数值", () => {
+  const markers = findEnumerationMarkers("第三条讲缓存，第十一条讲并发。");
+  assert.deepEqual(markers.map((m) => m.ordinal), [3, 11]);
+});
+
+test("textPolish 在整理服务不可用时也做列举排版", async () => {
+  const { TextPolisher } = require("../src/platform/electron/textPolish");
+  const polisher = new TextPolisher({ dataDirectory: null, logger: null });
+  const text = "我说三件事。第一，甲。第二，乙。第三，丙。";
+  const result = await polisher.polish(text, {
+    longFormat: { enabled: true, minChars: 40, isTerminal: false },
+  });
+  assert.ok(
+    result.stages.some((stage) => stage.stage === "enumeration_format"),
+    `应记录 enumeration_format 阶段，实际 ${JSON.stringify(result.stages)}`
+  );
+  assert.equal(result.text.split(/\n+/).filter(Boolean).length, 4);
+});
+
+test("textPolish 在终端里连列举排版也不做（换行=回车）", async () => {
+  const { TextPolisher } = require("../src/platform/electron/textPolish");
+  const polisher = new TextPolisher({ dataDirectory: null, logger: null });
+  const text = "我说三件事。第一，甲。第二，乙。第三，丙。";
+  const result = await polisher.polish(text, {
+    longFormat: { enabled: true, minChars: 40, isTerminal: true },
+  });
+  assert.equal(result.text, text, "终端里绝不能插换行");
+  assert.equal(result.stages.some((stage) => stage.stage === "enumeration_format"), false);
+});
+
+test("textPolish 在窗口未知时也不排版", async () => {
+  const { TextPolisher } = require("../src/platform/electron/textPolish");
+  const polisher = new TextPolisher({ dataDirectory: null, logger: null });
+  const text = "我说三件事。第一，甲。第二，乙。第三，丙。";
+  const result = await polisher.polish(text, {
+    longFormat: { enabled: true, minChars: 40, isTerminal: null },
+  });
+  assert.equal(result.text, text);
 });

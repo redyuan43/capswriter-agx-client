@@ -461,6 +461,7 @@ const m5VoiceBridge = new M5VoiceBridge({
   databaseManager,
   asrConnectionProfiles,
   sendToRenderer: safeSendToMainWindow,
+  dataDirectory,
 });
 const m5BridgeIngress = new M5BridgeIngressManager({
   logger,
