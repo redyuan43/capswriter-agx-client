@@ -60,5 +60,32 @@ NXE = nx1
 # 实测命中 19 条全部正确、0 误伤。
 [Aa]\s+[Pp]\s+[Pp]\b = APP
 [Aa]\s+[Pp]\s+[Kk]\b = APK
-[Gg]it\s+[Hh]ub\b = GitHub
 [Aa]\s+[Gg]\s+[Xx]\b = AGX
+
+# ══════════════════════════════════════════════════════════════════════
+# 中英混排空格 + 专名规范化
+# 2026-09-20 基于 3807 条真实录音（~/Documents/CapsWriter-Voice-Dataset）回归得出。
+# 改动 762 条（20.0%），逐条核对：全部为「插入空格」或「专名写法归一」，无正文增删。
+# ══════════════════════════════════════════════════════════════════════
+
+# 专名：把 ASR 的大小写/拆分变体收敛到唯一正确写法。
+# Tailscale 实测 16 条正确 / 15 条错写，是错写率最高的专名。
+# 一条规则覆盖 tailscale(全小写) / TailScale(驼峰) / Tail Scale(拆开) / TAILSCALE(全大写)。
+[Tt][Aa][Ii][Ll]\s*[Ss][Cc][Aa][Ll][Ee] = Tailscale
+(?<![A-Za-z])tcale(?![A-Za-z]) = Tailscale
+
+# GitHub：一条覆盖 github / Github / GITHUB / Git Hub。
+# 前后必须是真的自然语言边界：排除 / . @ 与字母数字，否则会把
+# ~/github/capswriter-agx-client、https://github.com/... 这类路径与域名一起改掉。
+(?<![/.@\w])[Gg][Ii][Tt]\s*[Hh][Uu][Bb](?![/.\w]) = GitHub
+
+# 同一条边界规则：排除 - 与 _，否则会把项目名 capswriter-agx-client 改掉；
+# 排除 / 与 .，否则会把 https://agx.local 这类主机名改掉。
+(?<![/.@A-Za-z0-9_-])agx(?![./A-Za-z0-9_-]) = AGX
+(?<![/.@A-Za-z])webstick(?![./A-Za-z]) = VibeStick
+
+# 中英之间补空格：汉字与拉丁字母相邻时插入一个空格（W3C 中文排版需求的做法）。
+# 刻意不动数字：v1.0.22、第2个、192.168.31.134、18081 全部保持原样。
+# 幂等：已经带空格的写法不会被重复插入。
+([\u3400-\u4dbf\u4e00-\u9fff])([A-Za-z]) = $1 $2
+([A-Za-z])([\u3400-\u4dbf\u4e00-\u9fff]) = $1 $2
