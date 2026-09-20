@@ -76,6 +76,8 @@ class TextPolisher {
     this.seq = 0;
     this.pending = new Map();
     this.starting = null;
+    // 用于在规则条数变化时打一条日志，便于确认用户改完 hot-rule.txt 已生效
+    this.lastRuleCount = 0;
   }
 
   /** 载入规则文件；返回规则条数。 */
@@ -114,7 +116,13 @@ class TextPolisher {
     // 阶段一：自定义规则替换（hot-rule.txt）
     if (useHotRule) {
       const stageStart = Date.now();
-      const count = this.replacer.rules.length ? this.replacer.rules.length : this.loadRules();
+      // 每次都走 loadRules：内部按 mtime 判断是否需要重新读盘，未变时只多一次
+      // statSync。这样用户改完 hot-rule.txt 无需重启客户端，下一次转写即生效。
+      const count = this.loadRules();
+      if (count !== this.lastRuleCount) {
+        this.logger?.info("自定义替换规则已更新", { count, previous: this.lastRuleCount });
+        this.lastRuleCount = count;
+      }
       result.ruleCount = count;
       if (count > 0) {
         const applied = this.replacer.apply(current);

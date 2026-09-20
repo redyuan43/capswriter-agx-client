@@ -64,9 +64,14 @@ class HotRuleReplacer {
     return this.rules.length;
   }
 
-  /** 从磁盘读取；文件不存在或无有效规则时返回 0，调用方应据此跳过替换。 */
+  /**
+   * 从磁盘读取；文件不存在或无有效规则时返回 0。
+   * 已加载且文件 mtime 未变时直接复用（一次 statSync 的成本）。
+   * 读取失败（文件被编辑器临时改名、权限瞬时异常）时**保留上一次的规则**，
+   * 不清空——否则一次瞬时故障会让全部规则在本次会话内静默失效。
+   */
   loadFromFile() {
-    if (!this.filePath || !this.fs) return 0;
+    if (!this.filePath || !this.fs) return this.rules.length;
     try {
       const stat = this.fs.statSync(this.filePath);
       if (stat.mtimeMs === this.mtimeMs && this.rules.length) {
@@ -77,12 +82,12 @@ class HotRuleReplacer {
       this.mtimeMs = stat.mtimeMs;
       return count;
     } catch (error) {
-      this.logger?.debug('Hot rule file unavailable', {
+      this.logger?.debug('Hot rule file unavailable, keeping previous rules', {
         path: this.filePath,
+        kept: this.rules.length,
         error: error?.message || String(error),
       });
-      this.rules = [];
-      return 0;
+      return this.rules.length;
     }
   }
 
