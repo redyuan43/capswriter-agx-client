@@ -77,7 +77,7 @@ class HotRuleReplacer {
       this.mtimeMs = stat.mtimeMs;
       return count;
     } catch (error) {
-      this.logger?.('debug', 'Hot rule file unavailable', {
+      this.logger?.debug('Hot rule file unavailable', {
         path: this.filePath,
         error: error?.message || String(error),
       });
@@ -111,7 +111,7 @@ class HotRuleReplacer {
       } catch (err) {
         // 运行时报错（如灾难性回溯）：跳过该规则，保留当前结果
         error = err?.message || String(err);
-        this.logger?.('warn', 'Hot rule failed, skipped', {
+        this.logger?.warn('Hot rule failed, skipped', {
           index: i,
           pattern,
           error,

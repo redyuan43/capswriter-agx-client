@@ -98,7 +98,7 @@ class HotWordsStore {
     } catch (error) {
       // 文件不存在是首次运行的正常情况，不算错误
       this.entries = [];
-      this.logger?.("debug", "热词表不可用", { path: this.filePath, error: error?.message || String(error) });
+      this.logger?.debug("热词表不可用", { path: this.filePath, error: error?.message || String(error) });
       return 0;
     }
   }
@@ -147,14 +147,14 @@ class HotWordsStore {
     try {
       // 内置词表是只读模板：复制失败时 filePath 会指向它，此时禁止回写
       if (!this.filePath || this.filePath === BUNDLED_FILE) {
-        this.logger?.("warn", "热词表路径不可写，跳过持久化", { path: this.filePath });
+        this.logger?.warn("热词表路径不可写，跳过持久化", { path: this.filePath });
         return false;
       }
       const body = this.entries.map((e) => `${e.term}|${e.weight}`).join("\n") + "\n";
       this.fs.writeFileSync(this.filePath, body, "utf8");
       return true;
     } catch (error) {
-      this.logger?.("warn", "热词表写入失败", { path: this.filePath, error: error?.message || String(error) });
+      this.logger?.warn("热词表写入失败", { path: this.filePath, error: error?.message || String(error) });
       return false;
     }
   }

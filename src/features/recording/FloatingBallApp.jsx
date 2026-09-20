@@ -3300,9 +3300,15 @@ export default function FloatingBallApp() {
           .map((item) => item.trim())
           .filter(Boolean);
         if (!entries.length) {
-          logRuntime("warn", "ASR hot words list is empty", {
+          // 空表有两种性质完全不同的原因，日志里必须能分开看：
+          //   degraded 有值 —— 链路故障（例如 store 没接上），属于 bug，按 error 记
+          //   degraded 为空 —— 用户确实没配词表，属于正常，按 warn 记
+          // 历史上这两种都静默 return，所以「热词压根没生效」很久没人发现。
+          const degraded = payload?.degraded || null;
+          logRuntime(degraded ? "error" : "warn", "ASR hot words list is empty", {
             path: payload?.path || "",
-            degraded: payload?.degraded || null,
+            degraded,
+            hint: degraded ? "热词链路故障，本次录音将不带热词" : "词表为空，未启用热词",
           });
           return;
         }

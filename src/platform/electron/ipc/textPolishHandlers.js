@@ -8,7 +8,7 @@ function registerTextPolishHandlers(ctx, ipcMainImpl = ipcMain) {
     try {
       return await ctx.textPolisher.polish(text, options);
     } catch (error) {
-      ctx.logger?.("warn", "文本整理失败，已回退原文:", error?.message || error);
+      ctx.logger?.warn("文本整理失败，已回退原文:", error?.message || error);
       return {
         text: text || "",
         changed: false,

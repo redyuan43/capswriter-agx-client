@@ -83,7 +83,7 @@ class TextPolisher {
     try {
       return this.replacer.loadFromFile();
     } catch (error) {
-      this.logger?.("warn", "加载自定义替换规则失败", { error: error?.message || String(error) });
+      this.logger?.warn("加载自定义替换规则失败", { error: error?.message || String(error) });
       return 0;
     }
   }
@@ -164,7 +164,7 @@ class TextPolisher {
     this.starting = new Promise((resolve) => {
       const python = DEFAULT_PYTHON || this.findPython();
       if (!python) {
-        this.logger?.("warn", "未找到可用的 Python，标点恢复不可用");
+        this.logger?.warn("未找到可用的 Python，标点恢复不可用");
         this.starting = null;
         resolve(false);
         return;
@@ -193,7 +193,7 @@ class TextPolisher {
         });
         child.stderr.on("data", (chunk) => {
           const text = chunk.toString("utf8").trim();
-          if (text) this.logger?.("debug", "punc stderr", { line: text.slice(0, 300) });
+          if (text) this.logger?.debug("punc stderr", { line: text.slice(0, 300) });
         });
         child.on("exit", () => {
           this.child = null;
@@ -207,7 +207,7 @@ class TextPolisher {
           this.rejectAll("punc_process_exited");
         });
         child.on("error", (error) => {
-          this.logger?.("warn", "标点服务启动失败", { error: error?.message });
+          this.logger?.warn("标点服务启动失败", { error: error?.message });
           this.child = null;
           this.ready = false;
           resolve(false);
@@ -215,7 +215,7 @@ class TextPolisher {
 
         this.readyResolver = resolve;
       } catch (error) {
-        this.logger?.("warn", "标点服务启动异常", { error: error?.message });
+        this.logger?.warn("标点服务启动异常", { error: error?.message });
         this.starting = null;
         resolve(false);
       }
@@ -226,7 +226,7 @@ class TextPolisher {
   onMessage(message) {
     if (message?.type === "ready") {
       this.ready = true;
-      this.logger?.("info", "标点服务已就绪", { elapsed_ms: message.elapsed_ms });
+      this.logger?.info("标点服务已就绪", { elapsed_ms: message.elapsed_ms });
       if (this.readyResolver) {
         this.readyResolver(true);
         this.readyResolver = null;
