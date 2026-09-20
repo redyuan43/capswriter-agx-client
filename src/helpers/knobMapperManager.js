@@ -1,10 +1,16 @@
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const ENABLED_SETTING = "knob_mapper_enabled";
 const RESTART_DELAY_MS = 2000;
 const MAX_LOG_LINES = 80;
+// 自动重启上限：连续失败这么多次后彻底停手，避免日志被刷屏
+const MAX_AUTO_RESTARTS = 2;
+// 依赖探测超时
+const DEPENDENCY_PROBE_TIMEOUT_MS = 5000;
+// 进程存活不足这个时长就退出 → 视为启动失败（而非正常运行结束）
+const MIN_HEALTHY_UPTIME_MS = 3000;
 
 const VERIFIED_MAPPINGS = [
   {
@@ -75,6 +81,34 @@ class KnobMapperManager {
     this.startedAt = null;
     this.lastError = "";
     this.logs = [];
+    this.autoRestartCount = 0;
+    this.dependencyMissing = false;
+  }
+
+  /**
+   * 启动前探测 Python 依赖（knob_mapper.py 需要 PyYAML）。
+   * 缺依赖时直接不启动，避免 spawn → 崩溃 → 2 秒后重启 的无限循环刷屏。
+   */
+  checkDependencies() {
+    const python = process.env.CAPSWRITER_PYTHON || "python3";
+    try {
+      const probe = spawnSync(python, ["-c", "import yaml"], {
+        encoding: "utf8",
+        timeout: DEPENDENCY_PROBE_TIMEOUT_MS,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (probe.error) {
+        return { ok: false, error: `${python} 不可用：${probe.error.message}` };
+      }
+      if (probe.status !== 0) {
+        const stderr = String(probe.stderr || "").trim();
+        const last = stderr.split("\n").filter(Boolean).pop() || "依赖缺失";
+        return { ok: false, error: last };
+      }
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error?.message || String(error) };
+    }
   }
 
   isSupported() {
@@ -88,7 +122,9 @@ class KnobMapperManager {
   setEnabled(enabled) {
     const next = Boolean(enabled);
     this.databaseManager.setSetting(ENABLED_SETTING, next);
-    return next ? this.start({ automatic: false }) : this.stop();
+    if (!next) return this.stop();
+    this.autoRestartCount = 0; // 手动开启时重置失败计数，让重试真正生效
+    return this.start({ automatic: false });
   }
 
   getSourceDirectory() {
@@ -131,6 +167,25 @@ class KnobMapperManager {
 
     this.intentionalStop = false;
     this.lastError = "";
+
+    // 依赖预检：缺 PyYAML 直接跳过，不再 spawn（否则会崩溃重启死循环刷屏）
+    const dep = this.checkDependencies();
+    if (!dep.ok) {
+      this.dependencyMissing = true;
+      this.autoRestartCount = 0;
+      this.lastError =
+        `设备映射未启动：缺少 Python 依赖（${dep.error}）。执行 pip install pyyaml 后重启应用即可恢复。`;
+      this.appendLog(this.lastError);
+      return Promise.resolve({
+        success: false,
+        supported: true,
+        skipped: true,
+        dependencyMissing: true,
+        error: this.lastError,
+      });
+    }
+    this.dependencyMissing = false;
+
     let configPath;
     try {
       configPath = this.ensureRuntimeConfig();
@@ -152,6 +207,7 @@ class KnobMapperManager {
       });
       this.child = child;
       this.startedAt = new Date().toISOString();
+      const spawnedAt = Date.now();
 
       child.stdout.on("data", (chunk) => this.appendLog(chunk));
       child.stderr.on("data", (chunk) => {
@@ -173,9 +229,18 @@ class KnobMapperManager {
         }
       });
       child.once("close", (code, signal) => {
-        this.appendLog(`Knob mapper exited: code=${code} signal=${signal || "none"}`);
+        const uptime = Date.now() - spawnedAt;
+        this.appendLog(
+          `Knob mapper exited: code=${code} signal=${signal || "none"} uptime=${uptime}ms`
+        );
         if (this.child === child) this.child = null;
         if (!this.intentionalStop && this.isEnabled()) {
+          // 秒退说明根本没起来（依赖缺失/配置错误）；跑满 MIN_HEALTHY_UPTIME_MS 才算正常退出
+          if (uptime < MIN_HEALTHY_UPTIME_MS) {
+            this.autoRestartCount += 1;
+          } else {
+            this.autoRestartCount = 0;
+          }
           this.scheduleRestart();
         }
       });
@@ -188,6 +253,13 @@ class KnobMapperManager {
 
   scheduleRestart() {
     if (this.restartTimer || this.intentionalStop) return;
+    if (this.dependencyMissing) return;
+    if (this.autoRestartCount > MAX_AUTO_RESTARTS) {
+      this.appendLog(
+        `设备映射连续启动失败 ${this.autoRestartCount} 次，已停止自动重启（可在设置中手动重试）`
+      );
+      return;
+    }
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
       this.start({ automatic: true }).catch((error) => {
@@ -265,6 +337,8 @@ class KnobMapperManager {
       supported: this.isSupported(),
       enabled: this.isEnabled(),
       running: this.isRunning(),
+      dependencyMissing: this.dependencyMissing,
+      autoRestartCount: this.autoRestartCount,
       pid: this.child?.pid || null,
       startedAt: this.startedAt,
       lastError: this.lastError,
