@@ -200,12 +200,19 @@ class TextPolisher {
   /**
    * 决定是否值得为这段文本做长文本整理。
    *
-   * 两道否决：
+   * 三道否决：
    *   - 终端场景：整理会插换行，而终端里换行 = 回车执行命令，必须避让
+   *   - 窗口未知：读不到目标窗口信息时**也必须跳过**。整理是危险动作，
+   *     判不出来就不能做——宁可这次不排版，也不能赌它不是终端。
+   *     （2026-09-20 端到端回放发现原来的实现是反的：读不到窗口照样排版）
    *   - 太短：一两句话不需要分段，白等一次推理
+   *
+   * isTerminal 是三态：true=是终端，false=确认不是终端，null/undefined=未知。
+   * 只有明确为 false 才整理。
    */
-  shouldRunLongFormat(text, { minChars = 40, isTerminal = false } = {}) {
-    if (isTerminal) return { run: false, reason: "terminal" };
+  shouldRunLongFormat(text, { minChars = 40, isTerminal = null } = {}) {
+    if (isTerminal === true) return { run: false, reason: "terminal" };
+    if (isTerminal !== false) return { run: false, reason: "unknown_window" };
     const contentChars = String(text || "").replace(/[\s\p{P}\p{S}]/gu, "").length;
     if (contentChars < minChars) return { run: false, reason: "below_min_chars" };
     return { run: true, reason: null, contentChars };

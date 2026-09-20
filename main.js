@@ -1210,6 +1210,25 @@ app.whenReady().then(async () => {
   }).catch((error) => {
     logger.warn('Realtime ASR proxy resolution failed', error?.message || error);
   });
+
+  // 长文本整理服务预热。放在这里而不是第一次转写时：模型冷启动实测 3.1 秒，
+  // 而请求超时只给了 5 秒——冷启动占掉大半个预算，机器一忙就会在用户
+  // 第一次长口述时超时回退。预热把这段等待挪到开机阶段。
+  // 不 await：预热失败（ollama 没装/没起）不能影响客户端启动。
+  if (textPolisher.longFormatter) {
+    textPolisher.longFormatter
+      .probe()
+      .then((probed) => {
+        if (!probed.available) {
+          logger.warn('长文本整理服务不可用，本次运行将跳过整理', probed);
+          return null;
+        }
+        return textPolisher.longFormatter.warmup();
+      })
+      .catch((error) => {
+        logger.warn('长文本整理预热异常', error?.message || String(error));
+      });
+  }
 });
 
 app.on("window-all-closed", () => {

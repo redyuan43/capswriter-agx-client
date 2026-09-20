@@ -24,6 +24,12 @@ const DEFAULT_MODEL = "qwen2.5:3b";
 // 宁可回退原文。这个值是上限而不是预期。
 const DEFAULT_TIMEOUT_MS = 5000;
 
+// ollama 默认只把模型驻留 5 分钟。口述之间隔几分钟是很正常的事，
+// 那样每次都要重新加载（实测冷启动 3.1 秒 vs 稳态 1.3 秒），
+// 3 秒的等待会落在"说完话等粘贴"这段最敏感的时间上。
+// 驻留 30 分钟的代价是占住约 2.5GB 显存。
+const DEFAULT_KEEP_ALIVE = "30m";
+
 // 去掉标点空白后，输出/原文的长度比允许区间。
 // 下界：删填充词会变短，但不该短到 70% 以下（那基本是"总结"了）。
 // 上界：稍有增补（补标点、拆句号）可接受，但超过 15% 就是加戏。
@@ -46,18 +52,29 @@ const BIGRAM_STRICT_MIN_CHARS = 80;
 // 模型偶尔会自作主张加这类前缀，统一剥掉。
 const LEADING_NOISE = /^\s*(?:整理后|整理结果|输出|结果|以下是整理后的文本)[:：\s]*/;
 
+// 只有断在这些符号后面的换行才算真分段。模型（尤其 3B）经常在逗号处
+// 硬换行，把一句话切成好几行——那不是分段，是噪声，得并回去。
+const SENTENCE_END = /[。！？!?…][”"』」）)】]*$/;
+
+// 中文标点前后不该有空格。模型在英文词后面接中文标点时爱加一个空格，
+// 真实回放里出现过"知道了 sessionID ，其实"这种输出。
+const SPACE_BEFORE_PUNCT = /\s+([，。！？；：、）】」』”’])/g;
+const SPACE_AFTER_OPEN = /([（【「『“‘])\s+/g;
+
 /**
  * prompt 刻意写得短。
  * 实测教训：给 Qwen3-4B 一份"角色 + 四条规则 + 五条禁止"的长 prompt，
  * 它会把要求本身当成待分析文本复述一遍。小模型对**简短指令 + 示例**
  * 的遵循度，明显高于对长规则清单的遵循度。
+ *
+ * "只在一句话讲完后换行"这句是 2026-09-20 端到端回放后补的：真实长句里
+ * 模型会在一句话中间换行，光靠"按意思分段"约束不住。
  */
-const PROMPT_TEMPLATE = `把下面这段语音转写整理一下：删掉"呃、嗯、那个、就是说"这类口头语，改掉明显的错别字，按意思分段。其余一个字都不要改。不要总结，不要解释。
+const PROMPT_TEMPLATE = `把下面这段语音转写整理一下：删掉"呃、嗯、那个、就是说"这类口头语，改掉明显的错别字，按意思分成几段。只在一句话讲完后换行，不要在一句话中间换行。其余一个字都不要改。不要总结，不要解释。
 
 示例：
 原文：然后那个，我觉得这个方案可以。呃，但是第二个问题就是说它太慢了。
 整理后：我觉得这个方案可以。
-
 但是第二个问题，它太慢了。
 
 下面这段照上面的做法整理：
@@ -85,11 +102,12 @@ function bigramCoverage(strippedOriginal, strippedFormatted) {
 }
 
 class LongTextFormatter {
-  constructor({ endpoint, model, logger = null, timeoutMs } = {}) {
+  constructor({ endpoint, model, logger = null, timeoutMs, keepAlive } = {}) {
     this.endpoint = String(endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
     this.model = String(model || DEFAULT_MODEL);
     this.logger = logger;
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : DEFAULT_TIMEOUT_MS;
+    this.keepAlive = keepAlive || DEFAULT_KEEP_ALIVE;
     this.available = null; // null=未探测, true/false=上次探测结果
   }
 
@@ -104,6 +122,44 @@ class LongTextFormatter {
     if (fence) out = fence[1].trim();
     out = out.replace(LEADING_NOISE, "");
     return out.trim();
+  }
+
+  /**
+   * 把模型输出的换行规整成"像人写的段落"。
+   *
+   * 两步，都是确定性规则，不靠模型自觉：
+   *   1. 丢空行、统一换行符
+   *   2. 上一行没断在句末标点 → 说明是在逗号处硬换行，并回上一段
+   *
+   * 为什么不能让模型自己来：真实回放里同一条 prompt，模型既会 222 字
+   * 一段不分，也会把 135 字切成 6 行、每行断在逗号上。规则兜底之后
+   * 至少不会出现"一句话被切成三行"这种明显劣化。
+   *
+   * 刻意**不做**"短段落合并"：试过按字数往后并，结果把两句话的短文本
+   * 并回成一段，分段能力整个失效。逗号硬换行才是真问题，第二步已经解决。
+   */
+  normalizeParagraphs(text) {
+    const lines = String(text || "")
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const merged = [];
+    for (const line of lines) {
+      const prev = merged[merged.length - 1];
+      if (prev !== undefined && !SENTENCE_END.test(prev)) {
+        // 中英混排时，两个 ASCII 词之间补一个空格，避免粘成一个词
+        const needsSpace = /[A-Za-z0-9]$/.test(prev) && /^[A-Za-z0-9]/.test(line);
+        merged[merged.length - 1] = needsSpace ? `${prev} ${line}` : `${prev}${line}`;
+      } else {
+        merged.push(line);
+      }
+    }
+    return merged
+      .join("\n")
+      .replace(SPACE_BEFORE_PUNCT, "$1")
+      .replace(SPACE_AFTER_OPEN, "$1");
   }
 
   /**
@@ -176,6 +232,8 @@ class LongTextFormatter {
           model: this.model,
           messages: [{ role: "user", content: "你好" }],
           stream: false,
+          // 预热请求也要带 keep_alive，否则加载完 5 分钟就又被卸掉
+          keep_alive: this.keepAlive,
           options: { num_predict: 1 },
         }),
       }, 120000);
@@ -218,6 +276,7 @@ class LongTextFormatter {
           model: this.model,
           messages: [{ role: "user", content: this.buildPrompt(original) }],
           stream: false,
+          keep_alive: this.keepAlive,
           // 刻意不传 think：目标模型（Qwen2.5）架构上就没有思考模式，
           // 传 think:false 反而在 Qwen3 上实测出过"思考内容污染正文"的问题。
           options: { temperature: 0.2, num_predict: Math.max(256, original.length * 2) },
@@ -238,7 +297,7 @@ class LongTextFormatter {
       // /api/chat 的思考内容在 message.thinking，正文在 message.content；
       // think:false 时 thinking 应为空，这里只取 content 以防万一。
       const raw = data?.message?.content ?? "";
-      const cleaned = this.stripNoise(raw);
+      const cleaned = this.normalizeParagraphs(this.stripNoise(raw));
 
       if (!cleaned) {
         return {

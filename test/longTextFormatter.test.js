@@ -170,6 +170,21 @@ test("shouldRunLongFormat 对长句放行，且字符数不计标点", () => {
   assert.ok(decision.contentChars < longText.length, "标点不该计入字数");
 });
 
+test("shouldRunLongFormat 在窗口未知时也拒绝——整理是危险动作，判不出来就不能做", () => {
+  // 2026-09-20 端到端回放抓到的方向性错误：原来读不到窗口就返回 false
+  // （= 不是终端），于是照样排版。终端里换行等于回车执行，代价太大。
+  const { TextPolisher } = require("../src/platform/electron/textPolish");
+  const polisher = new TextPolisher({ dataDirectory: null, logger: null });
+  const longText = "这".repeat(200);
+  for (const isTerminal of [undefined, null]) {
+    const decision = polisher.shouldRunLongFormat(longText, { isTerminal, minChars: 40 });
+    assert.equal(decision.run, false, `isTerminal=${isTerminal} 时不该整理`);
+    assert.equal(decision.reason, "unknown_window");
+  }
+  // 不传 isTerminal 整体也不能放行
+  assert.equal(polisher.shouldRunLongFormat(longText, { minChars: 40 }).run, false);
+});
+
 /* ------------------------------------------------------------------ *
  * 输出清洗——模型偶尔会加围栏或前缀
  * ------------------------------------------------------------------ */
@@ -188,6 +203,71 @@ test("stripNoise 剥掉模型自加的前缀", () => {
 test("stripNoise 对干净输入不做改动", () => {
   const f = makeFormatter();
   assert.equal(f.stripNoise("  我觉得这个方案可以。  "), "我觉得这个方案可以。");
+});
+
+/* ------------------------------------------------------------------ *
+ * 段落规整——模型会在逗号处硬换行，那是噪声不是分段
+ * ------------------------------------------------------------------ */
+
+test("normalizeParagraphs 把断在逗号上的换行并回上一段", () => {
+  // 真实回放的输出：135 字被切成 6 行，每行断在逗号上
+  const f = makeFormatter();
+  const messy = [
+    "把下指令实现了，",
+    "就是既然知道了sessionID，其实就可以用 Codex ACP 继续给这个对话下指令。",
+    "所以说下面可以增加一个对话框，",
+    "可以增加一个输入按钮，",
+    "实现在 Checkbox 的session context 里面就能继续的发指令。",
+  ].join("\n");
+  const out = f.normalizeParagraphs(messy);
+  const lines = out.split("\n");
+  assert.equal(lines.length, 2, `应并成 2 段，实际 ${lines.length} 段：${JSON.stringify(lines)}`);
+  assert.ok(lines[0].endsWith("。"));
+  assert.ok(lines[1].endsWith("。"));
+  // 内容不能丢
+  assert.ok(out.includes("把下指令实现了，就是既然知道了sessionID"));
+});
+
+test("normalizeParagraphs 保留按句号分好的段落", () => {
+  const f = makeFormatter();
+  const tidy = "我要实现对电脑进行 web coding，但是我的耳机是连在手机上的。\n然后我释放按键的时候，它就能把录音传到我指定的服务器上进行解码。";
+  const out = f.normalizeParagraphs(tidy);
+  assert.equal(out.split("\n").length, 2, "本来就是好段落，不该被改动");
+  assert.equal(out, tidy);
+});
+
+test("normalizeParagraphs 丢掉模型多打的空行", () => {
+  const f = makeFormatter();
+  const out = f.normalizeParagraphs("第一句话在这里。\n\n\n第二句话在这里。\n\n");
+  assert.equal(out, "第一句话在这里。\n第二句话在这里。");
+});
+
+test("normalizeParagraphs 单段文本原样返回", () => {
+  const f = makeFormatter();
+  const single = "这句话没有换行也没有句末标点";
+  assert.equal(f.normalizeParagraphs(single), single);
+});
+
+test("normalizeParagraphs 中英混排相邻时补空格，纯中文不补", () => {
+  const f = makeFormatter();
+  assert.equal(f.normalizeParagraphs("使用 Codex\nACP 继续。"), "使用 Codex ACP 继续。");
+  assert.equal(f.normalizeParagraphs("使用这个，\n继续。"), "使用这个，继续。");
+});
+
+test("normalizeParagraphs 句末标点带引号/括号也算断句", () => {
+  const f = makeFormatter();
+  const out = f.normalizeParagraphs("他说“可以了。”\n那就这样办。");
+  assert.equal(out.split("\n").length, 2, "引号结尾仍算句末");
+});
+
+test("normalizeParagraphs 去掉中文标点前后的多余空格", () => {
+  // 真实回放输出：知道了 sessionID ，其实
+  const f = makeFormatter();
+  assert.equal(
+    f.normalizeParagraphs("就是既然知道了 sessionID ，其实就可以继续。"),
+    "就是既然知道了 sessionID，其实就可以继续。"
+  );
+  assert.equal(f.normalizeParagraphs("参考（ 见上文 ）即可。"), "参考（见上文）即可。");
 });
 
 /* ------------------------------------------------------------------ *
@@ -272,13 +352,14 @@ test("format 空输入直接返回，不发起请求", async () => {
   }
 });
 
-test("format 成功时返回整理结果", async () => {
+test("format 成功时返回整理结果（含段落规整）", async () => {
   const f = makeFormatter();
-  const polished = "我觉得这个方案可以。\n\n但是它太慢了。";
-  const restore = stubFetch(async () => jsonResponse({ message: { content: polished } }));
+  // 模型给的是"句号后接两行、行尾逗号"的毛坯，返回前应被规整
+  const rawFromModel = "我觉得这个方案可以，\n但是它太慢了。";
+  const restore = stubFetch(async () => jsonResponse({ message: { content: rawFromModel } }));
   try {
     const result = await f.format(SAMPLE);
-    assert.equal(result.text, polished);
+    assert.equal(result.text, "我觉得这个方案可以，但是它太慢了。");
     assert.equal(result.changed, true);
     assert.equal(result.degraded, null);
   } finally {
@@ -293,6 +374,57 @@ test("format 在模型原样返回时不标记 changed", async () => {
     const result = await f.format(SAMPLE);
     assert.equal(result.changed, false, "没变化就不该报告变化");
     assert.equal(result.degraded, null, "没变化不算降级");
+  } finally {
+    restore();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 驻留与预热——冷启动 3.1s 会吃掉 5s 超时的大半
+ * ------------------------------------------------------------------ */
+
+test("format 请求带 keep_alive，避免每次口述都重新加载模型", async () => {
+  const f = makeFormatter();
+  let body = null;
+  const restore = stubFetch(async (_url, init) => {
+    body = JSON.parse(init.body);
+    return jsonResponse({ message: { content: SAMPLE } });
+  });
+  try {
+    await f.format(SAMPLE);
+    assert.equal(body.keep_alive, "30m", "不带 keep_alive 就退回 ollama 默认的 5 分钟");
+  } finally {
+    restore();
+  }
+});
+
+test("format 请求不带 think 参数（Qwen3 会因此把思考倒进正文）", async () => {
+  const f = makeFormatter();
+  let body = null;
+  const restore = stubFetch(async (_url, init) => {
+    body = JSON.parse(init.body);
+    return jsonResponse({ message: { content: SAMPLE } });
+  });
+  try {
+    await f.format(SAMPLE);
+    assert.ok(!("think" in body), "传 think 会触发 Qwen3 的异常模式");
+  } finally {
+    restore();
+  }
+});
+
+test("warmup 也带 keep_alive，否则刚加载完 5 分钟又被卸掉", async () => {
+  const f = makeFormatter();
+  let body = null;
+  const restore = stubFetch(async (_url, init) => {
+    body = JSON.parse(init.body);
+    return jsonResponse({ done: true });
+  });
+  try {
+    const result = await f.warmup();
+    assert.equal(result.ok, true);
+    assert.equal(body.keep_alive, "30m");
+    assert.equal(body.options.num_predict, 1, "预热不该生成正文");
   } finally {
     restore();
   }
