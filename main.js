@@ -438,14 +438,24 @@ const asrConnectionProfiles = new AsrConnectionProfiles({
 clipboardManager.setDatabaseManager(databaseManager);
 const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.getPath("documents"), logger });
 // 长文本整理（去口水词 + 修错别字 + 接回被误断的句子 + 分段）。
-// 默认走 AMD 上的 Qwen3.8-Flash-Next（OpenAI 兼容端点）。
-// 为什么不用本机小模型：qwen2.5:3b 只会把 ASR 的句号机械换成换行
-// （183 字 → 7~9 行），且在中英混排长文本上会崩成逐词加空格。
-// 详见 src/helpers/longTextFormatter.js 顶部的实测记录。
+// 主力后端 = 本机 ollama 的 qwen2.5:7b（3060，2026-09-21 原哥拍板切换：
+// "如果 7B 能解决，就不需要 AMD 了"）。7B 实测：延迟 0.7~2.5s、保真 7/8
+// PASS；短板是不分段、会吞逗号问号，但不依赖一台经常整晚挂掉的远程机器
+// （2026-09-20 晚 AMD 连挂一整晚，用户看到的"标点断句一塌糊涂"就是没整理
+// 的原文）。
+// 历史选型：3B 只会把句号机械换行且中英混排崩成逐词加空格（v1.0.24/25）；
+// AMD 27B 质量最好（v1.0.26~29）但可用性差，现降级为 env 可选。
+// CAPS_LONG_TEXT_PROVIDER=openai 切回 AMD；CAPS_LONG_TEXT_FALLBACK=openai
+// 可给 7B 挂 AMD 反向兜底（默认不挂）。超时 30s：容忍 7B 冷启动 ~25s。
 const longTextFormatter = new LongTextFormatter({
-  provider: process.env.CAPS_LONG_TEXT_PROVIDER || undefined,
+  provider: process.env.CAPS_LONG_TEXT_PROVIDER || "ollama",
   endpoint: process.env.CAPS_LONG_TEXT_ENDPOINT || undefined,
   model: process.env.CAPS_LONG_TEXT_MODEL || undefined,
+  timeoutMs: Number(process.env.CAPS_LONG_TEXT_TIMEOUT) || 30000,
+  keepAlive: "2h",
+  fallback: process.env.CAPS_LONG_TEXT_FALLBACK === "openai"
+    ? { provider: "openai" }
+    : null,
   logger,
 });
 const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter });

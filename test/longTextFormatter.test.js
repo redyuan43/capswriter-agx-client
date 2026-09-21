@@ -480,15 +480,16 @@ test("warmup 在 ollama 下带 keep_alive，否则刚加载完 5 分钟又被卸
 });
 
 /* ------------------------------------------------------------------ *
- * AMD（openai 兼容）路径——线上默认后端
+ * 默认后端——2026-09-21 起切到本机 ollama 7B（原哥拍板）
  * ------------------------------------------------------------------ */
 
-test("默认后端是 AMD 的 openai 端点", () => {
-  assert.equal(DEFAULT_PROVIDER, "openai");
-  assert.ok(PROVIDERS.openai.defaultEndpoint.startsWith("http"), "得有默认端点");
+test("默认后端是本机 ollama 的 7B", () => {
+  assert.equal(DEFAULT_PROVIDER, "ollama");
+  assert.ok(PROVIDERS.ollama.defaultEndpoint.startsWith("http"), "得有默认端点");
   const f = new LongTextFormatter({ logger: null });
-  assert.equal(f.provider, "openai");
-  assert.ok(f.endpoint.includes("18106"), "默认应指向 AMD 网关");
+  assert.equal(f.provider, "ollama");
+  assert.equal(f.model, "qwen2.5:7b-instruct-q4_K_M", "默认模型必须是 7B，别退回 3B");
+  assert.ok(f.endpoint.includes("11434"), "默认应指向本机 ollama");
 });
 
 test("openai 路径打 /chat/completions，用 max_tokens 而不是 num_predict", async () => {
@@ -686,4 +687,137 @@ test("textPolish 在窗口未知时也不排版", async () => {
     longFormat: { enabled: true, minChars: 40, isTerminal: null },
   });
   assert.equal(result.text, text);
+});
+
+/* ------------------------------------------------------------------ *
+ * 兜底后端（fallback）——主后端不可用时不让整理整体失效
+ * 2026-09-20 晚 AMD 连挂一整晚，长文本整理退化为原文（用户抱怨的
+ * "标点断句一塌糊涂"）。本机 ollama 7B 实测延迟 0.7~2.5s、保真 7/8
+ * PASS，足以兜底；但不分段、吞标点，不配当默认后端。
+ * ------------------------------------------------------------------ */
+
+test("主后端连不上时切到兜底后端，结果标记 backend=fallback", async () => {
+  let fallbackCalled = false;
+  const restore = stubFetch((url) => {
+    if (String(url).startsWith("http://amd.test/")) {
+      return Promise.reject(new Error("ECONNREFUSED"));
+    }
+    fallbackCalled = true;
+    return Promise.resolve(
+      jsonResponse({ message: { content: "然后我觉得这个方案可以，但是它太慢了。" } })
+    );
+  });
+  const f = new LongTextFormatter({
+    provider: "openai",
+    endpoint: "http://amd.test/v1",
+    model: "test-model",
+    fallback: { provider: "ollama", endpoint: "http://local.test", model: "qwen2.5:7b-instruct-q4_K_M" },
+  });
+  const r = await f.format(SAMPLE);
+  restore();
+  assert.equal(fallbackCalled, true, "兜底后端应被调用");
+  assert.equal(r.backend, "fallback");
+  assert.equal(r.changed, true);
+  assert.equal(r.degraded, null, "兜底成功就不是失败");
+  assert.ok(r.primary_degraded, "应记录主后端失败原因");
+});
+
+test("主后端正常时兜底不被触发", async () => {
+  let fallbackCalled = false;
+  const restore = stubFetch((url) => {
+    if (String(url).startsWith("http://amd.test/")) {
+      return Promise.resolve(
+        jsonResponse({ choices: [{ message: { content: "然后我觉得这个方案可以，但是它太慢了。" } }] })
+      );
+    }
+    fallbackCalled = true;
+    return Promise.resolve(jsonResponse({ message: { content: "x" } }));
+  });
+  const f = new LongTextFormatter({
+    provider: "openai",
+    endpoint: "http://amd.test/v1",
+    model: "test-model",
+    fallback: { provider: "ollama", endpoint: "http://local.test", model: "m7" },
+  });
+  const r = await f.format(SAMPLE);
+  restore();
+  assert.equal(fallbackCalled, false, "主后端活着就不该麻烦兜底");
+  assert.equal(r.backend, undefined);
+  assert.equal(r.changed, true);
+});
+
+test("保真校验失败不切兜底（主后端活着，换模型是双倍延迟赌运气）", async () => {
+  let fallbackCalled = false;
+  const restore = stubFetch((url) => {
+    if (String(url).startsWith("http://amd.test/")) {
+      // 同义改写：长度比还行，双字组覆盖率崩 → fidelity:rewritten
+      return Promise.resolve(
+        jsonResponse({ choices: [{ message: { content: "我认为此方案速度欠佳。" } }] })
+      );
+    }
+    fallbackCalled = true;
+    return Promise.resolve(jsonResponse({ message: { content: "x" } }));
+  });
+  const f = new LongTextFormatter({
+    provider: "openai",
+    endpoint: "http://amd.test/v1",
+    model: "test-model",
+    fallback: { provider: "ollama", endpoint: "http://local.test", model: "m7" },
+  });
+  const r = await f.format(SAMPLE);
+  restore();
+  assert.equal(fallbackCalled, false, "保真失败不该触发兜底");
+  assert.ok(String(r.degraded).startsWith("fidelity:"), "实际 degraded：" + r.degraded);
+});
+
+test("兜底也失败时返回主失败信息并附 fallback_degraded", async () => {
+  const restore = stubFetch((url) => {
+    if (String(url).startsWith("http://amd.test/")) {
+      return Promise.reject(new Error("ECONNREFUSED"));
+    }
+    return Promise.resolve(jsonResponse({ message: { content: "   " } }));
+  });
+  const f = new LongTextFormatter({
+    provider: "openai",
+    endpoint: "http://amd.test/v1",
+    model: "test-model",
+    fallback: { provider: "ollama", endpoint: "http://local.test", model: "m7" },
+  });
+  const r = await f.format(SAMPLE);
+  restore();
+  assert.equal(r.changed, false);
+  assert.equal(r.degraded, "ECONNREFUSED", "实际：" + r.degraded);
+  assert.equal(r.fallback_degraded, "empty_response");
+  assert.equal(r.text, SAMPLE);
+});
+
+test("兜底配置对象会被展开成实例，使用兜底专用超时且不再嵌套", () => {
+  const f = new LongTextFormatter({
+    provider: "openai",
+    fallback: { provider: "ollama", model: "m7" },
+  });
+  assert.ok(f.fallback instanceof LongTextFormatter);
+  assert.equal(f.fallback.provider, "ollama");
+  assert.equal(f.fallback.model, "m7");
+  assert.equal(f.fallback.timeoutMs, 35000, "兜底冷启动 ~25s，超时必须放宽");
+  assert.equal(f.fallback.keepAlive, "2h");
+  assert.equal(f.fallback.fallback, null, "备胎不能再有备胎");
+});
+
+test("warmup 会同时预热主后端与兜底后端", async () => {
+  const hits = [];
+  const restore = stubFetch((url) => {
+    hits.push(String(url));
+    return Promise.resolve(jsonResponse({ choices: [{ message: { content: "好" } }] }));
+  });
+  const f = new LongTextFormatter({
+    provider: "openai",
+    endpoint: "http://amd.test/v1",
+    model: "test-model",
+    fallback: { provider: "ollama", endpoint: "http://local.test", model: "m7" },
+  });
+  await f.warmup();
+  restore();
+  assert.ok(hits.some((u) => u.startsWith("http://amd.test/")), "主后端应被预热");
+  assert.ok(hits.some((u) => u.startsWith("http://local.test/")), "兜底后端应被预热");
 });

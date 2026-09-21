@@ -32,10 +32,23 @@
  *   3/3 输出一致、把 ASR 误断的句子正确接回、分成 3 段、保真校验 PASS。
  *   代价是延迟 2.2~3.4 秒（本机 3B 约 1.0 秒）且依赖 AMD 在线。
  *
+ * 2026-09-21 实测 qwen2.5:7b-instruct-q4_K_M（本机 3060，3827 条语料里挑的
+ * 8 条真实长口述）：
+ *   - 延迟 0.7~2.5s（预热后），与 AMD 27B 同量级，比 3B 快版本强
+ *   - 保真校验 7/8 PASS（1 条中英混排 space_garbage 被第三道关拦下，回退正确）
+ *   - 但**分段能力仍然为零**（8 条全 1 段，27B 能分 3~4 段）、
+ *     **会吞逗号/问号**（"第一，怎么样？"→"第一怎么样"，会连带废掉
+ *     normalizeEnumerations 的列举排版）、同一条输入两次输出不一致（3B 同款）
+ *   结论：7B 不足以当默认后端，但远好于"AMD 挂了直接退原文"——
+ *   所以做成 fallback：主后端连不上/超时/空响应时用 7B 兜底。
+ *
  * 两个 provider 都是 HTTP 接口，差别只在请求/响应形状：
- *   openai —— AMD 网关 18106，OpenAI 兼容
- *   ollama —— 本机 11434，原生 API（保留作可切换的备选）
- * 用 CAPS_LONG_TEXT_PROVIDER 切换，默认 openai。
+ *   ollama —— 本机 11434，原生 API（**默认主力**，qwen2.5:7b-instruct-q4_K_M）
+ *   openai —— AMD 网关 18106，OpenAI 兼容（CAPS_LONG_TEXT_PROVIDER=openai 可切）
+ * 默认后端沿革：v1.0.24/25 本机 3B → v1.0.26~29 AMD 27B（3B/7B 分段不行）→
+ * v1.0.30 本机 7B（原哥拍板：7B 能解决就不需要 AMD；27B 质量更好但 AMD
+ * 经常整晚挂掉，2026-09-20 晚挂一整晚导致整理整体失效）。
+ * fallback 机制保留（构造参数可挂任意备用后端），默认不挂。
  */
 const PROVIDERS = {
   openai: {
@@ -57,7 +70,7 @@ const PROVIDERS = {
   },
   ollama: {
     defaultEndpoint: "http://127.0.0.1:11434",
-    defaultModel: "qwen2.5:3b",
+    defaultModel: "qwen2.5:7b-instruct-q4_K_M",
     chatPath: "/api/chat",
     modelsPath: "/api/tags",
     listModels: (data) => (data?.models || []).map((m) => String(m?.name || "")),
@@ -75,7 +88,11 @@ const PROVIDERS = {
   },
 };
 
-const DEFAULT_PROVIDER = "openai";
+// 2026-09-21 原哥拍板：主力后端切本机 7B（"如果 7B 能解决，就不需要 AMD 了"）。
+// AMD 降级为可选后端：CAPS_LONG_TEXT_PROVIDER=openai 可切回。
+// 切换依据（8 条真实长口述实测）：7B 分段能力弱于 27B、会吞逗号问号，
+// 但延迟同量级（0.7~2.5s）、保真 7/8 PASS，且不依赖一台经常挂的远程机器。
+const DEFAULT_PROVIDER = "ollama";
 
 // AMD 实测 2.2~3.4 秒（含跨 Tailscale 的往返）。超时留到 8 秒：
 // 这是"不能让用户干等"的上限，不是预期值 —— 正常 2~3 秒就回来了。
@@ -92,6 +109,12 @@ const DEFAULT_KEEP_ALIVE = "30m";
 // 上界：稍有增补（补标点、拆句号）可接受，但超过 15% 就是加戏。
 const MIN_RATIO = 0.7;
 const MAX_RATIO = 1.15;
+
+// 兜底后端（本机 ollama 7B）专用。模型常驻靠 keep_alive + 启动预热；但 ollama
+// 重启或闲置卸载后冷启动实测 ~25s，超时必须放宽——兜底场景里"慢"总比"整理失败
+// 退回原文"强（原文 = 用户抱怨的"标点断句一塌糊涂"）。
+const FALLBACK_TIMEOUT_MS = 35000;
+const FALLBACK_KEEP_ALIVE = "2h";
 
 // 双字组覆盖率：输出里有多少比例的双字组在原文中出现过。
 // 长度比抓不住"等长改写"——实测把"交互界面还是有问题"写成"交互存在问题"，
@@ -325,7 +348,7 @@ function bigramCoverage(strippedOriginal, strippedFormatted) {
 }
 
 class LongTextFormatter {
-  constructor({ provider, endpoint, model, logger = null, timeoutMs, keepAlive } = {}) {
+  constructor({ provider, endpoint, model, logger = null, timeoutMs, keepAlive, fallback } = {}) {
     const providerKey = PROVIDERS[provider] ? provider : DEFAULT_PROVIDER;
     this.api = PROVIDERS[providerKey];
     this.provider = providerKey;
@@ -335,6 +358,24 @@ class LongTextFormatter {
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : DEFAULT_TIMEOUT_MS;
     this.keepAlive = keepAlive || DEFAULT_KEEP_ALIVE;
     this.available = null; // null=未探测, true/false=上次探测结果
+    // 本机兜底后端：主后端"连不上/超时/HTTP 错误/空响应"时再试一次，避免
+    // "AMD 一挂，长文本整理整体失效"（2026-09-20 晚实测挂了一整晚，用户看到的
+    // "标点断句一塌糊涂"其实就是没整理的原文）。传实例直接用；传配置对象就地
+    // 构造；备胎内部不再嵌套 fallback（防无限链）。传 null/省略 = 无兜底。
+    if (fallback && typeof fallback === "object" && typeof fallback.format === "function") {
+      this.fallback = fallback;
+    } else if (fallback && typeof fallback === "object") {
+      this.fallback = new LongTextFormatter({
+        provider: fallback.provider,
+        endpoint: fallback.endpoint,
+        model: fallback.model,
+        timeoutMs: Number(fallback.timeoutMs) > 0 ? Number(fallback.timeoutMs) : FALLBACK_TIMEOUT_MS,
+        keepAlive: fallback.keepAlive || FALLBACK_KEEP_ALIVE,
+        logger,
+      });
+    } else {
+      this.fallback = null;
+    }
   }
 
   buildPrompt(text) {
@@ -465,6 +506,20 @@ class LongTextFormatter {
    * 免得第一次长口述才发现服务不通。失败不影响启动。
    */
   async warmup() {
+    const primary = await this._warmupOnce();
+    // 兜底后端一起预热：把 7B 拉进显存常驻（keep_alive 2h），别等第一次
+    // failover 才付 25 秒冷启动。兜底预热失败不影响主流程。
+    if (this.fallback) {
+      try {
+        await this.fallback.warmup();
+      } catch {
+        // 兜底预热失败只影响下次 failover 的首请求延迟，不阻断启动
+      }
+    }
+    return primary;
+  }
+
+  async _warmupOnce() {
     const started = Date.now();
     try {
       const response = await this.fetchWithTimeout(`${this.endpoint}${this.api.chatPath}`, {
@@ -534,12 +589,12 @@ class LongTextFormatter {
 
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
-        return {
+        return this._tryFallback(original, {
           text: original,
           changed: false,
           elapsed_ms: Date.now() - started,
           degraded: `http_${response.status}${detail ? `:${detail.slice(0, 120)}` : ""}`,
-        };
+        });
       }
 
       const data = await response.json();
@@ -548,22 +603,22 @@ class LongTextFormatter {
       // 内容，说明 token 被思考吃掉、答案根本没写出来 —— 视为失败回退原文，
       // 绝不能让空结果覆盖用户说的话。
       if (!String(raw).trim() && String(this.api.parseReasoning(data) || "").trim()) {
-        return {
+        return this._tryFallback(original, {
           text: original,
           changed: false,
           elapsed_ms: Date.now() - started,
           degraded: "reasoning_only",
-        };
+        });
       }
       const cleaned = this.normalizeParagraphs(this.stripNoise(raw));
 
       if (!cleaned) {
-        return {
+        return this._tryFallback(original, {
           text: original,
           changed: false,
           elapsed_ms: Date.now() - started,
           degraded: "empty_response",
-        };
+        });
       }
 
       if (cleaned === original.trim()) {
@@ -601,13 +656,49 @@ class LongTextFormatter {
       const message = error?.name === "AbortError"
         ? `timeout(${this.timeoutMs}ms)`
         : (error?.message || String(error));
-      return {
+      return this._tryFallback(original, {
         text: original,
         changed: false,
         elapsed_ms: Date.now() - started,
         degraded: message,
-      };
+      });
     }
+  }
+
+  /**
+   * 主后端不可用时用兜底后端再试一次。
+   *
+   * 只兜"后端不可用"：连不上、超时、HTTP 错误、空响应、思考污染——这些情况下
+   * 主后端根本没产出内容。保真校验失败**不**走兜底：那说明主后端活着且输出了
+   * 完整结果，只是内容漂移，换备胎重试是拿双倍延迟赌运气。
+   *
+   * 兜底成功 → 结果带 backend:"fallback" 与 primary_degraded（哪类失败触发的）。
+   * 兜底也失败 → 返回主后端的失败结果，附加 fallback_degraded 供诊断。
+   */
+  async _tryFallback(original, primaryResult) {
+    if (!this.fallback) return primaryResult;
+    let fb;
+    try {
+      fb = await this.fallback.format(original);
+    } catch (error) {
+      return primaryResult;
+    }
+    if (fb.changed || (fb.degraded === null && typeof fb.text === "string")) {
+      // changed=true：兜底整理出了可用结果。
+      // changed=false 且 degraded=null：兜底后端活着、判定无需改动——同样
+      // 优于"回退失败"，因为至少证明了兜底链路是通的。
+      const result = {
+        text: fb.text,
+        changed: fb.changed,
+        elapsed_ms: (primaryResult.elapsed_ms || 0) + (fb.elapsed_ms || 0),
+        degraded: null,
+        backend: "fallback",
+        primary_degraded: primaryResult.degraded,
+      };
+      if (fb.ratio !== undefined) result.ratio = fb.ratio;
+      return result;
+    }
+    return { ...primaryResult, fallback_degraded: fb.degraded };
   }
 }
 

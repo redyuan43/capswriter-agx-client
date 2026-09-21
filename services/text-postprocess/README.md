@@ -151,6 +151,43 @@ v1.0.24/25 用的是本机 ollama + Qwen2.5:3B。真实口述反馈"断句还有
 代码保留两个 provider（`openai` / `ollama`），用 `CAPS_LONG_TEXT_PROVIDER` 切换。
 AMD 不可达时回退原文并记 `degraded`，不会产生坏结果。
 
+### 默认后端切到本机 7B（v1.0.30，原哥拍板）
+
+上面的"AMD 不可达时回退原文"在 2026-09-20 晚出了事：AMD 栈连挂一整晚，
+所有长口述全部退回原文——用户看到的就是没整理的 ASR 原文（"标点断句一塌糊涂"）。
+**"质量最好的后端"挂掉时，实际体验是"质量最差的输出"**。
+
+2026-09-21 实测 qwen2.5:7b-instruct-q4_K_M（本机 3060，3827 条语料里挑的
+8 条真实长口述，预热后）：
+
+| 指标 | 7B | AMD 27B |
+|---|---|---|
+| 延迟 | 0.7–2.5s（同量级） | 2.2–3.4s |
+| 保真校验 | 7/8 PASS（1 条中英混排 space_garbage 被第三道关拦下，回退正确） | PASS |
+| 分段 | **8 条全 1 段**（分段能力仍然为零） | 分 3~4 段 |
+| 标点 | **会吞逗号/问号**（"第一，怎么样？"→"第一怎么样"），连带废掉列举排版 | 标点完整 |
+| 稳定性 | 同一条输入两次输出不一致 | 3/3 一致 |
+| 可用性 | **本机，ollama 常驻** | 经常整晚挂掉 |
+
+原哥拍板：**"如果 7B 能解决，就不需要 AMD 了，也不存在兜底的问题。"**
+默认后端切到本机 7B（`DEFAULT_PROVIDER = "ollama"`），27B 质量更好但
+可用性一票否决。历史上 3B 时代（v1.0.24/25）的"机械换行/逐词空格崩坏"
+在 7B 上没有复现（空格率 0.0%）。
+
+接线细节：
+
+- `main.js`：`provider: process.env.CAPS_LONG_TEXT_PROVIDER || "ollama"`，
+  `timeoutMs: 30000`（容忍 7B 冷启动 ~25s），`keepAlive: "2h"`（显存常驻，
+  启动时 warmup 把模型拉进显存）
+- `CAPS_LONG_TEXT_PROVIDER=openai` 可切回 AMD 27B；
+  `CAPS_LONG_TEXT_FALLBACK=openai` 可给 7B 挂 AMD 反向兜底（默认不挂）
+- fallback 机制本身保留在 `LongTextFormatter`（构造参数），判据是通用的：
+  只兜"后端不可用"（连不上/超时/HTTP 错误/空响应），保真校验失败不切
+- 兜底成功的结果带 `backend:"fallback"`，textPolish 的 long_format stage
+  会透传，排查时先看这个
+- 27B 输出质量仍作为参照系钉在测试与本文档里；哪天 7B 的分段/标点短板
+  换模型解决了，直接换 `PROVIDERS.ollama.defaultModel` 就行
+
 ### 关于 Qwen3 的 think 参数（仍然有效的老教训）
 
 | 模型 | 结果 |

@@ -198,6 +198,8 @@ class TextPolisher {
             stage: "long_format",
             elapsed_ms: Date.now() - stageStart,
             applied: applied.changed === true,
+            // backend:"fallback" = 主后端（AMD）不可用、本机 ollama 7B 兜底成功
+            ...(applied.backend ? { backend: applied.backend } : {}),
             ...(applied.changed ? { ratio: applied.ratio } : {}),
           });
           if (applied.changed) {
