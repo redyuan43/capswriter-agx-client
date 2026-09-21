@@ -42,6 +42,15 @@
  *   结论：7B 不足以当默认后端，但远好于"AMD 挂了直接退原文"——
  *   所以做成 fallback：主后端连不上/超时/空响应时用 7B 兜底。
  *
+ * 2026-09-21 下午 v1.0.31：纯 7B 默认上线后用户反馈"容易把内容改偏"。
+ * 审计（40 条真实长口述 x 2 遍）定位到两个事实：
+ *   1. 三道关放行了 3 条改写嫌疑 >5% 的输出（"生不生效"→"是否生效"、
+ *      "经验"→"心得"这类低密度改词，覆盖率 0.79~0.90 刚好压线）
+ *   2. 温度 0.1 下同输入两遍输出不一致 14/40；温度 0 + 固定 seed 反而 13%
+ *      （GPU 浮点非确定性，采样参数压不住）→ 生成侧调参无解，只能靠校验拦
+ *   另实测改偏是稳定行为：3 条改偏样本各 5 遍 = 15/15 全改偏，重试无价值。
+ *   对策：validate() 加第四道关 rewriteRatio（LCS），>=4% 拦截回退原文。
+ *
  * 两个 provider 都是 HTTP 接口，差别只在请求/响应形状：
  *   ollama —— 本机 11434，原生 API（**默认主力**，qwen2.5:7b-instruct-q4_K_M）
  *   openai —— AMD 网关 18106，OpenAI 兼容（CAPS_LONG_TEXT_PROVIDER=openai 可切）
@@ -128,6 +137,16 @@ const FALLBACK_KEEP_ALIVE = "2h";
 const MIN_BIGRAM_COVERAGE_LONG = 0.9;   // 原文 >= 80 字
 const MIN_BIGRAM_COVERAGE_SHORT = 0.75; // 原文 < 80 字
 const BIGRAM_STRICT_MIN_CHARS = 80;
+
+// 字符级改写嫌疑度（v1.0.31 第四道关）：= min(删掉的字数, 新增的字数) / 原文长度。
+// 双字组覆盖率抓不住"低密度改写"——长文本里改三五个词，覆盖率还有 0.94，
+// 照样放行。LCS 能精确分开"删"和"改"：只删词时 inserted≈0 → 嫌疑≈0（合法）；
+// 同义替换时 deleted≈inserted>0 → 嫌疑高（改偏）。
+// 阈值 4% 的依据（2026-09-21 实测 40 条真实长口述，7B 温度 0.1）：
+//   合法样本嫌疑度全部 <= 3.9%，实锤改偏样本 5.1% / 5.4% / 8.2%，中间切。
+//   同一批实验还证明：改偏是 7B 的**稳定行为**（3 条改偏样本各跑 5 遍，
+//   15/15 全部改偏），所以不做"校验失败重试"——那只会白付一倍延迟。
+const MAX_REWRITE_RATIO = 0.04;
 
 // 模型偶尔会自作主张加这类前缀，统一剥掉。
 const LEADING_NOISE = /^\s*(?:整理后|整理结果|输出|结果|以下是整理后的文本)[:：\s]*/;
@@ -347,6 +366,43 @@ function bigramCoverage(strippedOriginal, strippedFormatted) {
   return total ? hit / total : 0;
 }
 
+/**
+ * 最长公共子序列长度（滚动数组 DP）。
+ * 口述文本 strip 后通常几百字，O(n·m) 完全够用（500×500 ≈ 0.1ms）。
+ */
+function lcsLength(a, b) {
+  if (!a.length || !b.length) return 0;
+  let prev = new Uint32Array(b.length + 1);
+  let cur = new Uint32Array(b.length + 1);
+  for (let i = 1; i <= a.length; i += 1) {
+    const ca = a[i - 1];
+    for (let j = 1; j <= b.length; j += 1) {
+      cur[j] = ca === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    }
+    [prev, cur] = [cur, prev];
+  }
+  return prev[b.length];
+}
+
+/**
+ * 字符级改写嫌疑度：min(删除字数, 新增字数) / 原文字数。
+ *
+ * 直觉：只删词的合法整理 inserted≈0 → 嫌疑 0；等量替换（"经验"→"心得"、
+ * "生不生效"→"是否生效"）deleted≈inserted>0 → 嫌疑等于替换规模。
+ * 实测改偏 case（2026-09-21）：
+ *   "是不是你就不能帮我" → "你能不能帮我"              嫌疑 5.4%
+ *   "你的经验" → "你的心得"、"另外一台" → "另一台"      嫌疑 5.1%
+ *   "试试看会不会" → "试一试看看会不会"                 嫌疑 8.2%
+ * 这些都能骗过双字组覆盖率（0.79~0.90，阈值线附近），LCS 一抓一个准。
+ */
+function rewriteRatio(strippedOriginal, strippedFormatted) {
+  const a = strippedOriginal;
+  const b = strippedFormatted;
+  if (!a.length) return 0;
+  const kept = lcsLength(a, b);
+  return Math.min(a.length - kept, b.length - kept) / a.length;
+}
+
 class LongTextFormatter {
   constructor({ provider, endpoint, model, logger = null, timeoutMs, keepAlive, fallback } = {}) {
     const providerKey = PROVIDERS[provider] ? provider : DEFAULT_PROVIDER;
@@ -435,26 +491,28 @@ class LongTextFormatter {
   }
 
   /**
-   * 保真校验。三道关：
+   * 保真校验。四道关：
    *   1. 长度比——抓大幅增删（总结、复述要求）
    *   2. 逐词空格——抓 3B 在中英混排上的崩坏输出（字都在，但每字后加空格）
-   *   3. 双字组覆盖率——抓等长改写（同义替换），长度比看不见这类
-   * 返回 { ok, reason, ratio, coverage, spacey }
+   *   3. 双字组覆盖率——抓成片改写（同义替换），长度比看不见这类
+   *   4. 字符级改写嫌疑度——抓低密度改写（改三五个词），覆盖率 0.94 也放行
+   * 返回 { ok, reason, ratio, coverage, spacey, rewrite }
    */
   validate(original, formatted) {
     const strip = (s) => String(s || "").replace(/[\s\p{P}\p{S}]/gu, "");
     const a = strip(original);
     const b = strip(formatted);
-    if (!b) return { ok: false, reason: "empty_output", ratio: 0, coverage: 0, spacey: 0 };
-    if (!a) return { ok: false, reason: "empty_input", ratio: 1, coverage: 1, spacey: 0 };
+    if (!b) return { ok: false, reason: "empty_output", ratio: 0, coverage: 0, spacey: 0, rewrite: 0 };
+    if (!a) return { ok: false, reason: "empty_input", ratio: 1, coverage: 1, spacey: 0, rewrite: 0 };
 
     const ratio = b.length / a.length;
     const coverage = bigramCoverage(a, b);
     const spacey = spaceyRatio(formatted);
+    const rewrite = rewriteRatio(a, b);
     const threshold = a.length >= BIGRAM_STRICT_MIN_CHARS
       ? MIN_BIGRAM_COVERAGE_LONG
       : MIN_BIGRAM_COVERAGE_SHORT;
-    const detail = { ratio, coverage, threshold, spacey };
+    const detail = { ratio, coverage, threshold, spacey, rewrite };
 
     if (ratio < MIN_RATIO) return { ok: false, reason: `too_short(${ratio.toFixed(2)})`, ...detail };
     if (ratio > MAX_RATIO) return { ok: false, reason: `too_long(${ratio.toFixed(2)})`, ...detail };
@@ -463,6 +521,13 @@ class LongTextFormatter {
     }
     if (coverage < threshold) {
       return { ok: false, reason: `rewritten(coverage=${coverage.toFixed(2)})`, ...detail };
+    }
+    if (rewrite > MAX_REWRITE_RATIO) {
+      return {
+        ok: false,
+        reason: `rewritten_chars(${(rewrite * 100).toFixed(1)}%)`,
+        ...detail,
+      };
     }
     return { ok: true, reason: null, ...detail };
   }
@@ -632,6 +697,7 @@ class LongTextFormatter {
           ratio: Number(check.ratio?.toFixed(3)),
           coverage: Number(check.coverage?.toFixed(3)),
           spacey: Number((check.spacey || 0).toFixed(3)),
+          rewrite: Number((check.rewrite || 0).toFixed(3)),
           original_chars: original.length,
           formatted_chars: cleaned.length,
           preview: cleaned.slice(0, 80),
@@ -706,6 +772,8 @@ module.exports = {
   LongTextFormatter,
   bigramCoverage,
   spaceyRatio,
+  rewriteRatio,
+  lcsLength,
   normalizeEnumerations,
   findEnumerationMarkers,
   PROMPT_TEMPLATE,
@@ -716,6 +784,7 @@ module.exports = {
   MIN_BIGRAM_COVERAGE_LONG,
   MIN_BIGRAM_COVERAGE_SHORT,
   BIGRAM_STRICT_MIN_CHARS,
+  MAX_REWRITE_RATIO,
   DEFAULT_PROVIDER,
   DEFAULT_TIMEOUT_MS,
 };

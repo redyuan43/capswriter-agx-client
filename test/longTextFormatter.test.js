@@ -15,6 +15,8 @@ const {
   LongTextFormatter,
   bigramCoverage,
   spaceyRatio,
+  rewriteRatio,
+  lcsLength,
   normalizeEnumerations,
   findEnumerationMarkers,
   PROMPT_TEMPLATE,
@@ -23,6 +25,7 @@ const {
   MAX_SPACEY_RATIO,
   MIN_RATIO,
   MAX_RATIO,
+  MAX_REWRITE_RATIO,
 } = require("../src/helpers/longTextFormatter");
 
 const SAMPLE = "然后那个，我觉得这个方案可以。呃，但是它太慢了。";
@@ -185,6 +188,102 @@ test("bigramCoverage 对完全相同文本返回 1", () => {
 
 test("bigramCoverage 对完全无关文本返回 0", () => {
   assert.equal(bigramCoverage("一二三四五六七八", "甲乙丙丁戊己庚辛"), 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * 第四道关：字符级改写嫌疑度（rewriteRatio / LCS）
+ *
+ * v1.0.31 上线后用户反馈"容易把内容改偏"。审计（40 条真实长口述）发现
+ * 三道关放行了 3 条改写嫌疑 >5% 的输出——低密度改词（改三五个字）在
+ * 覆盖率上只掉到 0.79~0.90，刚好压线。LCS 能精确分开"删"与"改"：
+ * 只删词 inserted≈0 → 嫌疑 0；等量替换 deleted≈inserted → 嫌疑高。
+ * 阈值 4%：合法样本实测全部 <= 3.9%，改偏样本 5.1% / 5.4% / 8.2%。
+ * ------------------------------------------------------------------ */
+
+test("rewriteRatio 只删词时为 0（合法整理不该被第四道关误伤）", () => {
+  const original = "然后那个，我觉得这个方案可以。呃，但是它太慢了，得改。";
+  const formatted = "我觉得这个方案可以。但是它太慢了，得改。"; // 只删口头语
+  assert.equal(rewriteRatio(original.replace(/[\s\p{P}\p{S}]/gu, ""), formatted.replace(/[\s\p{P}\p{S}]/gu, "")), 0);
+});
+
+test("rewriteRatio 等量替换时按替换规模计算", () => {
+  // "经验"→"心得"、"另外"→"另"：删除与新增同时发生
+  const a = "把你的经验总结到文档里面去";
+  const b = "把你的心得总结到文档里面";
+  const ratio = rewriteRatio(a, b);
+  assert.ok(ratio > 0, "等量替换嫌疑度必须大于 0");
+  assert.ok(ratio < 0.3, `短句上小规模替换不该爆表，实际 ${ratio}`);
+});
+
+test("lcsLength 基本行为", () => {
+  assert.equal(lcsLength("ABCBDAB", "BDCABA"), 4); // 经典例：BCBA 或 BCAB
+  assert.equal(lcsLength("", "ABC"), 0);
+  assert.equal(lcsLength("ABC", ""), 0);
+  assert.equal(lcsLength("一样的字", "一样的字"), 4);
+});
+
+test("validate 拦住实测改偏 case：生不生效→是否生效（覆盖率压线 0.86 放行过）", () => {
+  const f = makeFormatter();
+  const original =
+    "声控录音，如果我把它打开的话，第一，我如何知道声控录音它生不生效？第二个，我如何能够真实的测试一下，" +
+    "是不是你就不能帮我完成整个测试？需要我配合你做什么？你可以跟我讲。";
+  const drifted =
+    "如果我把它打开的话 第一 我如何知道声控录音是否生效 第二 我如何能够真实地测试一下 " +
+    "你能不能帮我完成整个测试 需要我配合你做什么 你可以跟我讲";
+  const result = f.validate(original, drifted);
+  assert.equal(result.ok, false, "实测改偏 case 必须被第四道关拦住");
+  assert.match(result.reason, /^rewritten_chars/);
+});
+
+test("validate 拦住实测改偏 case：经验→心得、另外一台→另一台", () => {
+  const f = makeFormatter();
+  const original =
+    "生成一个文件夹，然后把你的经验总结到文档里面去，并且生成一个PRD。我需要在另外一台设备上实现" +
+    "你刚才最后建议的双USB麦独立录音加同段VAD加ASR置信度的评分选择。";
+  const drifted =
+    "生成一个文件夹，然后把你的心得总结到文档里面，并且生成一个PRD。  我需要在另一台设备上实现" +
+    "你刚才最后建议的双USB麦克风独立录音加同段VAD加ASR置信度的评分选择。";
+  const result = f.validate(original, drifted);
+  assert.equal(result.ok, false, "实测改偏 case 必须被第四道关拦住");
+  assert.match(result.reason, /^rewritten_chars/);
+});
+
+test("validate 拦住实测改偏 case：试试看会不会→试一试看看会不会", () => {
+  const f = makeFormatter();
+  const original =
+    "我觉得针对这些特殊的字符去做处理，泛化性不强。我想你把这些特殊的这些处理方式都去掉，" +
+    "通过在小模型上加提示词试试看，会不会效果好一些？";
+  const drifted =
+    "我觉得针对这些特殊字符去做处理泛化性不强。我想你可以把那些特殊的处理方式去掉，" +
+    "在小模型上加提示词试一试，看看会不会效果好一些？";
+  const result = f.validate(original, drifted);
+  assert.equal(result.ok, false, "实测改偏 case 必须被第四道关拦住");
+});
+
+test("validate 第四道关阈值边界符合常量定义", () => {
+  const f = makeFormatter();
+  // 50 字原文，替换 2 字 = 4% 恰好在阈值上（>0.04 才拦），替换 3 字 = 6% 必拦
+  const base = "一二三四五六七八九十".repeat(5); // 50 字
+  const swap2 = "甲乙" + base.slice(2); // 替换前 2 字，长度不变
+  assert.equal(f.validate(base, swap2).ok, true, `4% 不应超过阈值 ${MAX_REWRITE_RATIO}`);
+  const swap3 = "甲乙丙" + base.slice(3);
+  const result = f.validate(base, swap3);
+  assert.equal(result.ok, false, "6% 替换必须拦截");
+  assert.match(result.reason, /^rewritten_chars/);
+});
+
+test("validate 依然接受删词加接句的忠实整理（第四道关不误伤）", () => {
+  const f = makeFormatter();
+  const original =
+    "现在手机界面的交互界面还是有问题。第一个就是你下载到手机上，如果是在下载过程中能看到状态的变化，" +
+    "下载完了也能看到状态的。上同步也需要看到服务器上的变化，也需要看到手机上服务器同步时候的锁定状态以及。" +
+    "及服务器同步完了之后的状态。同理，在服务器端也要能看到实时同步的状态，这样才合理。";
+  const faithful =
+    "现在手机界面的交互界面还是有问题。第一个就是你下载到手机上，如果是在下载过程中能看到状态的变化，" +
+    "下载完了也能看到状态的。同步也需要看到服务器上的变化，也需要看到手机上服务器同步时候的锁定状态，" +
+    "以及服务器同步完了之后的状态。同理，在服务器端也要能看到实时同步的状态，这样才合理。";
+  const result = f.validate(original, faithful);
+  assert.equal(result.ok, true, `删词+接句不该被第四道关拦，实际 ${result.reason}`);
 });
 
 /* ------------------------------------------------------------------ *
