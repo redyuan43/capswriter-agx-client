@@ -40,7 +40,16 @@ AI\s*Agents\s*建特 = AI Agents
 [《“"']?\s*紫禁城\s*[》”"']? = 子进程
 [Oo]pen[\s_-]*[Cc]lone = OpenClaw
 子\s*[AaＡａ]?\s*建的 = subagent
-筛选 = session
+
+# 2026-09-21 收窄：原「筛选 = session」会误伤真说"筛选"的场合
+#（语料实测 4 次"筛选"里 2 次是真词，如"策略筛选""Checkbox 的筛选"）。
+# 只修 "筛选ID"（sessionID 的 ASR 误识别）这一种形态。
+筛选\s*[IiＩ][DdＤ] = sessionID
+
+# 2026-09-21 语料审计（3897 条）补漏：
+# codex 17 次里 4 次小写漏网。边界照 agx 式（排除 - _ / . 前后缀），
+# 不动 codex-cli、github.com/codex 这类路径与域名。
+(?<![/.@A-Za-z0-9_-])codex(?![./A-Za-z0-9_-]) = Codex
 [Nn恩嗯]\s*[叉杈差插查岔]\s*一 = nx1
 [Nn恩嗯]\s*[叉杈差插查岔]\s*二 = nx2
 [Nn恩嗯]\s*[叉杈差插查岔]\s*三 = nx3
@@ -71,7 +80,9 @@ NXE = nx1
 # 专名：把 ASR 的大小写/拆分变体收敛到唯一正确写法。
 # Tailscale 实测 16 条正确 / 15 条错写，是错写率最高的专名。
 # 一条规则覆盖 tailscale(全小写) / TailScale(驼峰) / Tail Scale(拆开) / TAILSCALE(全大写)。
-[Tt][Aa][Ii][Ll]\s*[Ss][Cc][Aa][Ll][Ee] = Tailscale
+# 2026-09-21 加边界（agx 式，连 - 与 _ 一起排除）：原版无边界会把 tailscale.com、
+# capswriter-tailscale-yyy 这类域名/路径也改掉（3897 条语料回归实测踩中）。
+(?<![/.@A-Za-z0-9_-])[Tt][Aa][Ii][Ll]\s*[Ss][Cc][Aa][Ll][Ee](?![./A-Za-z0-9_-]) = Tailscale
 (?<![A-Za-z])tcale(?![A-Za-z]) = Tailscale
 
 # GitHub：一条覆盖 github / Github / GITHUB / Git Hub。
