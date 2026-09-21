@@ -163,3 +163,4 @@ python
 
 # Assistant workspace data (memory, skills, local session state)
 .workbuddy/
+_tmp_*
