@@ -1,6 +1,6 @@
 const { ipcMain } = require("electron");
 
-const serialProvision = require("../../helpers/m5SerialProvision");
+const serialProvision = require("../../../helpers/m5SerialProvision");
 
 const REMEMBERED_PROFILE_KEY = "m5_serial_wifi_profile_v1";
 
