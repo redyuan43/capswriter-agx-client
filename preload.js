@@ -44,6 +44,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   recordVoiceDatasetSample: (sample) =>
     ipcRenderer.invoke("record-voice-dataset-sample", sample),
   polishText: (text, options) => ipcRenderer.invoke("polish-text", text, options),
+
+  // M5 串口配网（Cardputer USB 线连接）
+  m5SerialListDevices: () => ipcRenderer.invoke("m5-serial-list-devices"),
+  m5SerialHostInfo: () => ipcRenderer.invoke("m5-serial-host-info"),
+  m5SerialProvision: (payload) => ipcRenderer.invoke("m5-serial-provision", payload),
+  m5SerialForgetProfile: () => ipcRenderer.invoke("m5-serial-forget-profile"),
   reloadHotRules: () => ipcRenderer.invoke("reload-hot-rules"),
   probeLongTextService: () => ipcRenderer.invoke("probe-long-text-service"),
   getHotWords: () => ipcRenderer.invoke("get-hot-words"),

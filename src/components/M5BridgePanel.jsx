@@ -13,6 +13,7 @@ import {
   Wifi,
 } from "lucide-react";
 import { toast } from "sonner";
+import M5SerialProvisionCard from "./M5SerialProvisionCard";
 
 const BRIDGE_BASE_URL = "http://127.0.0.1:8765";
 const REFRESH_INTERVAL_MS = 3000;
@@ -303,6 +304,8 @@ export default function M5BridgePanel() {
             {!loading && routes.length === 0 && <p className="text-sm text-gray-500">当前没有可用路由。</p>}
           </div>
         </section>
+
+        <M5SerialProvisionCard />
 
         <div className="grid gap-5 lg:grid-cols-2">
           <section className="rounded-xl border border-gray-200 bg-white p-5">

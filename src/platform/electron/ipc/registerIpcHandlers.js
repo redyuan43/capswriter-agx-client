@@ -2,6 +2,7 @@ const { registerClipboardHandlers } = require("./clipboardHandlers");
 const { registerDatabaseHandlers } = require("./databaseHandlers");
 const { registerDeviceMappingHandlers } = require("./deviceMappingHandlers");
 const { registerM5BridgeHandlers } = require("./m5BridgeHandlers");
+const { registerM5SerialProvisionHandlers } = require("./m5SerialProvisionHandlers");
 const { registerKnobMapperHandlers } = require("./knobMapperHandlers");
 const { registerMiscHandlers } = require("./miscHandlers");
 const { registerSettingsHandlers } = require("./settingsHandlers");
@@ -17,6 +18,7 @@ function registerIpcHandlers(ctx) {
   registerDatabaseHandlers(ctx);
   registerDeviceMappingHandlers(ctx);
   registerM5BridgeHandlers(ctx);
+  registerM5SerialProvisionHandlers(ctx);
   registerKnobMapperHandlers(ctx);
   registerClipboardHandlers(ctx);
   registerWindowHandlers(ctx);
