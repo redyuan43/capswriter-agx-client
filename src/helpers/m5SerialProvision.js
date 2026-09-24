@@ -284,8 +284,27 @@ function readHostWifiProfile(spawnSyncImpl = spawnSync) {
     ],
     { encoding: "utf8", timeout: 4000 }
   );
+  let pskOut = pskResult.stdout || "";
+  if (!pskOut.trim()) {
+    // 系统级连接的 psk 普通 nmcli 读不到（返回空），需要 root 权限（如 nx6）
+    const sudoPsk = spawnSyncImpl(
+      "sudo",
+      [
+        "-n",
+        "nmcli",
+        "-s",
+        "-g",
+        "802-11-wireless-security.psk",
+        "connection",
+        "show",
+        connection,
+      ],
+      { encoding: "utf8", timeout: 4000 }
+    );
+    pskOut = sudoPsk.stdout || "";
+  }
   const ssid = (ssidResult.stdout || "").trim();
-  const password = (pskResult.stdout || "").trim();
+  const password = pskOut.trim();
   if (!ssid) {
     return { available: false, reason: "ssid_unreadable" };
   }
