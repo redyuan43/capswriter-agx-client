@@ -137,7 +137,8 @@ export default function AsrConnectionPanel() {
     setBusy(true);
     try {
       const connection = await window.electronAPI.resolveAsrConnectionProfile(draft, { token, clearToken });
-      const metrics = await probeAsrConnection(connection, { readinessOnly: true });
+      const metrics = await probeAsrConnection(connection, { readinessOnly: true,
+        timeoutMs: draft.id === 'firered2-local' ? 120000 : 15000 });
       setTestedDraft({ ...draft, token });
       const summary = formatProbeMetrics(metrics);
       setProbeMetrics(summary);
@@ -255,7 +256,11 @@ export default function AsrConnectionPanel() {
           </div>}
           {draft.id === 'firered2-local' && <div className="rounded-md bg-blue-50 p-3 text-xs text-blue-900" aria-live="polite">
             <p>使用这台电脑上的 FireRed2 识别，无需 ASR API 密钥。</p>
-            <p className="mt-1">{cloudStatus?.asr_ready ? (cloudStatus.busy ? '本机模型已就绪，正在处理录音。' : '本机模型已就绪。') : '尚未连接到本机服务，请确认 FireRed2 已启动。'}</p>
+            <p className="mt-1">{cloudStatus?.status === 'loading' ? '正在加载本机模型，请稍候。'
+              : cloudStatus?.status === 'unloading' ? '正在释放闲置模型。'
+              : cloudStatus?.asr_ready ? (cloudStatus.busy ? '本机模型已就绪，正在处理录音。' : '本机模型已就绪。')
+              : cloudStatus?.service_ready ? '本机服务在线，首次使用时加载模型。' : '尚未连接到本机服务，请确认 FireRed2 已启动。'}</p>
+            <p className="mt-1">闲置 10 分钟后释放模型内存。首次录音或测试连接需要等待模型加载，最多等待 2 分钟。</p>
             <p className="mt-1">停顿后逐句显示结果。热词纠正、分段和文字整理继续使用当前客户端设置；启用 GLM 整理时仍需联网。</p>
           </div>}
           {!draft.preset && <label className="block text-xs text-gray-600">认证方式

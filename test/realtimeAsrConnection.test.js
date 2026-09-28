@@ -1,6 +1,16 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+test('local FireRed2 permits cold loading without changing cloud timeout', async () => {
+  const { resolveRealtimeAsrConnection } = await import('../src/helpers/realtimeAsrConnection.mjs');
+  for (const id of ['firered2-local', 'tencent-direct']) {
+    const connection = await resolveRealtimeAsrConnection({
+      getActiveConnection: async () => ({ id, url: 'ws://127.0.0.1:18011/api/asr/realtime' }),
+    });
+    assert.equal(connection.connectTimeoutMs, id === 'firered2-local' ? 120000 : undefined);
+  }
+});
+
 test('runtime ASR settings create authenticated primary and unauthenticated fallback', async () => {
   const { resolveRealtimeAsrConnection } = await import('../src/helpers/realtimeAsrConnection.mjs');
   const values = {

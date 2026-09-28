@@ -37,6 +37,7 @@ export async function resolveRealtimeAsrConnection({
           primaryUrl: activeUrl,
           fallbackUrl: '',
           token,
+          ...(active.id === 'firered2-local' ? { connectTimeoutMs: 120000 } : {}),
           candidates: [{ route: 'primary', url: activeUrl, protocols: buildRealtimeAsrProtocols(token) }],
         };
       }

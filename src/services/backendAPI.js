@@ -805,7 +805,8 @@ export class PCMRealtimeSession {
     }
 
     try {
-      await withClientTimeout(this.openWebSocket(), REALTIME_ASR_CONNECT_TIMEOUT_MS, `Realtime ASR connect timeout (${REALTIME_ASR_CONNECT_TIMEOUT_MS}ms)`);
+      const connectTimeoutMs = !this.explicitUrl && runtimeConnection.connectTimeoutMs || REALTIME_ASR_CONNECT_TIMEOUT_MS;
+      await withClientTimeout(this.openWebSocket(), connectTimeoutMs, `Realtime ASR connect timeout (${connectTimeoutMs}ms)`);
       if (this.stopped) {
         throw new Error('Realtime ASR session was cancelled before ready');
       }

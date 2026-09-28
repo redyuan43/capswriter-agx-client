@@ -5,6 +5,9 @@ import logging
 import os
 import threading
 import tempfile
+import time
+import gc
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -19,6 +22,11 @@ log = logging.getLogger('firered-local')
 pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='firered')
 engine = None
 busy = False
+loading = False
+unloading = False
+last_used = time.monotonic()
+IDLE_UNLOAD_SECONDS = 600
+model_lock = asyncio.Lock()
 CAPABILITIES = {'asr': True, 'optimize': False, 'translate': False, 'native_hotwords': False}
 
 
@@ -31,13 +39,62 @@ async def run(fn, *args):
         raise
 
 
+def release_model():
+    global engine
+    engine = None
+    gc.collect()
+    torch = sys.modules.get('torch')
+    if torch is not None and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
+async def ensure_model():
+    global engine, loading, last_used
+    async with model_lock:
+        if engine is None:
+            loading = True
+            try:
+                engine = await run(Engine)
+                log.info('FireRed2 模型加载完成')
+            finally:
+                loading = False
+        last_used = time.monotonic()
+
+
+async def unload_if_idle():
+    global unloading
+    async with model_lock:
+        if engine is None or busy or time.monotonic() - last_used < IDLE_UNLOAD_SECONDS:
+            return False
+        unloading = True
+        try:
+            await run(release_model)
+            log.info('FireRed2 闲置 10 分钟，已释放模型和 CUDA 缓存')
+            return True
+        finally:
+            unloading = False
+
+
+async def reap_idle_model():
+    while True:
+        await asyncio.sleep(5)
+        await unload_if_idle()
+
+
 @asynccontextmanager
 async def lifespan(app):
-    global engine
-    engine = await run(Engine)
-    log.info('FireRed2 模型已就绪，仅接受本机连接')
-    yield
-    pool.shutdown(wait=True)
+    reaper = asyncio.create_task(reap_idle_model())
+    log.info('FireRed2 服务就绪，模型按需加载，闲置 10 分钟卸载')
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        try:
+            await reaper
+        except asyncio.CancelledError:
+            pass
+        await run(release_model)
+        pool.shutdown(wait=True)
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -51,8 +108,10 @@ app.add_middleware(CORSMiddleware, allow_origins=['null', 'file://'],
 @app.get('/api/status')
 @app.get('/api/asr/status')
 async def status():
-    return {'status': 'ready' if engine else 'loading', 'ready': engine is not None,
+    state = 'unloading' if unloading else 'loading' if loading else 'ready' if engine else 'idle'
+    return {'status': state, 'ready': engine is not None and not unloading,
             'asr_ready': engine is not None, 'provider': 'firered2', 'busy': busy,
+            'service_ready': True, 'lazy_load': True, 'idle_unload_seconds': IDLE_UNLOAD_SECONDS,
             'partial_mode': 'vad_segment', 'capabilities': CAPABILITIES}
 
 
@@ -109,12 +168,13 @@ async def transcribe_file(request: Request):
             await form.close()
 
     async def events():
-        global busy
+        global busy, last_used
         process = None
         session_id = str(uuid4())
         samples = 0
         try:
             yield {'stage': 'processing'}
+            await ensure_model()
             await run(engine.new_session)
             # 只读临时本地文件，禁止解码器访问外部网络。
             process = await asyncio.create_subprocess_exec('ffmpeg', '-v', 'error', '-nostdin',
@@ -146,6 +206,7 @@ async def transcribe_file(request: Request):
                 process.kill()
                 await process.wait()
             temporary.close()
+            last_used = time.monotonic()
             busy = False
 
     if request.url.path.endswith('-stream'):
@@ -169,7 +230,7 @@ async def transcribe_file(request: Request):
 
 @app.websocket('/api/asr/realtime')
 async def realtime(ws: WebSocket):
-    global busy
+    global busy, last_used
     origin = ws.headers.get('origin')
     if not allowed_origin(origin):
         await ws.close(code=1008)
@@ -182,12 +243,26 @@ async def realtime(ws: WebSocket):
     finishing = False
     pending = 0
     samples = 0
+    prepared = False
     session_id = str(uuid4())
 
     async def consume():
-        nonlocal pending
+        nonlocal pending, prepared
         previous = ''
         try:
+            if engine is None or unloading:
+                await ws.send_json({'type': 'loading', 'cold_start': True, 'provider': 'firered2',
+                                    'message': '正在加载本机 FireRed2 模型'})
+            await ensure_model()
+            if cancelled.is_set():
+                return
+            await run(engine.new_session)
+            if cancelled.is_set():
+                return
+            prepared = True
+            await ws.send_json({'type': 'ready', 'success': True, 'provider': 'firered2',
+                                'session_id': session_id, 'partial_mode': 'vad_segment',
+                                'capabilities': CAPABILITIES})
             while not cancelled.is_set():
                 pcm, finish = await queue.get()
                 if cancelled.is_set():
@@ -218,7 +293,7 @@ async def realtime(ws: WebSocket):
                 break
             pcm = message.get('bytes')
             if pcm is not None:
-                if not owned or finishing or len(pcm) % 2 or len(pcm) > 320000:
+                if not prepared or finishing or len(pcm) % 2 or len(pcm) > 320000:
                     raise ValueError('需要开始会话后发送 16 kHz 单声道 PCM16 音频')
                 pending += len(pcm)
                 if pending > 4 * 1024 * 1024:
@@ -241,12 +316,8 @@ async def realtime(ws: WebSocket):
                 if command.get('optimize_mode') not in (None, '', 'none', False):
                     raise ValueError('本机服务只识别语音，文字整理请使用客户端')
                 busy = owned = True
-                await run(engine.new_session)
                 worker = asyncio.create_task(consume())
-                await ws.send_json({'type': 'ready', 'success': True, 'provider': 'firered2',
-                                    'session_id': session_id, 'partial_mode': 'vad_segment',
-                                    'capabilities': CAPABILITIES})
-            elif kind == 'finish' and owned and not finishing:
+            elif kind == 'finish' and prepared and not finishing:
                 finishing = True
                 queue.put_nowait((b'', True))
             else:
@@ -262,6 +333,7 @@ async def realtime(ws: WebSocket):
             # CUDA 运算不能强行取消；完成前保持独占，避免下一次会话污染模型状态。
             await asyncio.shield(worker)
         if owned:
+            last_used = time.monotonic()
             busy = False
         try:
             await ws.close()
