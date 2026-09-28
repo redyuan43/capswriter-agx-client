@@ -228,6 +228,8 @@ async def realtime(ws: WebSocket):
                     queue.put_nowait((pcm, False))
                 continue
             command = json.loads(message.get('text') or '{}')
+            if not isinstance(command, dict):
+                raise ValueError('录音控制消息必须是 JSON 对象')
             kind = command.get('type')
             if kind == 'cancel':
                 break

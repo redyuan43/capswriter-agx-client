@@ -142,3 +142,19 @@ xvfb-run -a env ELECTRON_RUN_AS_NODE=1 "dist/asr-review/linux-unpacked/speech-tr
 - NX6 实际 Electron `file://` 页面连接本机服务成功，返回 `provider=firered2`，发送音频 0 字节。尚未进行用户实际 FireRed2 录音验收，文件转写也尚未用真实样本验收。
 - ARM64 包验证通过（原生模块、ffmpeg、模板与规则子进程），141 个随包源码匹配。已替换 NX6 AppImage 并重启客户端，两项服务 active，重启次数均为 0。
 - 当前 AppImage SHA-256：`34146d7a8fed7d5b9fbd6326fa1608f87db7f8bb614495907677666025a608a7`。上一版备份：`/home/nx/.local/share/capswriter-backups/20260928-123141-firered-gui/`。
+
+## 提交后 Review（基线 54b4bfa）
+
+检查客户端整理、供应商适配、配置切换、取消、交付与本机服务的资源释放路径，发现并修复：
+
+1. **P1：未知窗口被当成已知编辑器。** `resolveTerminalState` 原先直接返回终端判断的 false，未命中的窗口会自动接收多行粘贴。改为已知编辑器名单；其余返回 unknown 并仅复制。新增未知窗口回归断言。
+2. **P1：直接插入入口绕过多行保护。** `insert-text-directly` 直接调用 clipboard，未共用 `paste-text` 的保护。两入口现共用一项判断，新增直接插入回归断言。
+3. **P2：FireRed2 非对象控制消息异常退出。** JSON 的 null、数组、数字或字符串能通过解析，但 `.get()` 会抛未处理的 AttributeError。现明确返回协议错误并关闭连接；无模型测试覆盖上述四类输入，以及忙碌拒绝不能释放另一会话锁。
+
+修复后 JavaScript 367 项全部通过，FireRed2 控制协议 2 项通过。原始模板中的两处行末空格保留，因为它们属于逐字节固定、经过哈希校验的参考模板。
+
+### 窗口消失排查
+
+NX6 客户端 PID 2373940 自 12:31:42 升级重启后持续存活，NRestarts=0；FireRed2 亦持续运行。对应时间段未找到 OOM、segfault 或新崩溃转储。通过应用自己的 D-Bus 托盘“设置”菜单恢复正常界面，并在 NX6 实际桌面打开 ASR 服务端页，确认腾讯和 FireRed2 选项存在。
+
+升级重启关闭了旧窗口，而启动代码默认隐藏窗口；该行为与此次“退出”观感相符，但不能据此排除更早、未报告具体时刻的其他异常。没有将单纯进程存活当作 GUI 验证，也没有停止占用 GPU 的其他应用。

@@ -20,6 +20,10 @@ test('多行终端/未知窗口仅复制，已知编辑器粘贴，保留单行�
   assert.equal((await paste({}, 'line1\nline2')).mode, 'copied');
   windowClass = ''; assert.equal((await paste({}, 'line1\nline2')).mode, 'copied');
   assert.equal(pasted, 0); assert.equal(copied, 2);
+  windowClass = 'unrecognized-shell';
+  assert.equal((await paste({}, 'line1\nline2')).mode, 'copied');
+  assert.equal((await handlers.get('insert-text-directly')({}, 'line1\nline2')).mode, 'copied');
+  assert.equal(pasted, 0);
   windowClass = 'code'; await paste({}, 'line1\nline2');
   assert.equal(pasted, process.platform === 'linux' ? 1 : 0);
   await paste({}, 'single line'); assert.equal(pasted, process.platform === 'linux' ? 2 : 1);

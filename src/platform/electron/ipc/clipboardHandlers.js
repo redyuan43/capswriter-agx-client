@@ -2,6 +2,11 @@ const { ipcMain } = require("electron");
 const { resolveTerminalState } = require('./textPolishHandlers');
 
 function registerClipboardHandlers(ctx) {
+  const copyMultilineIfNeeded = async (text) => {
+    if (!/[\r\n]/.test(String(text)) || resolveTerminalState(ctx) === false) return null;
+    const result = await ctx.clipboardManager.copyText(text);
+    return { ...result, mode: 'copied' };
+  };
   ipcMain.handle("copy-text", async (_event, text) => {
     try {
       return await ctx.clipboardManager.copyText(text);
@@ -12,15 +17,15 @@ function registerClipboardHandlers(ctx) {
   });
 
   ipcMain.handle("paste-text", async (_event, text) => {
-    if (/[\r\n]/.test(String(text)) && resolveTerminalState(ctx) !== false) {
-      const result = await ctx.clipboardManager.copyText(text);
-      return { ...result, mode: 'copied' };
-    }
+    const copied = await copyMultilineIfNeeded(text);
+    if (copied) return copied;
     return ctx.clipboardManager.pasteText(text);
   });
 
   ipcMain.handle("insert-text-directly", async (_event, text) => {
     try {
+      const copied = await copyMultilineIfNeeded(text);
+      if (copied) return copied;
       return await ctx.clipboardManager.insertTextDirectly(text);
     } catch (error) {
       ctx.logger.error("直接插入文本失败:", error);
