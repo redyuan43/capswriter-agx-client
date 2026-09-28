@@ -261,7 +261,8 @@ export default function AsrConnectionPanel() {
               : cloudStatus?.asr_ready ? (cloudStatus.busy ? '本机模型已就绪，正在处理录音。' : '本机模型已就绪。')
               : cloudStatus?.service_ready ? '本机服务在线，首次使用时加载模型。' : '尚未连接到本机服务，请确认 FireRed2 已启动。'}</p>
             <p className="mt-1">闲置 10 分钟后释放模型内存。首次录音或测试连接需要等待模型加载，最多等待 2 分钟。</p>
-            <p className="mt-1">停顿后逐句显示结果。热词纠正、分段和文字整理继续使用当前客户端设置；启用 GLM 整理时仍需联网。</p>
+            <p className="mt-1">停顿后逐句显示结果。文字整理自动使用本机 Qwen3-4B 非思考模型；热词和规则继续生效。本机整理失败时保留基础结果，不回退云端。</p>
+            <p className="mt-1">本机整理地址：127.0.0.1:18087。轻度润色最多等待 15 秒，提示词优化最多等待 60 秒。</p>
           </div>}
           {!draft.preset && <label className="block text-xs text-gray-600">认证方式
             <select value={draft.auth} disabled={busy} onChange={(event) => changeDraft("auth", event.target.value)} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md bg-white">

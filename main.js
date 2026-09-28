@@ -442,6 +442,7 @@ const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.
 const providerSecrets = new ProviderSecrets({ dataDirectory, safeStorage });
 const longTextFormatter = new SpeechTextFormatter({
   getApiKey: () => providerSecrets.get().glmApiKey,
+  getAsrProfileId: () => asrConnectionProfiles.readConfig().activeProfileId,
 });
 const hotWordsStore = new HotWordsStore({ dataDirectory, logger });
 const tencentDirectBridge = new TencentDirectBridge({ dataDirectory, getCredentials: () => providerSecrets.get(), hotWordsStore });

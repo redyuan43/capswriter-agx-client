@@ -96,12 +96,14 @@ class TextPolisher {
       if (options.punctuation === 'full') result.stages.push({ stage: 'punctuation', skipped: 'disabled' });
       const useModel = mode === 'prompt' || options.longFormat?.enabled !== false;
       if (useModel && this.longFormatter && !controller.signal.aborted) {
+        const totalBudget = this.longFormatter.getTimeoutMs?.(mode, options.asrProvider) || (mode === 'prompt' ? 30000 : 2000);
         const applied = await this.longFormatter.format(current, { mode, signal: controller.signal,
-          timeoutMs: mode === 'prompt' ? 30000 - (Date.now() - started) : 2000 - (Date.now() - started) });
+          asrProvider: options.asrProvider, timeoutMs: Math.max(1, totalBudget - (Date.now() - started)) });
         current = applied.text;
         result.stages.push({ stage: mode, elapsed_ms: applied.elapsed_ms, applied: applied.changed, degraded: applied.degraded });
         result.degraded = applied.degraded || result.degraded;
         result.model = applied.model;
+        result.provider = applied.provider;
         result.thinking = applied.thinking;
         result.prompt_version = applied.prompt_version;
       }

@@ -47,7 +47,7 @@ export default function SpeechSettingsPanel() {
   return <section className="mb-6 space-y-5 rounded-lg border border-gray-200 bg-white p-5">
     <div>
       <h2 className="text-lg font-semibold text-gray-900">语音整理与热词</h2>
-      <p className="mt-1 text-sm text-gray-600">腾讯负责识别，GLM-4.7-Flash 负责文本整理。两种模式均关闭思考，只使用该免费模型。</p>
+      <p className="mt-1 text-sm text-gray-600">整理随 ASR 自动切换：FireRed2 使用本机 Qwen3-4B；腾讯及其他连接使用免费 GLM-4.7-Flash。均关闭思考，本机路径不回退云端。</p>
     </div>
     <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => {
       const value = e.target.checked;
@@ -58,11 +58,11 @@ export default function SpeechSettingsPanel() {
         <option value="light">轻度润色</option><option value="prompt">提示词优化</option>
       </select>
     </label>
-    <p className="text-sm text-gray-600">{mode === 'light' ? '修正断句、标点和分段，保护原意。整理预算约 2 秒，超时保留基础结果。' : '使用 WorkBuddy 原始模板，改写为约 800 字符内的提示词，长输入可能压缩。最多等待 30 秒，可按 Esc 取消。'}</p>
+    <p className="text-sm text-gray-600">{mode === 'light' ? '修正断句、标点和分段，保护原意。云端最多约 2 秒，本机最多 15 秒，超时保留基础结果。' : '使用 WorkBuddy 原始模板，改写为约 800 字符内的提示词，长输入可能压缩。云端最多 30 秒，本机最多 60 秒，可按 Esc 取消。'}</p>
     <details>
       <summary className="cursor-pointer text-sm font-medium text-blue-700">API 凭据与腾讯直连</summary>
       <div className="mt-3 space-y-3">
-        <p className="text-xs text-gray-600">识别音频发送到腾讯，整理文本发送到智谱。密钥使用系统密钥环加密，填写新值才会替换已有值。</p>
+        <p className="text-xs text-gray-600">腾讯直连时音频发送到腾讯、整理文本发送到智谱。FireRed2 路径在本机识别和整理，不使用这些云端密钥。填写新值才会替换已有值。</p>
         {[
           ['glmApiKey', '智谱 API Key'], ['tencentAppId', '腾讯 AppId'],
           ['tencentSecretId', '腾讯 SecretId'], ['tencentSecretKey', '腾讯 SecretKey'],
@@ -115,7 +115,7 @@ export default function SpeechSettingsPanel() {
     </details>
     <details>
       <summary className="cursor-pointer text-sm font-medium text-blue-700">试一下整理效果</summary>
-      <textarea aria-label="待整理文本" className={`${INPUT} mt-3`} rows={4} value={previewInput} onChange={(e) => setPreviewInput(e.target.value)} placeholder="输入测试文本（会发送给智谱免费模型）" />
+      <textarea aria-label="待整理文本" className={`${INPUT} mt-3`} rows={4} value={previewInput} onChange={(e) => setPreviewInput(e.target.value)} placeholder="输入测试文本（FireRed2 使用本机模型，其他连接使用智谱免费模型）" />
       <button className={`${BUTTON} mt-2`} disabled={busy || !previewInput.trim()} onClick={() => run(async () => {
         setPreview(await api.polishText(previewInput, { mode, hotRule: true, longFormat: { enabled: true } }));
       })}>{busy ? '正在整理…' : '预览'}</button>

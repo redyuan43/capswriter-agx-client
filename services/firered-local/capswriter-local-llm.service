@@ -1,0 +1,13 @@
+[Unit]
+Description=CapsWriter local Qwen3-4B text processing
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sg docker -c "exec /usr/bin/docker run --rm --name capswriter-local-llm --device nvidia.com/gpu=all --network host --ipc private --mount type=bind,src=%h/weight/capswriter,dst=/models,readonly --entrypoint /opt/llama/llama-server nx6/llamacpp-ornith:jp7-mcp5-ckpt --model /models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf --alias capswriter-qwen3-4b --host 127.0.0.1 --port 18087 -ngl 99 -fa on -c 8192 --parallel 1 --jinja --reasoning-budget 0 --cache-ram 0 --sleep-idle-seconds 600"
+ExecStop=/usr/bin/sg docker -c "/usr/bin/docker stop -t 30 capswriter-local-llm"
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

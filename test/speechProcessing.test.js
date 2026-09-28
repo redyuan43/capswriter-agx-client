@@ -6,6 +6,46 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { SpeechTextFormatter, validateLight, validateEnhancement } = require('../src/helpers/speechTextFormatter');
+
+test('FireRed2 整理只访问本机，切回腾讯仍固定免费 GLM', async () => {
+  let active = 'firered2-local', keyReads = 0;
+  const calls = [];
+  const formatter = new SpeechTextFormatter({ getAsrProfileId: () => active,
+    getApiKey: () => { keyReads++; return 'cloud-secret'; },
+    fetchImpl: async (url, init) => {
+      calls.push({ url, ...init, body: JSON.parse(init.body) });
+      return { ok: true, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: '你好。' } }] }) };
+    },
+  });
+  assert.equal((await formatter.format('你好')).provider, 'local');
+  assert.equal(keyReads, 0);
+  assert.equal(calls[0].url, 'http://127.0.0.1:18087/v1/chat/completions');
+  assert.equal(calls[0].headers.Authorization, undefined);
+  assert.equal(calls[0].redirect, 'error');
+  assert.equal(calls[0].body.model, 'capswriter-qwen3-4b');
+  assert.equal(calls[0].body.chat_template_kwargs.enable_thinking, false);
+  assert.equal(calls[0].body.reasoning_budget, 0);
+  active = 'tencent-direct';
+  assert.equal((await formatter.format('你好', { asrProvider: 'firered2' })).provider, 'local');
+  assert.equal(keyReads, 0);
+  assert.equal((await formatter.format('你好', { asrProvider: 'tencent' })).provider, 'glm');
+  assert.equal(calls.at(-1).body.model, 'glm-4.7-flash');
+  assert.equal(calls.at(-1).body.thinking.type, 'disabled');
+});
+
+test('本机模型失败不读取云端密钥、不向云端回退', async () => {
+  const urls = [];
+  const formatter = new SpeechTextFormatter({ getAsrProfileId: () => 'firered2-local',
+    getApiKey: () => { throw new Error('不得读取云端密钥'); },
+    fetchImpl: async url => { urls.push(url); throw new Error('offline'); },
+  });
+  const result = await formatter.format('保留这段原文。');
+  assert.equal(result.text, '保留这段原文。');
+  assert.equal(result.degraded, 'request_failed');
+  assert.deepEqual(urls, ['http://127.0.0.1:18087/v1/chat/completions']);
+  assert.equal(formatter.getTimeoutMs('light'), 15000);
+  assert.equal(formatter.getTimeoutMs('prompt'), 60000);
+});
 const { protectedSpans, segmentWithOffsets, applyAliases } = require('../src/helpers/protectedText');
 const { HotRuleReplacer } = require('../src/helpers/hotRuleReplace');
 const { HotWordsStore } = require('../src/platform/electron/hotWordsStore');

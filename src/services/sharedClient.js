@@ -58,6 +58,7 @@ export async function finalizeFileTranscript(payload, options = {}) {
     const hotRule = await api.getSetting?.('text_polish_hot_rule', true);
     const longEnabled = await api.getSetting?.('long_text_format_enabled', true);
     const processing = await api.polishText(raw, { dictionaryVersion: payload.dictionary_version,
+      asrProvider: payload.provider,
       hotRule: hotRule !== false, longFormat: { enabled: longEnabled !== false }, ...(options.processingMode ? { mode: options.processingMode } : {}) });
     return { ...payload, raw_text: raw, raw_asr_text: raw, text: processing.text, final_text: processing.text,
       corrected_text: processing.corrected_text, processing };

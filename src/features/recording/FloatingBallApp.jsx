@@ -1771,10 +1771,10 @@ export default function FloatingBallApp() {
   }, [clearCodexUpdateHideTimer, hideFloatingBall, logRuntime, resetUI, setAnimatedRealtimeTarget, transitionStatus]);
 
   /**
-   * 转写文本整理：原文 → 受保护的规则/别名替换 → 所选 GLM 模式。
+   * 转写文本整理：原文 → 受保护的规则/别名替换 → 当前 ASR 对应的整理模型。
    * 失败保留上一阶段文本，原文与整理结果分别记录。
    */
-  const polishRecognizedText = useCallback(async (rawText, dictionaryVersion) => {
+  const polishRecognizedText = useCallback(async (rawText, dictionaryVersion, asrProvider) => {
     const settings = textPolishRef.current;
     if (!settings.enabled || !rawText || typeof window.electronAPI?.polishText !== "function") {
       return { text: rawText, changed: false, degraded: null };
@@ -1784,6 +1784,7 @@ export default function FloatingBallApp() {
         hotRule: settings.hotRule,
         punctuation: settings.punctuation,
         dictionaryVersion,
+        asrProvider,
         // 整理与交付分开：终端/未知窗口的多行结果只复制。
         longFormat: settings.longFormat,
       });
@@ -1858,7 +1859,7 @@ export default function FloatingBallApp() {
       let polishDegraded = null;
       if (postprocessMode !== 'translate' && recognizedText) {
         // 文件入口可能已经整理，避免再次改写和重复调用模型。
-        const polished = transcriptionResult.processing || await polishRecognizedText(recognizedText, transcriptionResult.dictionary_version);
+        const polished = transcriptionResult.processing || await polishRecognizedText(recognizedText, transcriptionResult.dictionary_version, transcriptionResult.provider);
         transcriptionResult.processing = polished;
         transcriptionResult.corrected_text = polished.corrected_text || recognizedText;
         transcriptionResult.final_text = polished.text;
