@@ -1879,6 +1879,11 @@ export default function FloatingBallApp() {
 
       transcriptionResult.final_text = finalText;
 
+      if (transcriptionResult.provider === 'firered2' && transcriptionResult.timing?.client_stop_at_ms) {
+        transcriptionResult.timing.stop_to_text_ready_ms = Date.now() - transcriptionResult.timing.client_stop_at_ms;
+        logRuntime('info', 'FireRed2 local timing', transcriptionResult.timing);
+      }
+
       if (!fastMode) {
         setAnimatedRealtimeTarget(finalText, { immediate: true });
       }

@@ -583,3 +583,33 @@ test('reset cancels and invalidates the module startup idle callback', async (t)
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(FakeWebSocket.instances.length, 0);
 });
+
+for (const provider of ['firered2', 'tencent']) {
+  test(`${provider}: 仅 FireRed2 整段模式延长最终等待并记录耗时`, async (t) => {
+    FakeWebSocket.instances = [];
+    global.WebSocket = FakeWebSocket;
+    global.window = runtimeWindow({ realtime_asr_url: 'ws://localhost/realtime' });
+    t.after(() => { delete global.WebSocket; delete global.window; });
+    const { PCMRealtimeSession, resetRealtimeAsrPreconnection } = await loadBackendApi(t);
+    t.after(resetRealtimeAsrPreconnection);
+    const session = new PCMRealtimeSession();
+    const starting = session.start();
+    await tick();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    await tick();
+    socket.emitMessage({ type: 'ready', provider, partial_mode: 'batch_on_finish' });
+    await starting;
+    const timers = [];
+    const original = global.setTimeout;
+    let finishing;
+    try {
+      global.setTimeout = (fn, ms, ...args) => { timers.push(ms); return original(fn, ms, ...args); };
+      finishing = session.finish({ timeoutMs: 5000 });
+    } finally { global.setTimeout = original; }
+    socket.emitMessage({ type: 'final', provider, text: '完成', timing: { asr_ms: 12 } });
+    const result = await finishing;
+    assert.ok(timers.includes(provider === 'firered2' ? 120000 : 5000));
+    assert.equal(typeof result.timing.client_finish_to_result_ms, provider === 'firered2' ? 'number' : 'undefined');
+  });
+}

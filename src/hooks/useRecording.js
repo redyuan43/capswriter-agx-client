@@ -1057,6 +1057,10 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             });
             throw realtimeFailedError || new Error('实时语音识别失败');
           }
+          if (realtimePayload?.provider === 'firered2') {
+            realtimePayload.timing = { ...realtimePayload.timing, client_stop_at_ms: stopAt,
+              stop_to_asr_result_ms: Date.now() - stopAt };
+          }
           await processAudio(audioBlob, localAudioStats, realtimePayload);
         } finally {
           releaseActiveMicrophone('recording_finalization_cleanup');

@@ -939,6 +939,7 @@ export class PCMRealtimeSession {
         }
         if (type === 'ready') {
           if (settled) return;
+          this.localBatch = payload.provider === 'firered2' && payload.partial_mode === 'batch_on_finish';
           ready = true;
           settled = true;
           const readyAt = monotonicNow();
@@ -1139,10 +1140,13 @@ export class PCMRealtimeSession {
       throw new Error('Realtime ASR session is not open');
     }
     this.flushPendingChunks();
-    const timeoutMs = normalizePositiveNumber(
+    const requestedTimeoutMs = normalizePositiveNumber(
       options.timeoutMs,
       normalizePositiveNumber(REALTIME_ASR_FINAL_TIMEOUT_MS, 15000)
     );
+    // 本地整段识别从 finish 才开始，不能套用线上“无 partial 等 5 秒”的期限。
+    const timeoutMs = this.localBatch ? Math.max(requestedTimeoutMs, 120000) : requestedTimeoutMs;
+    const finishAt = Date.now();
     this.websocket.send(JSON.stringify({ type: 'finish' }));
     const payload = await withClientTimeout(
       this.finalPromise,
@@ -1150,6 +1154,7 @@ export class PCMRealtimeSession {
       `Realtime ASR final timeout (${timeoutMs}ms)`,
       "REALTIME_ASR_FINAL_TIMEOUT"
     );
+    if (this.localBatch) payload.timing = { ...payload.timing, client_finish_to_result_ms: Date.now() - finishAt };
     this.websocket.close();
     releaseRealtimeAsrSocket(this.websocket);
     scheduleRealtimeAsrPreconnect(250);

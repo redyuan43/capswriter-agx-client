@@ -112,7 +112,7 @@ async def status():
     return {'status': state, 'ready': engine is not None and not unloading,
             'asr_ready': engine is not None, 'provider': 'firered2', 'busy': busy,
             'service_ready': True, 'lazy_load': True, 'idle_unload_seconds': IDLE_UNLOAD_SECONDS,
-            'partial_mode': 'vad_segment', 'capabilities': CAPABILITIES}
+            'partial_mode': 'batch_on_finish', 'capabilities': CAPABILITIES}
 
 
 def payload(kind, text, raw, session_id, samples):
@@ -241,13 +241,13 @@ async def realtime(ws: WebSocket):
     worker = None
     owned = False
     finishing = False
-    pending = 0
     samples = 0
     prepared = False
+    finish_at = 0.0
     session_id = str(uuid4())
 
     async def consume():
-        nonlocal pending, prepared
+        nonlocal prepared
         previous = ''
         try:
             if engine is None or unloading:
@@ -256,23 +256,26 @@ async def realtime(ws: WebSocket):
             await ensure_model()
             if cancelled.is_set():
                 return
-            await run(engine.new_session)
+            await run(engine.new_session, True)
             if cancelled.is_set():
                 return
             prepared = True
             await ws.send_json({'type': 'ready', 'success': True, 'provider': 'firered2',
-                                'session_id': session_id, 'partial_mode': 'vad_segment',
+                                'session_id': session_id, 'partial_mode': 'batch_on_finish',
                                 'capabilities': CAPABILITIES})
             while not cancelled.is_set():
                 pcm, finish = await queue.get()
                 if cancelled.is_set():
                     return
                 text, raw = await run(engine.process, pcm, finish, cancelled)
-                pending -= len(pcm)
                 if cancelled.is_set():
                     return
                 if finish or text != previous:
-                    await ws.send_json(payload('final' if finish else 'partial', text, raw, session_id, samples))
+                    result = payload('final' if finish else 'partial', text, raw, session_id, samples)
+                    result['partial_mode'] = 'batch_on_finish'
+                    result['timing'] = {**engine.timing, 'finish_to_result_ms': round((time.monotonic() - finish_at) * 1000, 2)}
+                    log.info('FireRed2 timing session=%s audio_s=%.3f timing=%s', session_id, samples / 16000, result['timing'])
+                    await ws.send_json(result)
                     previous = text
                 if finish:
                     await ws.close()
@@ -295,9 +298,8 @@ async def realtime(ws: WebSocket):
             if pcm is not None:
                 if not prepared or finishing or len(pcm) % 2 or len(pcm) > 320000:
                     raise ValueError('需要开始会话后发送 16 kHz 单声道 PCM16 音频')
-                pending += len(pcm)
-                if pending > 4 * 1024 * 1024:
-                    raise ValueError('识别处理速度不足，音频队列已满，请重试')
+                if (samples * 2 + len(pcm)) > 4 * 1024 * 1024:
+                    raise ValueError('本机整段录音超过 4 MB，请分段录音')
                 samples += len(pcm) // 2
                 if pcm:
                     queue.put_nowait((pcm, False))
@@ -319,6 +321,7 @@ async def realtime(ws: WebSocket):
                 worker = asyncio.create_task(consume())
             elif kind == 'finish' and prepared and not finishing:
                 finishing = True
+                finish_at = time.monotonic()
                 queue.put_nowait((b'', True))
             else:
                 raise ValueError('录音控制消息顺序无效')

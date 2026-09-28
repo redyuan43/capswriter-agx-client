@@ -261,7 +261,7 @@ export default function AsrConnectionPanel() {
               : cloudStatus?.asr_ready ? (cloudStatus.busy ? '本机模型已就绪，正在处理录音。' : '本机模型已就绪。')
               : cloudStatus?.service_ready ? '本机服务在线，首次使用时加载模型。' : '尚未连接到本机服务，请确认 FireRed2 已启动。'}</p>
             <p className="mt-1">闲置 10 分钟后释放模型内存。首次录音或测试连接需要等待模型加载，最多等待 2 分钟。</p>
-            <p className="mt-1">停顿后逐句显示结果。日常输入保留本机标点、热词和规则处理，不调用大模型；不回退云端。</p>
+            <p className="mt-1">本机录音在松开后整段识别一次，录音中不显示中间文字。日常输入保留本机标点、热词和规则处理，不调用大模型；不回退云端。</p>
             <p className="mt-1">需要提示词优化时，在语音整理设置中粘贴文字并点击“手动提示词优化”，使用本机 Qwen3-4B，最多等待 60 秒。</p>
           </div>}
           {!draft.preset && <label className="block text-xs text-gray-600">认证方式

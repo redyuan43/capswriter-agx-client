@@ -1,6 +1,7 @@
 """本机模型适配：只识别、断句，不执行词库替换或 LLM 整理。"""
 import os
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -98,24 +99,44 @@ class Engine:
                                    min_silence_frame=30, max_speech_frame=800))
         self.punc = FireRedPunc.from_pretrained(str(root / 'FireRedPunc'), FireRedPuncConfig(use_gpu=False))
 
-    def new_session(self):
+    def new_session(self, batch=False):
+        self.batch = batch
+        self.buffer = bytearray()
+        self.timing = {'asr_ms': 0, 'punctuation_ms': 0}
         self.segmenter = Segmenter(self.vad)
         self.raw_parts = []
         self.parts = []
 
     def process(self, pcm, finish, cancelled):
         import torch
+        if self.batch:
+            self.buffer.extend(pcm)
+            if not finish or cancelled.is_set():
+                return '', ''
+            audio = np.frombuffer(bytes(self.buffer), dtype='<i2')
+            self.buffer.clear()
+            segments = [audio] if len(audio) else []
+        else:
+            segments = self.segmenter.feed(pcm, finish)
         with torch.inference_mode():
-            for audio in self.segmenter.feed(pcm, finish):
+            for audio in segments:
                 if cancelled.is_set():
                     break
+                torch.cuda.synchronize()
+                started = time.perf_counter()
                 rows = self.asr.transcribe([str(len(self.parts))], [(16000, audio)])
+                torch.cuda.synchronize()
+                self.timing['asr_ms'] += round((time.perf_counter() - started) * 1000, 2)
                 if not rows:
                     raise RuntimeError('FireRed2 未返回识别结果，请检查模型日志')
                 raw = rows[0].get('text', '').strip()
                 if not raw:
                     continue
+                if cancelled.is_set():
+                    break
+                started = time.perf_counter()
                 punctuated = self.punc.process([raw], [str(len(self.parts))])
+                self.timing['punctuation_ms'] += round((time.perf_counter() - started) * 1000, 2)
                 self.raw_parts.append(raw)
                 self.parts.append(punctuated[0]['punc_text'] if punctuated else raw)
         return join_text(self.parts), join_text(self.raw_parts)
