@@ -9,6 +9,44 @@ const { realtimeUrl, cloudRequest, normalizeSegments, joinSegments, STANDARD, MO
 const { TencentQuota, freeSeconds } = require('../src/helpers/tencentQuota');
 const { TencentDirectBridge } = require('../src/helpers/tencentDirectBridge');
 const { HotWordsStore } = require('../src/platform/electron/hotWordsStore');
+const { relayTencent } = require('../src/helpers/tencentRealtimeRelay');
+const { EventEmitter } = require('events');
+
+test('腾讯异常 JSON 和分句结构返回错误，不抛出未捕获异常', async () => {
+  for (const malformed of [null, [], 42, { sentences: { sentence_list: {} } }, { sentences: { sentence_list: [null] } }]) {
+    const events = [];
+    class Socket extends EventEmitter {
+      readyState = WebSocket.OPEN;
+      send(raw) { events.push(JSON.parse(raw)); }
+      close() {}
+      terminate() {}
+    }
+    class Upstream extends Socket {
+      constructor() { super(); queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify(malformed)))); }
+    }
+    const client = new Socket();
+    const relay = relayTencent(client, { provider: { realtimeUrl: () => 'ws://test.invalid' },
+      quota: { begin: () => STANDARD, record() {}, status: () => ({}) },
+      snapshot: { hotword: '', version: 'test' }, WebSocketImpl: Upstream });
+    try {
+      client.emit('message', Buffer.from('{"type":"start","sample_rate":16000}'), false);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(events.at(-1).type, 'error');
+    } finally { relay.cancel(); }
+  }
+});
+
+test('腾讯控制通道拒绝 JSON null，不建立上游连接', () => {
+  const client = new EventEmitter(), events = [];
+  client.readyState = WebSocket.OPEN;
+  client.send = raw => events.push(JSON.parse(raw));
+  client.close = () => {};
+  const relay = relayTencent(client, { provider: { realtimeUrl() { throw new Error('不应调用'); } }, quota: { record() {} } });
+  try {
+    assert.doesNotThrow(() => client.emit('message', Buffer.from('null'), false));
+    assert.equal(events[0].type, 'error');
+  } finally { relay.cancel(); }
+});
 
 const credentials = { tencentAppId: '123456', tencentSecretId: 'test-id', tencentSecretKey: 'test-secret' };
 function directory(t) {

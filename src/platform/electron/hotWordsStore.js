@@ -100,7 +100,10 @@ class HotWordsStore {
         const byTerm = new Map(this.entries.map((entry) => [entry.term.toLowerCase(), entry]));
         for (const entry of parseHotWords(text)) {
           const key = entry.term.toLowerCase();
-          byTerm.set(key, normalizeEntry({ ...byTerm.get(key), ...entry }));
+          const existing = byTerm.get(key);
+          // GUI 编辑后的 JSON 词条优先；旧文件追加不能重置已调整的权重。
+          if (existing?.updatedAt > 0) continue;
+          byTerm.set(key, normalizeEntry({ ...existing, ...entry }));
         }
         this.entries = [...byTerm.values()];
         this.sourceHash = hash;

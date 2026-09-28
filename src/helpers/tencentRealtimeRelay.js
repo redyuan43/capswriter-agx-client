@@ -67,6 +67,10 @@ function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getS
       if (done || socket !== upstream) return;
       let data;
       try { data = JSON.parse(raw.toString()); } catch { stop('failed', '腾讯返回无效数据'); return; }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) { stop('failed', '腾讯返回无效数据'); return; }
+      let normalized;
+      try { normalized = normalizeSegments(data); }
+      catch { stop('failed', '腾讯返回无效分句数据'); return; }
       if (data.code && data.code !== 0) {
         if (Number(data.code) === 4004 && engine === STANDARD) {
           try { quota.exhausted(); } catch { stop('failed', '本地额度记录失败'); return; }
@@ -87,13 +91,13 @@ function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getS
           hotword: snapshot.hotword, dictionary_version: snapshot.version,
           capabilities: { asr: true, optimize: false, translate: false } });
       }
-      for (const segment of normalizeSegments(data)) {
+      for (const segment of normalized) {
         if (!segments.get(segment.id)?.isFinal || segment.isFinal) segments.set(segment.id, segment);
       }
       if (data.final === 1) {
         if (!endSent) { stop('failed', '腾讯提前结束会话'); return; }
         emit(payload('final')); stop('completed');
-      } else if (normalizeSegments(data).length) emit(payload('partial'));
+      } else if (normalized.length) emit(payload('partial'));
     });
     socket.on('error', () => { if (socket === upstream) stop('failed', '腾讯连接失败'); });
     socket.on('close', () => { if (socket === upstream && !done) stop('failed', '腾讯连接在最终结果前断开'); });
@@ -108,6 +112,7 @@ function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getS
     }
     let command;
     try { command = JSON.parse(raw.toString()); } catch { stop('failed', '录音控制消息无效'); return; }
+    if (!command || typeof command !== 'object' || Array.isArray(command)) { stop('failed', '录音控制消息无效'); return; }
     if (command.type === 'cancel') { stop('cancelled'); return; }
     if (command.type === 'start' && !started) {
       if (command.sample_rate !== 16000 || !['none', '', undefined, false].includes(command.optimize_mode)) { stop('failed', '腾讯直连需要 16000 Hz PCM；翻译请另选连接'); return; }

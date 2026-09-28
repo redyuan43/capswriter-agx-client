@@ -112,6 +112,21 @@ test('词库原子保存失败时不谎报成功、不改变内存', (t) => {
   assert.equal(store.add(['新词']).added, 0); assert.deepEqual(store.list(), ['原词']);
 });
 
+test('旧词表追加后保留 GUI 权重、别名及禁用状态', (t) => {
+  const dir = temp(t), legacy = path.join(dir, 'hot-words.txt');
+  fs.writeFileSync(legacy, '原词|11\n未编辑|4\n');
+  const store = new HotWordsStore({ dataDirectory: dir });
+  store.update({ term: '原词', weight: 3, aliases: ['元词'], enabled: false });
+  fs.writeFileSync(legacy, '原词|11\n未编辑|6\n新增|5\n');
+  const restored = new HotWordsStore({ dataDirectory: dir });
+  const entry = restored.entries.find(row => row.term === '原词');
+  assert.equal(entry.weight, 3);
+  assert.equal(entry.enabled, false);
+  assert.deepEqual(entry.aliases, ['元词']);
+  assert.equal(restored.entries.find(row => row.term === '未编辑').weight, 6);
+  assert.ok(restored.list().includes('新增'));
+});
+
 test('WorkBuddy 模板字节和上游固定版本一致', () => {
   for (const [name, digest] of [
     ['enhance_system_prompt.md', 'f8306b1918a322c0d6e3a646715a73210de2f8e5277243a7220bedf3ee89c1f9'],
