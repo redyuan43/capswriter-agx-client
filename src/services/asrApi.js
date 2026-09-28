@@ -1,5 +1,5 @@
 import backendConfig from '../config/backend.js';
-import { apiClient, getBaseURL, getAsrBaseURL, inferAudioUploadFilename } from './sharedClient.js';
+import { apiClient, getAsrBaseURL, inferAudioUploadFilename, finalizeFileTranscript } from './sharedClient.js';
 
 export async function transcribeAudio(audioBlob, options = {}) {
   const { useVad = true, usePunc = true, hotword = '' } = options;
@@ -13,7 +13,7 @@ export async function transcribeAudio(audioBlob, options = {}) {
     timeout: 120000,
     headers: { 'Content-Type': 'multipart/form-data' }
   });
-  return response.data;
+  return finalizeFileTranscript(response.data, options);
 }
 
 export async function transcribeAudioStream(audioBlob, options = {}) {
@@ -71,11 +71,9 @@ export async function transcribeAudioStream(audioBlob, options = {}) {
       if (!trimmed || !trimmed.startsWith('data:')) continue;
       const dataStr = trimmed.slice(5).trim();
       if (!dataStr) continue;
-      try {
-        handlePayload(JSON.parse(dataStr));
-      } catch (error) {
-        console.warn('[API] Ignore malformed SSE payload:', error);
-      }
+      let payload;
+      try { payload = JSON.parse(dataStr); } catch { throw new Error('ASR 返回无效的流式数据'); }
+      handlePayload(payload);
     }
   }
 
@@ -90,16 +88,13 @@ export async function transcribeAudioStream(audioBlob, options = {}) {
   if (!finalPayload) {
     throw new Error('Stream finished without done event');
   }
-  return finalPayload;
+  return finalizeFileTranscript(finalPayload, options);
 }
 
 export async function optimizeText(text, mode = 'optimize', customPrompt = null) {
-  const response = await apiClient.post(`${await getBaseURL()}${backendConfig.endpoints.optimize}`, {
-    text,
-    mode,
-    custom_prompt: customPrompt
-  });
-  return response.data;
+  if (customPrompt) throw new Error('请使用已配置的轻度润色或提示词优化模板');
+  if (!window.electronAPI?.processText) throw new Error('请在桌面客户端使用文本整理');
+  return window.electronAPI.processText(text, mode);
 }
 
 export async function transcribeAndOptimize(audioBlob, options = {}) {
@@ -115,7 +110,7 @@ export async function transcribeAndOptimize(audioBlob, options = {}) {
     timeout: 120000,
     headers: { 'Content-Type': 'multipart/form-data' }
   });
-  return response.data;
+  return finalizeFileTranscript(response.data, options);
 }
 
 export async function getBackendStatus() {

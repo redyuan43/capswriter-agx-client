@@ -125,7 +125,9 @@ const VoiceActionManager = require("./src/helpers/voiceActionManager");
 const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
-const { LongTextFormatter } = require("./src/helpers/longTextFormatter");
+const { SpeechTextFormatter } = require("./src/helpers/speechTextFormatter");
+const { ProviderSecrets } = require("./src/helpers/providerSecrets");
+const { TencentDirectBridge } = require('./src/helpers/tencentDirectBridge');
 const { TextPolisher } = require("./src/platform/electron/textPolish");
 const { HotWordsStore } = require("./src/platform/electron/hotWordsStore");
 const M5VoiceBridge = require("./src/helpers/m5VoiceBridge");
@@ -437,29 +439,14 @@ const asrConnectionProfiles = new AsrConnectionProfiles({
 });
 clipboardManager.setDatabaseManager(databaseManager);
 const voiceDatasetRecorder = new VoiceDatasetRecorder({ documentsDirectory: app.getPath("documents"), logger });
-// 长文本整理（去口水词 + 修错别字 + 接回被误断的句子 + 分段）。
-// 主力后端 = 本机 ollama 的 qwen2.5:7b（3060，2026-09-21 原哥拍板切换：
-// "如果 7B 能解决，就不需要 AMD 了"）。7B 实测：延迟 0.7~2.5s、保真 7/8
-// PASS；短板是不分段、会吞逗号问号，但不依赖一台经常整晚挂掉的远程机器
-// （2026-09-20 晚 AMD 连挂一整晚，用户看到的"标点断句一塌糊涂"就是没整理
-// 的原文）。
-// 历史选型：3B 只会把句号机械换行且中英混排崩成逐词加空格（v1.0.24/25）；
-// AMD 27B 质量最好（v1.0.26~29）但可用性差，现降级为 env 可选。
-// CAPS_LONG_TEXT_PROVIDER=openai 切回 AMD；CAPS_LONG_TEXT_FALLBACK=openai
-// 可给 7B 挂 AMD 反向兜底（默认不挂）。超时 30s：容忍 7B 冷启动 ~25s。
-const longTextFormatter = new LongTextFormatter({
-  provider: process.env.CAPS_LONG_TEXT_PROVIDER || "ollama",
-  endpoint: process.env.CAPS_LONG_TEXT_ENDPOINT || undefined,
-  model: process.env.CAPS_LONG_TEXT_MODEL || undefined,
-  timeoutMs: Number(process.env.CAPS_LONG_TEXT_TIMEOUT) || 30000,
-  keepAlive: "2h",
-  fallback: process.env.CAPS_LONG_TEXT_FALLBACK === "openai"
-    ? { provider: "openai" }
-    : null,
-  logger,
+const providerSecrets = new ProviderSecrets({ dataDirectory, safeStorage });
+const longTextFormatter = new SpeechTextFormatter({
+  getApiKey: () => providerSecrets.get().glmApiKey,
 });
-const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter });
 const hotWordsStore = new HotWordsStore({ dataDirectory, logger });
+const tencentDirectBridge = new TencentDirectBridge({ dataDirectory, getCredentials: () => providerSecrets.get(), hotWordsStore });
+asrConnectionProfiles.directConnection = () => tencentDirectBridge.connection();
+const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter, hotWordsStore });
 const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory });
 const nx1QwenRouter = new Nx1QwenRouter({ logger, databaseManager });
 const voiceLearningManager = new VoiceLearningManager({ logger });
@@ -470,6 +457,7 @@ const m5VoiceBridge = new M5VoiceBridge({
   clipboardManager,
   databaseManager,
   asrConnectionProfiles,
+  hotWordsStore,
   sendToRenderer: safeSendToMainWindow,
   dataDirectory,
 });
@@ -612,6 +600,7 @@ const ipcHandlers = new IPCHandlers({
   logger,
   voiceDatasetRecorder,
   textPolisher,
+  providerSecrets,
   hotWordsStore,
   asrConnectionProfiles,
   m5VoiceBridge,
@@ -1226,24 +1215,7 @@ app.whenReady().then(async () => {
     logger.warn('Realtime ASR proxy resolution failed', error?.message || error);
   });
 
-  // 长文本整理服务预热。放在这里而不是第一次转写时：模型冷启动实测 3.1 秒，
-  // 而请求超时只给了 5 秒——冷启动占掉大半个预算，机器一忙就会在用户
-  // 第一次长口述时超时回退。预热把这段等待挪到开机阶段。
-  // 不 await：预热失败（ollama 没装/没起）不能影响客户端启动。
-  if (textPolisher.longFormatter) {
-    textPolisher.longFormatter
-      .probe()
-      .then((probed) => {
-        if (!probed.available) {
-          logger.warn('长文本整理服务不可用，本次运行将跳过整理', probed);
-          return null;
-        }
-        return textPolisher.longFormatter.warmup();
-      })
-      .catch((error) => {
-        logger.warn('长文本整理预热异常', error?.message || String(error));
-      });
-  }
+  // 云端模型按需请求，不在启动时预热。
 });
 
 app.on("window-all-closed", () => {
@@ -1255,6 +1227,8 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   // Window close handlers must allow closing before Electron can emit will-quit.
   app.isQuitting = true;
+  textPolisher.dispose();
+  tencentDirectBridge.dispose();
   codexTerminalManager.stop();
 });
 
@@ -1266,6 +1240,7 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
   app.isQuitting = true;
+  textPolisher.dispose();
   stopClipboardWatch();
   pipeWirePlayback.stop("app_quit");
   m5BridgeIngress.stop();

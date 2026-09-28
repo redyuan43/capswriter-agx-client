@@ -1,0 +1,18 @@
+[Unit]
+Description=CapsWriter local FireRed2 ASR
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=%h/weight/fireredasr2-nx4/vendor/firered-asr2s
+Environment=FIRERED_MODEL_ROOT=%h/weight/fireredasr2-nx4/models/firered
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/weight/fireredasr2-nx4/venv/bin/python %h/.local/opt/capswriter-firered/server.py
+WorkingDirectory=%h/.local/opt/capswriter-firered
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

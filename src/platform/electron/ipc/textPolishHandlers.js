@@ -1,25 +1,9 @@
 const { ipcMain } = require("electron");
 const { isTerminalWindow } = require("../../../helpers/terminalFocus");
 
-/**
- * 判断录音目标窗口是不是终端。返回三态：
- *   true  = 确认是终端
- *   false = 确认不是终端
- *   null  = 判断不出来（未知）
- *
- * 用 windowManager 在录音开始时记下的活动窗口（悬浮球是非聚焦的，
- * 所以那个窗口就是最终粘贴的目标），取它的 WM_CLASS 来判断。
- *
- * 为什么未知必须单列一态：长文本整理会插换行，而终端里换行等于回车执行。
- * "读不到窗口"和"不是终端"是两件事，混成一个 false 就等于在信息不足时
- * 照样排版——2026-09-20 端到端回放抓到过这个方向性错误。未知时调用方
- * 会跳过整理，代价只是这次不分段，而不是往终端里粘一串命令。
- *
- * 非 Linux 平台没有终端识别的实现，直接返回 false（维持原有行为，
- * 不能因为没实现这个判据就把功能整个关掉）。
- */
+// true 为终端，false 为已知编辑器，null 为未知。未知目标的多行结果仅复制。
 function resolveTerminalState(ctx) {
-  if (process.platform !== "linux") return false;
+  if (process.platform !== "linux") return null;
   try {
     const windowId = ctx.windowManager?.previousActiveWindow;
     if (!windowId) return null;
@@ -33,15 +17,31 @@ function resolveTerminalState(ctx) {
 }
 
 function registerTextPolishHandlers(ctx, ipcMainImpl = ipcMain) {
-  ipcMainImpl.handle("polish-text", async (_event, text, options = {}) => {
+  const active = new Map();
+  ipcMainImpl.handle('cancel-text-polish', (event) => {
+    active.get(event.sender.id)?.abort();
+    active.delete(event.sender.id);
+  });
+  ipcMainImpl.handle('get-provider-status', () => ctx.providerSecrets?.status() || { configured: {} });
+  ipcMainImpl.handle('save-provider-secrets', (_event, patch) => {
+    if (!ctx.providerSecrets) throw new Error('凭据存储不可用');
+    return ctx.providerSecrets.save(patch);
+  });
+  const polish = async (event, text, options = {}) => {
     if (!ctx.textPolisher) {
       return { text: text || "", changed: false, stages: [], degraded: "polisher_unavailable" };
     }
+    const senderId = event.sender.id;
+    active.get(senderId)?.abort();
+    const controller = new AbortController();
+    const onDestroyed = () => controller.abort();
+    event.sender.once?.('destroyed', onDestroyed);
+    active.set(senderId, controller);
     try {
-      // 只有真正要长文本整理时才去查窗口，省掉无谓的 xprop 调用
-      const payload = options.longFormat?.enabled
-        ? { ...options, longFormat: { ...options.longFormat, isTerminal: resolveTerminalState(ctx) } }
-        : options;
+      // 目标窗口影响交付方式，不阻止文本整理。
+      const payload = { ...options, signal: controller.signal,
+        mode: options.mode || ctx.databaseManager?.getSetting('text_processing_mode', 'light'),
+        longFormat: { ...options.longFormat, isTerminal: resolveTerminalState(ctx) } };
       return await ctx.textPolisher.polish(text, payload);
     } catch (error) {
       ctx.logger?.warn("文本整理失败，已回退原文:", error?.message || error);
@@ -51,8 +51,17 @@ function registerTextPolishHandlers(ctx, ipcMainImpl = ipcMain) {
         stages: [],
         degraded: error?.message || String(error),
       };
+    } finally {
+      event.sender.removeListener?.('destroyed', onDestroyed);
+      if (active.get(senderId) === controller) active.delete(senderId);
     }
+  };
+  ipcMainImpl.handle('polish-text', polish);
+  ipcMainImpl.handle('process-text', async (event, text, mode) => {
+    const result = await polish(event, text, { mode: mode === 'prompt' ? 'prompt' : undefined, hotRule: true, longFormat: { enabled: true } });
+    return { ...result, success: result.degraded !== 'cancelled', optimized_text: result.text };
   });
+
 
   ipcMainImpl.handle("reload-hot-rules", () => {
     if (!ctx.textPolisher) return 0;
@@ -67,4 +76,4 @@ function registerTextPolishHandlers(ctx, ipcMainImpl = ipcMain) {
   });
 }
 
-module.exports = { registerTextPolishHandlers };
+module.exports = { registerTextPolishHandlers, resolveTerminalState };

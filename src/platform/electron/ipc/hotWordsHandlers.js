@@ -8,13 +8,23 @@ function registerHotWordsHandlers(ctx, ipcMainImpl = ipcMain) {
       ctx.logger?.warn("热词存储未接入 ctx，本次录音将不带热词");
       return { terms: [], hotword: "", count: 0, path: "", degraded: "store_unavailable" };
     }
+    const snapshot = ctx.hotWordsStore.snapshot();
     return {
-      terms: ctx.hotWordsStore.list(),
-      hotword: ctx.hotWordsStore.toHotwordString(),
+      ...snapshot,
+      dictionary: ctx.hotWordsStore.entries,
+      candidates: ctx.hotWordsStore.candidates,
+      terms: snapshot.terms,
+      hotword: snapshot.hotword,
       count: ctx.hotWordsStore.entries.length,
       path: ctx.hotWordsStore.filePath,
     };
   });
+
+  ipcMainImpl.handle('update-hot-word', (_event, entry) => {
+    if (!ctx.hotWordsStore) throw new Error('词库不可用');
+    return ctx.hotWordsStore.update(entry);
+  });
+  ipcMainImpl.handle('propose-hot-words', (_event, terms) => ctx.hotWordsStore.propose(Array.isArray(terms) ? terms.slice(0, 256) : []));
 
   ipcMainImpl.handle("reload-hot-words", () => {
     if (!ctx.hotWordsStore) return 0;

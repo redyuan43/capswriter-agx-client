@@ -30,7 +30,7 @@ export function formatProbeMetrics(metrics = {}) {
   return values.join(' · ');
 }
 
-export function probeAsrConnection(connection, { WebSocketImpl = WebSocket, timeoutMs = 15000 } = {}) {
+export function probeAsrConnection(connection, { WebSocketImpl = WebSocket, timeoutMs = 15000, readinessOnly = false } = {}) {
   return new Promise((resolve, reject) => {
     const startedAt = now();
     let socket = null;
@@ -46,7 +46,7 @@ export function probeAsrConnection(connection, { WebSocketImpl = WebSocket, time
       if (error) reject(error);
       else resolve(result);
     };
-    const timeout = setTimeout(() => finish(null, new Error('ASR 测试超时：服务未完成音频处理')), timeoutMs);
+    const timeout = setTimeout(() => finish(null, new Error(readinessOnly ? 'ASR 测试超时：服务未就绪' : 'ASR 测试超时：服务未完成音频处理')), timeoutMs);
     try {
       const protocols = buildRealtimeAsrProtocols(connection?.token);
       socket = protocols.length ? new WebSocketImpl(connection.url, protocols) : new WebSocketImpl(connection.url);
@@ -65,6 +65,12 @@ export function probeAsrConnection(connection, { WebSocketImpl = WebSocket, time
         finish(null, new Error(payload?.error || payload?.message || 'ASR 服务拒绝测试请求'));
       } else if (payload?.type === 'ready' && !readyAt) {
         readyAt = now();
+        if (readinessOnly) {
+          socket.send(JSON.stringify({ type: 'cancel' }));
+          finish({ handshakeMs: handshakeAt - startedAt, servicePrepareMs: readyAt - handshakeAt,
+            endToEndMs: readyAt - startedAt });
+          return;
+        }
         uploadStartedAt = now();
         for (const chunk of silentPcmChunks()) socket.send(chunk);
         socket.send(JSON.stringify({ type: 'finish' }));

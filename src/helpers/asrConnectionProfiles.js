@@ -6,7 +6,9 @@ const SECRET_FILE_NAME = "asr-connection-secrets.json";
 const PUBLIC_ASR_URL = "wss://asr.yuanspaces.com/api/asr/realtime";
 
 const PRESETS = [
-  { id: "tencent", name: "腾讯云·中国直连", url: "ws://ai-x10drg.taild500c8.ts.net:18011/api/asr/realtime", httpBaseUrl: "http://ai-x10drg.taild500c8.ts.net:18011", auth: "none", preset: true },
+  { id: "tencent-direct", name: "腾讯云 · 本机直连", url: "ws://127.0.0.1", auth: "none", preset: true },
+  { id: "firered2-local", name: "FireRed2 · 本机", url: "ws://127.0.0.1:18011/api/asr/realtime", httpBaseUrl: "http://127.0.0.1:18011", auth: "none", preset: true },
+  { id: "tencent", name: "腾讯云 · AI 机器转发", url: "ws://ai-x10drg.taild500c8.ts.net:18011/api/asr/realtime", httpBaseUrl: "http://ai-x10drg.taild500c8.ts.net:18011", auth: "none", preset: true },
   { id: "spark", name: "Spark", url: "ws://spark-31d6.taild500c8.ts.net:18011/api/asr/realtime", auth: "none", preset: true },
   { id: "public", name: "公网", url: PUBLIC_ASR_URL, auth: "token", preset: true },
   { id: "agx", name: "AGX", url: "ws://agx.taild500c8.ts.net:18011/api/asr/realtime", auth: "none", preset: true },
@@ -219,6 +221,10 @@ class AsrConnectionProfiles {
     this.initialize();
     const config = this.readConfig();
     const profile = config.profiles.find((item) => item.id === config.activeProfileId) || config.profiles[0];
+    if (profile.id === 'tencent-direct') {
+      if (!this.directConnection) throw new Error('腾讯本机直连尚未初始化');
+      return this.directConnection();
+    }
     let token = "";
     if (profile.auth === "token") {
       const secrets = this.readSecrets();
@@ -234,6 +240,10 @@ class AsrConnectionProfiles {
     const config = this.readConfig();
     const existing = config.profiles.find((item) => item.id === profile?.id) || null;
     const normalized = normalizeProfile(profile, existing);
+    if (normalized.id === 'tencent-direct') {
+      if (!this.directConnection) throw new Error('腾讯本机直连尚未初始化');
+      return this.directConnection();
+    }
     const suppliedToken = typeof token === "string" ? token.trim() : "";
     const secrets = this.readSecrets();
     const resolvedToken = normalized.auth === "token"

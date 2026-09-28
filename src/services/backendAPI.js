@@ -6,7 +6,7 @@
 
 import axios from 'axios';
 import backendConfig from '../config/backend.js';
-import { getAsrBaseURL } from './sharedClient.js';
+import { getAsrBaseURL, finalizeFileTranscript } from './sharedClient.js';
 import { createRealtimeProtocolError } from '../helpers/asrResultPolicy.mjs';
 import {
   buildRealtimeAsrProtocols,
@@ -774,6 +774,11 @@ export class PCMRealtimeSession {
   }
 
   async start() {
+    if (typeof window !== 'undefined' && window.electronAPI?.getHotWords) {
+      const snapshot = await window.electronAPI.getHotWords();
+      this.hotword = snapshot.hotword || '';
+      this.dictionaryVersion = snapshot.version || null;
+    }
     const runtimeConnection = await getRealtimeAsrConnection();
     if (this.explicitUrl) {
       this.connectionCandidates = [{
@@ -949,6 +954,8 @@ export class PCMRealtimeSession {
           return;
         }
         if (type === 'final') {
+          payload.dictionary_version ||= this.dictionaryVersion;
+          payload.hotword ||= this.hotword;
           this.finalPayload = payload;
           this.finalResolve(payload);
           return;
@@ -1340,7 +1347,7 @@ export async function transcribeAudio(audioBlob, options = {}) {
       }
     );
 
-    return response.data;
+    return finalizeFileTranscript(response.data, options);
   } catch (error) {
     console.error('Transcription failed:', error);
     throw error;
@@ -1472,12 +1479,9 @@ export async function transcribeAudioStream(audioBlob, options = {}) {
       if (!trimmed || !trimmed.startsWith('data:')) continue;
       const dataStr = trimmed.slice(5).trim();
       if (!dataStr) continue;
-      try {
-        const payload = JSON.parse(dataStr);
-        handlePayload(payload);
-      } catch (e) {
-        console.warn('[API] Ignore malformed SSE payload:', e);
-      }
+      let payload;
+      try { payload = JSON.parse(dataStr); } catch { throw new Error('ASR 返回无效的流式数据'); }
+      handlePayload(payload);
     }
   }
 
@@ -1496,25 +1500,13 @@ export async function transcribeAudioStream(audioBlob, options = {}) {
   if (idleTimerId !== null) {
     clearTimeout(idleTimerId);
   }
-  return finalPayload;
+  return finalizeFileTranscript(finalPayload, options);
 }
 
 export async function optimizeText(text, mode = 'optimize', customPrompt = null) {
-  try {
-    const response = await apiClient.post(
-      `${await getBaseURL()}${backendConfig.endpoints.optimize}`,
-      {
-        text,
-        mode,
-        custom_prompt: customPrompt
-      }
-    );
-
-    return response.data;
-  } catch (error) {
-    console.error('Text optimization failed:', error);
-    throw error;
-  }
+  if (customPrompt) throw new Error('请使用已配置的轻度润色或提示词优化模板');
+  if (!window.electronAPI?.processText) throw new Error('请在桌面客户端使用文本整理');
+  return window.electronAPI.processText(text, mode);
 }
 
 export async function transcribeAndOptimize(audioBlob, options = {}) {
@@ -1552,7 +1544,7 @@ export async function transcribeAndOptimize(audioBlob, options = {}) {
       }
     );
 
-    return response.data;
+    return finalizeFileTranscript(response.data, options);
   } catch (error) {
     console.error('Transcribe and optimize failed:', error);
     throw error;

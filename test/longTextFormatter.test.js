@@ -290,13 +290,13 @@ test("validate 依然接受删词加接句的忠实整理（第四道关不误�
  * 触发决策——终端必须避让，短句不该白等一次推理
  * ------------------------------------------------------------------ */
 
-test("shouldRunLongFormat 对终端场景一律拒绝（换行会被当成回车执行）", () => {
+test("shouldRunLongFormat 允许整理终端文本，交付阶段负责只复制", () => {
   const { TextPolisher } = require("../src/platform/electron/textPolish");
   const polisher = new TextPolisher({ dataDirectory: null, logger: null });
   const longText = "这".repeat(200);
   const decision = polisher.shouldRunLongFormat(longText, { isTerminal: true, minChars: 40 });
-  assert.equal(decision.run, false);
-  assert.equal(decision.reason, "terminal");
+  assert.equal(decision.run, true);
+  assert.equal(decision.reason, null);
 });
 
 test("shouldRunLongFormat 对短句跳过（分段没有意义）", () => {
@@ -317,7 +317,7 @@ test("shouldRunLongFormat 对长句放行，且字符数不计标点", () => {
   assert.ok(decision.contentChars < longText.length, "标点不该计入字数");
 });
 
-test("shouldRunLongFormat 在窗口未知时也拒绝——整理是危险动作，判不出来就不能做", () => {
+test("shouldRunLongFormat 允许整理未知窗口文本，交付阶段保守处理", () => {
   // 2026-09-20 端到端回放抓到的方向性错误：原来读不到窗口就返回 false
   // （= 不是终端），于是照样排版。终端里换行等于回车执行，代价太大。
   const { TextPolisher } = require("../src/platform/electron/textPolish");
@@ -325,11 +325,11 @@ test("shouldRunLongFormat 在窗口未知时也拒绝——整理是危险动作
   const longText = "这".repeat(200);
   for (const isTerminal of [undefined, null]) {
     const decision = polisher.shouldRunLongFormat(longText, { isTerminal, minChars: 40 });
-    assert.equal(decision.run, false, `isTerminal=${isTerminal} 时不该整理`);
-    assert.equal(decision.reason, "unknown_window");
+    assert.equal(decision.run, true);
+    assert.equal(decision.reason, null);
   }
   // 不传 isTerminal 整体也不能放行
-  assert.equal(polisher.shouldRunLongFormat(longText, { minChars: 40 }).run, false);
+  assert.equal(polisher.shouldRunLongFormat(longText, { minChars: 40 }).run, true);
 });
 
 /* ------------------------------------------------------------------ *
@@ -767,25 +767,26 @@ test("textPolish 在整理服务不可用时也做列举排版", async () => {
   assert.equal(result.text.split(/\n+/).filter(Boolean).length, 4);
 });
 
-test("textPolish 在终端里连列举排版也不做（换行=回车）", async () => {
+test("textPolish 在终端里保留列举排版，并标记只复制", async () => {
   const { TextPolisher } = require("../src/platform/electron/textPolish");
   const polisher = new TextPolisher({ dataDirectory: null, logger: null });
   const text = "我说三件事。第一，甲。第二，乙。第三，丙。";
   const result = await polisher.polish(text, {
     longFormat: { enabled: true, minChars: 40, isTerminal: true },
   });
-  assert.equal(result.text, text, "终端里绝不能插换行");
-  assert.equal(result.stages.some((stage) => stage.stage === "enumeration_format"), false);
+  assert.equal(result.copyOnly, true);
+  assert.equal(result.stages.some((stage) => stage.stage === "enumeration_format"), true);
 });
 
-test("textPolish 在窗口未知时也不排版", async () => {
+test("textPolish 在窗口未知时排版结果只复制", async () => {
   const { TextPolisher } = require("../src/platform/electron/textPolish");
   const polisher = new TextPolisher({ dataDirectory: null, logger: null });
   const text = "我说三件事。第一，甲。第二，乙。第三，丙。";
   const result = await polisher.polish(text, {
     longFormat: { enabled: true, minChars: 40, isTerminal: null },
   });
-  assert.equal(result.text, text);
+  assert.equal(result.copyOnly, true);
+  assert.ok(result.text.includes('\n'));
 });
 
 /* ------------------------------------------------------------------ *

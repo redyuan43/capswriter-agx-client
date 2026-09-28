@@ -309,6 +309,7 @@ class M5VoiceBridge {
     clipboardManager,
     databaseManager,
     asrConnectionProfiles = null,
+    hotWordsStore = null,
     asrSessionFactory = null,
     sendToRenderer,
     dataDirectory,
@@ -318,6 +319,7 @@ class M5VoiceBridge {
     this.clipboardManager = clipboardManager;
     this.databaseManager = databaseManager;
     this.asrConnectionProfiles = asrConnectionProfiles;
+    this.hotWordsStore = hotWordsStore;
     this.asrSessionFactory = asrSessionFactory;
     this.sendToRenderer = sendToRenderer;
     // 抢救音频的落盘位置（见 preserveSessionPcm）。没传就退回临时目录。
@@ -1570,6 +1572,7 @@ loadBluetoothDevices();
     );
     const options = {
       connectionProvider: async () => this.asrConnectionProfiles?.getActiveConnection?.(),
+      hotword: this.hotWordsStore?.snapshot().hotword || '',
       logger: this.logger,
       sampleRate: session.sampleRate || 16000,
       optimizeMode: translateMode === "translate" ? "translate" : "none",

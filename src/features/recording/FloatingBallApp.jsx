@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import "../../floating-ball.css";
 import appLogoUrl from "../../../assets/icon.png?url";
+import { createTextDelivery } from "../../helpers/textDelivery.mjs";
 import codexCompletionChimeUrl from "../../assets/audio/codex-complete.oga?url";
 import { useRecording } from "../../hooks/useRecording";
 import { useModelStatus } from "../../hooks/useModelStatus";
@@ -16,12 +17,11 @@ import {
   loadService,
   unloadService,
   isHttpBackendConfigured,
-  learnHotwords,
   invalidateRealtimeAsrPreconnection,
 } from "../../services/backendAPI.js";
-import { isExactSilentASRArtifactText } from "../../helpers/silentAsrArtifacts.js";
 import {
   extractASRText,
+  asrProcessingMetadata,
   isUsableASRPayload,
   selectRealtimeFinalTimeoutFallback,
   selectRealtimeStreamFailureFallback,
@@ -403,6 +403,7 @@ function computePCMStats(chunks, sampleRate = 16000) {
 function normalizeASRPayload(payload, wavBlob) {
   const text = extractASRText(payload);
   return {
+    ...asrProcessingMetadata(payload),
     success: payload?.success !== false,
     text,
     asr_text: payload?.asr_text || payload?.text || text,
@@ -520,8 +521,8 @@ export default function FloatingBallApp() {
     error: recordingError
   } = useRecording({ translateMode, translateTarget });
 
-  const lastPasteRef = useRef({ text: '', timestamp: 0 });
-  const PASTE_DEBOUNCE_TIME = 1000;
+  const textDeliveryRef = useRef(null);
+  if (!textDeliveryRef.current) textDeliveryRef.current = createTextDelivery();
 
   const normalizeReleaseGraceMs = useCallback((value) => {
     const parsed = Number(value);
@@ -625,13 +626,6 @@ export default function FloatingBallApp() {
     }
 
     const now = Date.now();
-    const lastPaste = lastPasteRef.current;
-
-    if (lastPaste.text === text && (now - lastPaste.timestamp) < PASTE_DEBOUNCE_TIME) {
-      return { ok: true, mode: "skipped" };
-    }
-
-    lastPasteRef.current = { text, timestamp: now };
     suppressClipboardUntilRef.current = now + CLIPBOARD_SELF_WRITE_SUPPRESS_MS;
 
     if (!isCurrentOutputGeneration(expectedGeneration, {
@@ -640,21 +634,26 @@ export default function FloatingBallApp() {
       return { ok: false, mode: "cancelled" };
     }
 
-    try {
-      if (window.electronAPI) {
-        const pasteResult = await window.electronAPI.pasteText(text);
-        if (pasteResult && pasteResult.success === false) {
-          return { ok: false, mode: "failed" };
-        }
-        return { ok: true, mode: "pasted" };
-      } else {
-        await navigator.clipboard.writeText(text);
-        return { ok: true, mode: "copied" };
+    return textDeliveryRef.current(text, expectedGeneration, async () => {
+      if (!isCurrentOutputGeneration(expectedGeneration, { allowInterruptedConfirm })) {
+        return { ok: false, mode: 'cancelled' };
       }
-    } catch (error) {
-      console.error("粘贴失败:", error);
-      return { ok: false, mode: "failed" };
-    }
+      try {
+        if (window.electronAPI) {
+          const pasteResult = await window.electronAPI.pasteText(text);
+          if (pasteResult && pasteResult.success === false) {
+            return { ok: false, mode: "failed" };
+          }
+          return { ok: true, mode: pasteResult?.mode || "pasted" };
+        } else {
+          await navigator.clipboard.writeText(text);
+          return { ok: true, mode: "copied" };
+        }
+      } catch (error) {
+        console.error("粘贴失败:", error);
+        return { ok: false, mode: "failed" };
+      }
+    });
   }, []);
 
   const hideFloatingBall = useCallback(() => {
@@ -923,6 +922,7 @@ export default function FloatingBallApp() {
   }, []);
 
   const cancelCurrentOutput = useCallback((reason = "escape") => {
+    window.electronAPI?.cancelTextPolish?.().catch(() => {});
     pendingDictationConfirmRef.current = false;
     finishOutputControl();
     outputControlRef.current.reason = "cancel";
@@ -1650,92 +1650,6 @@ export default function FloatingBallApp() {
     window.electronAPI?.setFloatingBallInputCaptureEnabled?.(false).catch(() => { });
   }, []);
 
-  const extractHotwordTerms = useCallback((value) => {
-    if (isExactSilentASRArtifactText(value)) {
-      return [];
-    }
-    const seen = new Set();
-    return String(value || "")
-      .split(/[\n,;，；、|]+/)
-      .map((item) => item.trim())
-      .filter((item) => item && item.length <= 80 && !item.startsWith("#"))
-      .filter((item) => {
-        const key = item.toLowerCase();
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, 80);
-  }, []);
-
-  const extractClipboardText = useCallback((payload) => {
-    if (typeof payload === "string") {
-      return payload;
-    }
-    if (payload && typeof payload === "object") {
-      if (payload.success === false) {
-        throw new Error(payload.error || "无法读取剪贴板");
-      }
-      return String(payload.text || "");
-    }
-    return "";
-  }, []);
-
-  const captureClipboardHotwords = useCallback(async () => {
-    try {
-      const clipboardPayload = await window.electronAPI?.readClipboard?.();
-      const clipboardText = extractClipboardText(clipboardPayload);
-      const terms = extractHotwordTerms(clipboardText);
-      if (!terms.length) {
-        return { success: true, count: 0, terms: [] };
-      }
-      // 先落本地词表：腾讯-only 的 ASR 服务没有 /api/hotwords/learn 路由，
-      // 只依赖服务端会让剪贴板学到的词全部丢失。本地写入永远优先。
-      let added = terms.length;
-      let persisted = false;
-      if (typeof window.electronAPI?.addHotWords === "function") {
-        const local = await window.electronAPI.addHotWords(terms).catch(() => null);
-        added = local?.added ?? 0;
-        persisted = !!local?.persisted;
-      }
-      // 服务端 learn 仅作 best-effort（自建后端才有该接口），失败不影响结果
-      const learnResult = await learnHotwords(terms, { source: "clipboard" }).catch(() => null);
-      // 学完立刻从 store 回读：ref 里必须存「词|权重」，与词表保持一致
-      // （新词已由 addHotWords 落到本地词表，回读即可拿到权威结果）
-      const refreshed =
-        typeof window.electronAPI?.getHotWords === "function"
-          ? await window.electronAPI.getHotWords().catch(() => null)
-          : null;
-      const refreshedEntries = String(refreshed?.hotword || "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-      if (refreshedEntries.length) {
-        sessionHotwordsRef.current = refreshedEntries.slice(0, 128);
-      }
-      logRuntime("info", "Captured clipboard hotwords for session", {
-        added,
-        persisted,
-        serverLearn: learnResult?.success ? "ok" : "unavailable",
-        existing: learnResult?.existing_count ?? learnResult?.existing?.length ?? 0,
-        total: sessionHotwordsRef.current.length
-      });
-      return {
-        success: true,
-        count: added,
-        ruleCount: learnResult?.rule_added_count ?? learnResult?.rule_added?.length ?? 0,
-        existing: learnResult?.existing_count ?? learnResult?.existing?.length ?? 0,
-        ruleExisting: learnResult?.rule_existing_count ?? learnResult?.rule_existing?.length ?? 0,
-        ruleSource: learnResult?.rule_source || "none",
-        total: sessionHotwordsRef.current.length,
-        terms,
-        persisted
-      };
-    } catch (error) {
-      return { success: false, error: error?.message || String(error) };
-    }
-  }, [extractClipboardText, extractHotwordTerms, logRuntime]);
-
   const clearCodexUpdateHideTimer = useCallback(() => {
     if (codexUpdateHideTimerRef.current) {
       clearTimeout(codexUpdateHideTimerRef.current);
@@ -1831,6 +1745,9 @@ export default function FloatingBallApp() {
       if (!result || result.success === false) {
         throw new Error(result?.error || "MiniCPM voice bridge unavailable");
       }
+      transcriptionResult.final_text = recognizedText;
+      transcriptionResult.delivered_text = recognizedText;
+      transcriptionResult.delivery = { mode: 'submitted', delivered: true };
       await transitionStatus("completed");
       setMessage(result?.message || "已发送给窝窝头");
       logRuntime("info", "MiniCPM voice prompt submitted", {
@@ -1854,10 +1771,10 @@ export default function FloatingBallApp() {
   }, [clearCodexUpdateHideTimer, hideFloatingBall, logRuntime, resetUI, setAnimatedRealtimeTarget, transitionStatus]);
 
   /**
-   * 转写文本整理：腾讯 ASR 原文 → 自定义规则替换 → [可选]标点恢复。
-   * 任何异常一律回退原文，绝不因为整理把用户说的话弄丢或改坏。
+   * 转写文本整理：原文 → 受保护的规则/别名替换 → 所选 GLM 模式。
+   * 失败保留上一阶段文本，原文与整理结果分别记录。
    */
-  const polishRecognizedText = useCallback(async (rawText) => {
+  const polishRecognizedText = useCallback(async (rawText, dictionaryVersion) => {
     const settings = textPolishRef.current;
     if (!settings.enabled || !rawText || typeof window.electronAPI?.polishText !== "function") {
       return { text: rawText, changed: false, degraded: null };
@@ -1866,8 +1783,8 @@ export default function FloatingBallApp() {
       const result = await window.electronAPI.polishText(rawText, {
         hotRule: settings.hotRule,
         punctuation: settings.punctuation,
-        // 长文本整理：主进程会再判断一次目标窗口是不是终端，
-        // 是终端就跳过（换行会被当成回车执行）
+        dictionaryVersion,
+        // 整理与交付分开：终端/未知窗口的多行结果只复制。
         longFormat: settings.longFormat,
       });
       if (result && typeof result.text === "string" && result.text.trim()) {
@@ -1877,7 +1794,7 @@ export default function FloatingBallApp() {
           totalMs: result.total_ms || 0,
           degraded: result.degraded || null,
         });
-        return { text: result.text, changed: result.changed === true, degraded: result.degraded || null };
+        return { ...result, text: result.text, changed: result.changed === true, degraded: result.degraded || null };
       }
       if (result?.degraded) {
         logRuntime("warn", "Text polish degraded, fallback to raw", { degraded: result.degraded });
@@ -1892,6 +1809,8 @@ export default function FloatingBallApp() {
   }, [logRuntime]);
 
   const handleRecordingComplete = useCallback(async (transcriptionResult) => {
+    transcriptionResult.delivery = { mode: 'not_delivered', delivered: false };
+    transcriptionResult.raw_asr_text ||= transcriptionResult.asr_text || transcriptionResult.text || '';
     const queuedConfirm = pendingDictationConfirmRef.current;
     pendingDictationConfirmRef.current = false;
     if (recordingModeRef.current === "codex") {
@@ -1908,6 +1827,7 @@ export default function FloatingBallApp() {
     }
 
     if (transcriptionResult.success && transcriptionResult.voice_command_applied && !String(transcriptionResult.text || '').trim()) {
+      transcriptionResult.delivery = { mode: 'command_applied', delivered: true };
       setAnimatedRealtimeTarget('', { immediate: true });
       await transitionStatus('completed');
       setMessage('已清空本次草稿');
@@ -1937,7 +1857,11 @@ export default function FloatingBallApp() {
       let finalText = recognizedText;
       let polishDegraded = null;
       if (postprocessMode !== 'translate' && recognizedText) {
-        const polished = await polishRecognizedText(recognizedText);
+        // 文件入口可能已经整理，避免再次改写和重复调用模型。
+        const polished = transcriptionResult.processing || await polishRecognizedText(recognizedText, transcriptionResult.dictionary_version);
+        transcriptionResult.processing = polished;
+        transcriptionResult.corrected_text = polished.corrected_text || recognizedText;
+        transcriptionResult.final_text = polished.text;
         finalText = polished.text;
         polishDegraded = polished.degraded;
         // 整理是异步的：期间可能已被取消或切换任务，迟到结果不得粘贴
@@ -1951,6 +1875,8 @@ export default function FloatingBallApp() {
           setAnimatedRealtimeTarget(finalText, { immediate: true });
         }
       }
+
+      transcriptionResult.final_text = finalText;
 
       if (!fastMode) {
         setAnimatedRealtimeTarget(finalText, { immediate: true });
@@ -1973,6 +1899,8 @@ export default function FloatingBallApp() {
       if (fastMode) {
         const pasteStartedAt = performance.now();
         const pasteResult = await safePaste(finalText, outputGeneration);
+        transcriptionResult.delivery = { mode: pasteResult.mode, delivered: pasteResult.ok };
+        transcriptionResult.delivered_text = pasteResult.ok ? finalText : '';
         if (!isCurrentOutputGeneration(outputGeneration)) {
           return;
         }
@@ -2011,7 +1939,7 @@ export default function FloatingBallApp() {
         }
 
         await transitionStatus("error");
-        setMessage("粘贴失败（文本已复制）");
+        setMessage("粘贴失败，请从历史记录复制文本");
         setTimeout(() => {
           resetUI();
           hideFloatingBall();
@@ -2037,6 +1965,8 @@ export default function FloatingBallApp() {
       }
       setMessage("正在粘贴...");
       const pasteResult = await pasteTask;
+      transcriptionResult.delivery = { mode: pasteResult.mode, delivered: pasteResult.ok };
+      transcriptionResult.delivered_text = pasteResult.ok ? finalText : '';
       if (!isCurrentOutputGeneration(outputGeneration)) {
         return;
       }
@@ -2050,7 +1980,7 @@ export default function FloatingBallApp() {
         };
         setMessage(messageMap[pasteResult.mode] || "已粘贴");
       } else {
-        setMessage("粘贴失败（文本已复制）");
+        setMessage("粘贴失败，请从历史记录复制文本");
       }
 
       setTimeout(() => {
@@ -2089,7 +2019,11 @@ export default function FloatingBallApp() {
         hotword: sessionHotwordsRef.current.join("\n"),
         request_id: transcriptionResult?.request_id || "",
         text,
-        final_text: transcriptionResult?.text || text,
+        final_text: transcriptionResult?.final_text || transcriptionResult?.text || text,
+        corrected_text: transcriptionResult?.corrected_text || text,
+        delivered_text: transcriptionResult?.delivered_text || '',
+        delivery: transcriptionResult?.delivery,
+        processing: transcriptionResult?.processing,
         asr_text: transcriptionResult?.asr_text || "",
         raw_asr_text: transcriptionResult?.raw_asr_text || "",
         duration: transcriptionResult?.duration || stats?.durationSec || 0,
@@ -2216,6 +2150,7 @@ export default function FloatingBallApp() {
     };
 
     recordingModeRef.current = "dictation";
+    window.electronAPI?.cancelTextPolish?.().catch(() => {});
     outputControlRef.current = {
       generation: outputControlRef.current.generation + 1,
       interrupted: false,
@@ -2573,11 +2508,11 @@ export default function FloatingBallApp() {
       });
       reportExternalRecordingResult({
         session_id: sessionId,
-        success: hasUsableResult,
-        status: hasUsableResult ? "pasted" : "transcription_failed",
-        text: transcriptionResult.text || transcriptionResult.asr_text || "",
+        success: transcriptionResult.delivery?.delivered === true,
+        status: transcriptionResult.delivery?.mode || "not_delivered",
+        text: transcriptionResult.final_text ?? transcriptionResult.text ?? transcriptionResult.asr_text ?? "",
         message: "External M5 recording handled by CapsWriter",
-        error: hasUsableResult ? undefined : (realtimeError?.message || "No usable ASR result"),
+        error: transcriptionResult.delivery?.delivered ? undefined : "识别已结束，文本未交付",
       });
       logRuntime("info", "External M5 recording completed", {
         sessionId,
@@ -2883,6 +2818,7 @@ export default function FloatingBallApp() {
       return;
     }
 
+    window.electronAPI?.cancelTextPolish?.().catch(() => {});
     outputControlRef.current = {
       generation: outputControlRef.current.generation + 1,
       interrupted: false,

@@ -6,7 +6,7 @@ const RUNTIME_ENV_BY_SETTING = {
   realtime_asr_token: ["CAPSWRITER_REALTIME_ASR_TOKEN"],
   realtime_asr_fallback_url: ["CAPSWRITER_REALTIME_ASR_FALLBACK_URL"],
 };
-const RUNTIME_ONLY_SETTINGS = new Set(["realtime_asr_token"]);
+const RUNTIME_ONLY_SETTINGS = new Set(['realtime_asr_token', 'ai_api_key', 'glm_api_key', 'glmApiKey', 'tencentSecretId', 'tencentSecretKey']);
 
 function getRuntimeSettingDefault(key, defaultValue, env = process.env) {
   const names = RUNTIME_ENV_BY_SETTING[key] || [];

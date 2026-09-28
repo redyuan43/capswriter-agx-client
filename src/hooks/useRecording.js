@@ -14,6 +14,7 @@ import {
 import { isKnownSilentASRArtifactWithHotwords } from '../helpers/silentAsrArtifacts.js';
 import {
   extractASRText,
+  asrProcessingMetadata,
   selectRealtimeFinalTimeoutFallback,
 } from '../helpers/asrResultPolicy.mjs';
 
@@ -123,7 +124,11 @@ function queueVoiceDatasetSample({
         hotword,
         request_id: transcriptionResult?.request_id || '',
         text: rawText || transcriptionResult?.text || '',
-        final_text: transcriptionResult?.text || rawText || '',
+        final_text: transcriptionResult?.final_text || transcriptionResult?.text || rawText || '',
+        corrected_text: transcriptionResult?.corrected_text || rawText || '',
+        delivered_text: transcriptionResult?.delivered_text || '',
+        delivery: transcriptionResult?.delivery,
+        processing: transcriptionResult?.processing,
         asr_text: transcriptionResult?.asr_text || '',
         raw_asr_text: transcriptionResult?.raw_asr_text || '',
         duration: transcriptionResult?.duration || localAudioStats?.durationSec || 0,
@@ -719,6 +724,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
         const recognizedText = extractASRText(streamDonePayload);
 
         transcriptionResult = {
+          ...asrProcessingMetadata(streamDonePayload),
           success: streamDonePayload?.success !== false,
           text: recognizedText,
           asr_text:
@@ -880,12 +886,16 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
       };
 
       if (window.onTranscriptionComplete) {
-        window.onTranscriptionComplete({
+        const completedResult = {
           ...transcriptionResult,
           enhanced_by_ai:
             !!transcriptionResult?.postprocess_mode &&
             transcriptionResult.postprocess_mode !== 'none',
-        });
+        };
+        await window.onTranscriptionComplete(completedResult);
+        Object.assign(transcriptionResult, completedResult);
+        transcriptionData.text = completedResult.final_text || rawText;
+        transcriptionData.processed_text = completedResult.final_text || rawText;
       }
 
       queueVoiceDatasetSample({

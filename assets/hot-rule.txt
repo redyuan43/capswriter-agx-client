@@ -5,8 +5,6 @@
 毫安时     =      mAh
 赫兹      =      Hz
 伏特      =        V
-二、      =        二
-负一      =    -1
 (艾特)\s*(QQ)\s*点\s*            =     @qq.
 (艾特)\s*([一幺]六三)\s*点\s*     =     @163.
 (艾特)\s*(\w+)\s*(点)\s*(\w+)    =     @\2.\4
@@ -37,7 +35,6 @@ AI\s*是?\s*[\.。点]\s*[Pp] = AGENTS.md
 AIA\s*建图 = AI Agent
 AIA\s*建特 = AI Agents
 AI\s*Agents\s*建特 = AI Agents
-[《“"']?\s*紫禁城\s*[》”"']? = 子进程
 [Oo]pen[\s_-]*[Cc]lone = OpenClaw
 子\s*[AaＡａ]?\s*建的 = subagent
 

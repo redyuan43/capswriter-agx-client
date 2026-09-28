@@ -48,6 +48,25 @@ export function getAsrBaseURL() {
   return resolveAsrHttpBaseURL(getActive, getBaseURL);
 }
 
+export async function finalizeFileTranscript(payload, options = {}) {
+  const raw = payload?.asr_text || payload?.raw_text || payload?.text || '';
+  if (!raw || payload?.processing || options.processText === false || payload?.postprocess_mode === 'translate') return payload;
+  if (typeof window === 'undefined' || !window.electronAPI?.polishText) return payload;
+  try {
+    const api = window.electronAPI;
+    if (options.processText !== true && await api.getSetting?.('text_polish_enabled', true) === false) return payload;
+    const hotRule = await api.getSetting?.('text_polish_hot_rule', true);
+    const longEnabled = await api.getSetting?.('long_text_format_enabled', true);
+    const processing = await api.polishText(raw, { dictionaryVersion: payload.dictionary_version,
+      hotRule: hotRule !== false, longFormat: { enabled: longEnabled !== false }, ...(options.processingMode ? { mode: options.processingMode } : {}) });
+    return { ...payload, raw_text: raw, raw_asr_text: raw, text: processing.text, final_text: processing.text,
+      corrected_text: processing.corrected_text, processing };
+  } catch {
+    return { ...payload, raw_asr_text: raw, final_text: raw,
+      processing: { text: raw, changed: false, degraded: 'polisher_unavailable' } };
+  }
+}
+
 apiClient.interceptors.request.use(
   config => config,
   error => Promise.reject(error)

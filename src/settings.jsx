@@ -9,6 +9,7 @@ import { getBackendStatus, getTtsHealth } from "./services/backendAPI.js";
 const TranslatedHistory = lazy(() => import("./components/TranslatedHistory"));
 const M5BridgePanel = lazy(() => import("./components/M5BridgePanel"));
 const AsrConnectionPanel = lazy(() => import("./components/AsrConnectionPanel"));
+const SpeechSettingsPanel = lazy(() => import('./components/SpeechSettingsPanel'));
 const KnobMapperPanel = lazy(() => import("./components/KnobMapperPanel"));
 
 const SETTING_VOICE_TRANSLATE_MODE = "voice_translate_mode";
@@ -459,6 +460,7 @@ const SettingsPage = () => {
 
       {activeTab === 'settings' && <div className="flex-1 overflow-y-auto min-h-0">
         <div className="max-w-md mx-auto p-6 pb-8">
+          <Suspense fallback={<PanelLoading />}><SpeechSettingsPanel /></Suspense>
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-6">
             <div className="p-6">
               <div className="mb-6">

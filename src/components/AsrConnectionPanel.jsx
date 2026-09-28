@@ -64,12 +64,15 @@ export default function AsrConnectionPanel() {
   }, [load]);
 
   useEffect(() => {
-    const base = draft?.id === "tencent" ? draft.httpBaseUrl : "";
-    if (!base) { setCloudStatus(null); return; }
+    if (!['tencent', 'tencent-direct', 'firered2-local'].includes(draft?.id)) { setCloudStatus(null); return; }
+    setCloudStatus(null);
     let disposed = false;
     const controller = new AbortController();
     const refresh = async () => {
       try {
+        const base = draft.id === 'tencent-direct'
+          ? (await window.electronAPI.resolveAsrConnectionProfile(draft)).httpBaseUrl : draft.httpBaseUrl;
+        if (!base) return;
         const response = await fetch(`${base}/api/status`, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) });
         if (!response.ok) throw new Error('ASR status unavailable');
         const data = await response.json();
@@ -81,7 +84,7 @@ export default function AsrConnectionPanel() {
     refresh();
     const timer = setInterval(refresh, 15000);
     return () => { disposed = true; controller.abort(); clearInterval(timer); };
-  }, [draft?.id, draft?.httpBaseUrl]);
+  }, [draft]);
 
   const selectProfile = (profile) => {
     selectedIdRef.current = profile.id;
@@ -134,11 +137,11 @@ export default function AsrConnectionPanel() {
     setBusy(true);
     try {
       const connection = await window.electronAPI.resolveAsrConnectionProfile(draft, { token, clearToken });
-      const metrics = await probeAsrConnection(connection);
+      const metrics = await probeAsrConnection(connection, { readinessOnly: true });
       setTestedDraft({ ...draft, token });
       const summary = formatProbeMetrics(metrics);
       setProbeMetrics(summary);
-      toast.success("ASR 协议与音频吞吐测试通过", { description: summary });
+      toast.success("ASR 连接已就绪", { description: summary });
       return true;
     } catch (error) {
       toast.error("ASR 连接测试失败", { description: error?.message || String(error) });
@@ -202,7 +205,7 @@ export default function AsrConnectionPanel() {
       <div className="p-4">
         <div className="mb-3">
           <h2 className="text-lg font-semibold text-gray-900 chinese-title">ASR 服务端</h2>
-          <p className="text-xs text-gray-600 mt-1">选择路由，测试通过后启用。结果显示连接、准备、处理和总耗时。</p>
+          <p className="text-xs text-gray-600 mt-1">选择识别服务，测试通过后启用；下一次录音生效。连接测试不发送音频，识别效果请实际录音确认。</p>
         </div>
 
         <div className="grid grid-cols-3 gap-2 mb-3">
@@ -210,6 +213,7 @@ export default function AsrConnectionPanel() {
             <button
               key={profile.id}
               type="button"
+              disabled={busy}
               onClick={() => selectProfile(profile)}
               className={`min-w-0 p-2 rounded-md text-left border transition-colors ${profile.id === selectedId ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:bg-gray-50"}`}
             >
@@ -237,17 +241,22 @@ export default function AsrConnectionPanel() {
             <input value={draft.name} disabled={draft.preset || busy} onChange={(event) => changeDraft("name", event.target.value)} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md disabled:bg-gray-100" />
           </label>
           <label className="block text-xs text-gray-600">实时 ASR WebSocket 地址
-            <input value={draft.url} disabled={busy} onChange={(event) => changeDraft("url", event.target.value)} placeholder="wss://example.com/api/asr/realtime" className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
+            <input value={draft.id === 'tencent-direct' ? '由客户端管理，凭据在语音整理设置中配置' : draft.url} disabled={busy || draft.id === 'tencent-direct'} onChange={(event) => changeDraft("url", event.target.value)} placeholder="wss://example.com/api/asr/realtime" className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
           </label>
           <label className="block text-xs text-gray-600">ASR HTTP 地址（可选，用于文件上传和状态查询）
-            <input value={draft.httpBaseUrl || ""} disabled={busy} onChange={(event) => changeDraft("httpBaseUrl", event.target.value)} placeholder="留空沿用现有后端地址" className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
+            <input value={draft.httpBaseUrl || ""} disabled={busy || draft.id === 'tencent-direct'} onChange={(event) => changeDraft("httpBaseUrl", event.target.value)} placeholder={draft.id === 'tencent-direct' ? '由客户端管理' : '留空沿用现有后端地址'} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
           </label>
-          {draft.id === "tencent" && <div className="rounded-md bg-blue-50 p-3 text-xs text-blue-900" aria-live="polite">
+          {['tencent', 'tencent-direct'].includes(draft.id) && <div className="rounded-md bg-blue-50 p-3 text-xs text-blue-900" aria-live="polite">
             <p>中国直连 · 普通版免费额度优先，耗尽或无法确认时使用 2.0。</p>
             {cloudStatus?.quota ? <>
               <p className="mt-1">下一次录音：{cloudStatus.engine === "16k_zh" ? "普通 ASR" : "ASR 2.0"} · {cloudStatus.quota.message}</p>
               <p className="mt-1">2.0 参考价格：1 元/音频小时。额度在每次录音开始时判断。</p>
             </> : <p className="mt-1">暂未取得服务状态。</p>}
+          </div>}
+          {draft.id === 'firered2-local' && <div className="rounded-md bg-blue-50 p-3 text-xs text-blue-900" aria-live="polite">
+            <p>使用这台电脑上的 FireRed2 识别，无需 ASR API 密钥。</p>
+            <p className="mt-1">{cloudStatus?.asr_ready ? (cloudStatus.busy ? '本机模型已就绪，正在处理录音。' : '本机模型已就绪。') : '尚未连接到本机服务，请确认 FireRed2 已启动。'}</p>
+            <p className="mt-1">停顿后逐句显示结果。热词纠正、分段和文字整理继续使用当前客户端设置；启用 GLM 整理时仍需联网。</p>
           </div>}
           {!draft.preset && <label className="block text-xs text-gray-600">认证方式
             <select value={draft.auth} disabled={busy} onChange={(event) => changeDraft("auth", event.target.value)} className="mt-1 w-full px-3 py-2 text-sm border border-gray-300 rounded-md bg-white">

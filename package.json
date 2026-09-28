@@ -123,6 +123,7 @@
     "ws": "^8.18.0"
   },
   "build": {
+    "afterPack": "scripts/prepare-asr-resources.cjs",
     "appId": "com.speechtranscription.app",
     "productName": "语音转写",
     "directories": {

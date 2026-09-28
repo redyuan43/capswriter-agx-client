@@ -11,7 +11,6 @@ function registerRendererLogger(ctx, channel) {
 function registerMiscHandlers(ctx) {
   ipcMain.handle("start-recording", async () => ({ success: true }));
   ipcMain.handle("stop-recording", async () => ({ success: true }));
-  ipcMain.handle("process-text", async (_event, text, mode = "optimize") => ctx.processTextWithAI(text, mode));
   ipcMain.handle("check-ai-status", async (_event, testConfig = null) => ctx.checkAIStatus(testConfig));
 
   ctx.hotkeyRegisteredSenders = new Set();

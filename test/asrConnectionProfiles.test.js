@@ -42,7 +42,7 @@ test("seeds the editable presets and encrypts a migrated public token", () => {
   });
   const list = manager.list();
   assert.equal(list.activeProfileId, "public");
-  assert.deepEqual(list.profiles.map((item) => item.id), ["tencent", "spark", "public", "agx"]);
+  assert.deepEqual(list.profiles.map((item) => item.id), ["tencent-direct", "firered2-local", "tencent", "spark", "public", "agx"]);
   assert.equal(list.profiles.find((item) => item.id === "public").hasToken, true);
   assert.equal(JSON.stringify(list).includes("runtime-token"), false);
   assert.equal(manager.getActiveConnection().token, "runtime-token");
@@ -87,4 +87,40 @@ test("explicit token clearing suppresses a legacy runtime token", () => {
   manager.save({ id: "public", name: "公网", url: "wss://asr.yuanspaces.com/api/asr/realtime", auth: "token" }, { clearToken: true });
   assert.equal(manager.getActiveConnection().token, "");
   assert.equal(manager.list().profiles.find((item) => item.id === "public").hasToken, false);
+});
+
+test("adds local FireRed2 to saved profiles without changing the active provider", () => {
+  const { manager } = createManager({ settings: { asr_connection_profiles_v1: {
+    version: 1, activeProfileId: 'tencent-direct', profiles: [
+      { id: 'tencent-direct', name: '腾讯云 · 本机直连', url: 'ws://127.0.0.1', auth: 'none' },
+      { id: 'custom-existing', name: '现有服务', url: 'ws://existing.example/realtime', auth: 'none' },
+    ],
+  } } });
+  assert.equal(manager.list().activeProfileId, 'tencent-direct');
+  assert.ok(manager.list().profiles.some(profile => profile.id === 'custom-existing'));
+  manager.activate('firered2-local');
+  assert.deepEqual(manager.getActiveConnection(), {
+    id: 'firered2-local', name: 'FireRed2 · 本机',
+    url: 'ws://127.0.0.1:18011/api/asr/realtime', token: '', httpBaseUrl: 'http://127.0.0.1:18011',
+  });
+  manager.activate('tencent-direct');
+  assert.equal(manager.list().activeProfileId, 'tencent-direct');
+});
+
+test("readiness probe cancels after ready without sending audio", async () => {
+  const { probeAsrConnection } = await import('../src/helpers/asrConnectionProbe.mjs');
+  const sent = [];
+  class Socket {
+    constructor() { queueMicrotask(() => this.onopen()); }
+    send(value) {
+      assert.equal(typeof value, 'string');
+      const command = JSON.parse(value);
+      sent.push(command.type);
+      if (command.type === 'start') queueMicrotask(() => this.onmessage({ data: '{"type":"ready"}' }));
+    }
+    close() {}
+  }
+  const result = await probeAsrConnection({ url: 'ws://localhost' }, { WebSocketImpl: Socket, readinessOnly: true });
+  assert.deepEqual(sent, ['start', 'cancel']);
+  assert.equal(result.audioProcessingMs, undefined);
 });

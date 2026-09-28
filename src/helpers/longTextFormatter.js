@@ -266,7 +266,9 @@ function findEnumerationMarkers(text) {
  */
 function normalizeEnumerations(text) {
   const src = String(text || "");
+  const protectedRanges = require('./protectedText').protectedSpans(src);
   const markers = findEnumerationMarkers(src).filter((marker) => {
+    if (protectedRanges.some((s) => marker.index >= s.start && marker.index + marker.length <= s.end)) return false;
     // 序号前面是逗号/顿号时跳过：那说明它嵌在同一句话里
     // （"第十条讲的是缓存，第十一条讲的是并发"），不是列表项的开头。
     // 宁可少切，也不要把一句话从中间劈开——和终端避让同一个取舍。
@@ -435,7 +437,7 @@ class LongTextFormatter {
   }
 
   buildPrompt(text) {
-    return PROMPT_TEMPLATE.replace("${text}", text);
+    return PROMPT_TEMPLATE.replace("${text}", () => text);
   }
 
   /** 剥掉代码围栏与模型自加的前缀。 */
