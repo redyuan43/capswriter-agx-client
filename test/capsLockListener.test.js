@@ -343,3 +343,43 @@ test('tracks same-name MiniJoy hold keys independently and releases a disconnect
     ['up', second.trigger_id, 'key_released'],
   ]);
 });
+
+test('discovers renamed Bluetooth VibeStick and routes only its middle button to dictation', () => {
+  const devices = `I: Bus=0005 Vendor=0000 Product=0000 Version=0000
+N: Name="VibeStick-390A Keyboard"
+U: Uniq=c8:85:41:68:39:0a
+H: Handlers=kbd event14
+
+I: Bus=0005 Vendor=0000 Product=0000 Version=0000
+N: Name="VibeStick-390A Mouse"
+U: Uniq=c8:85:41:68:39:0a
+H: Handlers=event15
+
+I: Bus=0003 Vendor=0000 Product=0000 Version=0000
+N: Name="USB Mouse"
+H: Handlers=event16
+
+I: Bus=0003 Vendor=0000 Product=0000 Version=0000
+N: Name="VibeStick-390A Mouse"
+H: Handlers=event17
+`;
+  assert.deepEqual(discoverNamedLinuxInputDevicePaths(devices, ['VibeStick MiniJoy Mouse']),
+    ['/dev/input/event14', '/dev/input/event15']);
+  const listener = new CapsLockListener();
+  listener.minHoldMs = 0;
+  const source = describeLinuxInputDevice(devices, '/dev/input/event15');
+  assert.equal(source.trigger_id, 'minijoy_bt:c8854168390a');
+  assert.equal(describeLinuxInputDevice(devices, '/dev/input/event14').trigger_id, source.trigger_id);
+  assert.equal(listener._findHoldKeyByEvdevCode(274, {trigger_id:'keyboard'}), null);
+  listener._inputBuffers.set('/dev/input/event15', Buffer.alloc(0));
+  listener._inputDeviceInfo.set('/dev/input/event15', source);
+  const events = [];
+  listener.setOnCapsLockDown(p => events.push(['down', p.trigger_id]));
+  listener.setOnCapsLockUp(p => events.push(['up', p.trigger_id]));
+  for (const value of [1, 0]) {
+    const event = Buffer.alloc(24);
+    event.writeUInt16LE(1, 16); event.writeUInt16LE(274, 18); event.writeInt32LE(value, 20);
+    listener._onInputEventData('/dev/input/event15', event);
+  }
+  assert.deepEqual(events, [['down', source.trigger_id], ['up', source.trigger_id]]);
+});

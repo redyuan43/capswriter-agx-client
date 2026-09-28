@@ -56,6 +56,11 @@ function isMiniJoyTriggerId(value) {
   return value === 'minijoy_bt' || String(value || '').startsWith('minijoy_bt:');
 }
 
+function isBluetoothVibeStickInput(name, block) {
+  return /^VibeStick-[0-9a-f]{4}(?: Keyboard| Mouse)?$/i.test(name)
+    && /^I:\s+Bus=0005\b/m.test(block);
+}
+
 function normalizeDictationKeyName(value) {
   return String(value || '')
     .trim()
@@ -110,7 +115,8 @@ function describeLinuxInputDevice(text, devicePath) {
     const name = block.match(/^N:\s+Name="([^"]+)"$/m)?.[1] || '';
     const deviceUniq = block.match(/^U:\s+Uniq=(.+)$/m)?.[1]?.trim() || '';
     return {
-      trigger_id: /VibeStick MiniJoy/i.test(name) ? miniJoyTriggerId(deviceUniq) : 'keyboard',
+      trigger_id: /VibeStick MiniJoy/i.test(name) || isBluetoothVibeStickInput(name, block)
+        ? miniJoyTriggerId(deviceUniq) : 'keyboard',
       device_path: devicePath,
       device_name: name,
       device_phys: block.match(/^P:\s+Phys=(.+)$/m)?.[1]?.trim() || '',
@@ -131,7 +137,10 @@ function discoverNamedLinuxInputDevicePaths(text, names) {
   const devicePaths = [];
   for (const block of String(text || '').split(/\n\n+/)) {
     const nameMatch = block.match(/^N:\s+Name="([^"]+)"$/m);
-    if (!nameMatch || !wantedNames.has(nameMatch[1].toLowerCase())) {
+    // 新固件以蓝牙地址后四位命名；保留稳定地址作为触发器身份。
+    const bluetoothAlias = nameMatch && wantedNames.has('vibestick minijoy mouse')
+      && isBluetoothVibeStickInput(nameMatch[1], block);
+    if (!nameMatch || (!wantedNames.has(nameMatch[1].toLowerCase()) && !bluetoothAlias)) {
       continue;
     }
     const handlersMatch = block.match(/^H:\s+Handlers=(.+)$/m);
