@@ -33,14 +33,14 @@ HTTP 兼容 `/api/asr/transcribe`、`/api/asr/transcribe-and-optimize` 和 `-str
 
 ## 配套本地文字整理
 
-选择 `firered2-local` 后，客户端两种整理模式自动使用 NX6 的独立 Qwen3-4B-Instruct-2507 模型；其他 ASR 配置使用免费 GLM。识别结果携带 `provider=firered2`，保证中途切换配置也不会把该段文本送往云端。本机模型失败保留规则、热词处理后的文本，不做云端回退。
+选择 `firered2-local` 后，日常录音和文件转写只保留 FireRed2 标点、客户端热词、规则及列表分段，不调用大模型，忽略已保存的自动提示词模式。需要改写时，在设置的“文字整理 / 手动提示词优化”中粘贴文字，点击“手动提示词优化”，才调用 NX6 的独立 Qwen3-4B-Instruct-2507 模型；其他 ASR 配置继续自动使用免费 GLM。识别结果携带 `provider=firered2`，保证中途切换配置也不会把该段文本送往云端。本机模型失败保留规则、热词处理后的文本，不做云端回退。
 
 - 用户服务：`capswriter-local-llm.service`
 - 本机接口：`http://127.0.0.1:18087/v1/chat/completions`
 - API 模型名称：`capswriter-qwen3-4b`
 - 容器复用 NX6 已有 `nx6/llamacpp-ornith:jp7-mcp5-ckpt`，不改其他模型服务。
 - 上下文 8192、单并发、无思考、无多模态投影；模型闲置 600 秒由 llama-server 休眠回收，后续请求唤醒。
-- 客户端轻度模式总预算 15 秒，提示词优化总预算 60 秒；取消、原文保护、别名与规则共用原有处理。
+- 本地日常输入无大模型等待，手动提示词优化总预算 60 秒；取消、原文保护、别名与规则共用原有处理。
 - 权重：`~/weight/capswriter/Qwen3-4B-Instruct-2507-Q4_K_M.gguf`，2,497,281,120 字节。
 - 来源：[Unsloth 量化仓库](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF)，固定 revision `a06e946bb6b655725eafa393f4a9745d460374c9`；基础模型：[Qwen 官方模型](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)。
 - SHA-256：`3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`。

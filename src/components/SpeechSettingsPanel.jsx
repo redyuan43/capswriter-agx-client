@@ -47,18 +47,18 @@ export default function SpeechSettingsPanel() {
   return <section className="mb-6 space-y-5 rounded-lg border border-gray-200 bg-white p-5">
     <div>
       <h2 className="text-lg font-semibold text-gray-900">语音整理与热词</h2>
-      <p className="mt-1 text-sm text-gray-600">整理随 ASR 自动切换：FireRed2 使用本机 Qwen3-4B；腾讯及其他连接使用免费 GLM-4.7-Flash。均关闭思考，本机路径不回退云端。</p>
+      <p className="mt-1 text-sm text-gray-600">FireRed2 日常输入只做本机标点、热词和规则处理，不调用大模型。提示词优化可在下方手动执行；腾讯及其他连接继续使用免费 GLM-4.7-Flash。</p>
     </div>
     <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => {
       const value = e.target.checked;
       void run(async () => { await api.setSetting('text_polish_enabled', value); if (value) await api.setSetting('long_text_format_enabled', true); setEnabled(value); });
     }} />启用语音整理</label>
-    <label className="block text-sm font-medium">处理模式
+    <label className="block text-sm font-medium">云端自动处理模式
       <select aria-label="处理模式" className={`${INPUT} mt-1`} value={mode} disabled={busy} onChange={(e) => setProcessingMode(e.target.value)}>
         <option value="light">轻度润色</option><option value="prompt">提示词优化</option>
       </select>
     </label>
-    <p className="text-sm text-gray-600">{mode === 'light' ? '修正断句、标点和分段，保护原意。云端最多约 2 秒，本机最多 15 秒，超时保留基础结果。' : '使用 WorkBuddy 原始模板，改写为约 800 字符内的提示词，长输入可能压缩。云端最多 30 秒，本机最多 60 秒，可按 Esc 取消。'}</p>
+    <p className="text-sm text-gray-600">{mode === 'light' ? '修正断句、标点和分段，保护原意。云端最多约 2 秒；本机日常输入不等待大模型。' : '使用 WorkBuddy 原始模板，改写为约 800 字符内的提示词，长输入可能压缩。云端自动处理最多 30 秒；本机仅手动优化时调用模型，最多 60 秒，可取消。'}</p>
     <details>
       <summary className="cursor-pointer text-sm font-medium text-blue-700">API 凭据与腾讯直连</summary>
       <div className="mt-3 space-y-3">
@@ -114,11 +114,14 @@ export default function SpeechSettingsPanel() {
       </div>
     </details>
     <details>
-      <summary className="cursor-pointer text-sm font-medium text-blue-700">试一下整理效果</summary>
-      <textarea aria-label="待整理文本" className={`${INPUT} mt-3`} rows={4} value={previewInput} onChange={(e) => setPreviewInput(e.target.value)} placeholder="输入测试文本（FireRed2 使用本机模型，其他连接使用智谱免费模型）" />
+      <summary className="cursor-pointer text-sm font-medium text-blue-700">文字整理 / 手动提示词优化</summary>
+      <textarea aria-label="待整理文本" className={`${INPUT} mt-3`} rows={4} value={previewInput} onChange={(e) => setPreviewInput(e.target.value)} placeholder="粘贴需要整理的文字；本机预览只处理规则，点击手动优化才调用本机模型" />
       <button className={`${BUTTON} mt-2`} disabled={busy || !previewInput.trim()} onClick={() => run(async () => {
         setPreview(await api.polishText(previewInput, { mode, hotRule: true, longFormat: { enabled: true } }));
       })}>{busy ? '正在整理…' : '预览'}</button>
+      <button className={`${BUTTON} ml-2 mt-2`} disabled={busy || !previewInput.trim()} onClick={() => run(async () => {
+        setPreview(await api.polishText(previewInput, { mode: 'prompt', manualPrompt: true, hotRule: true, longFormat: { enabled: true } }));
+      })}>手动提示词优化</button>
       {busy && <button className="ml-3 text-sm text-gray-600" onClick={() => api.cancelTextPolish()}>取消</button>}
       {preview && <div className="mt-3 rounded bg-gray-50 p-3"><p className="whitespace-pre-wrap text-sm">{preview.text}</p><p className="mt-2 text-xs text-gray-500">{preview.total_ms} ms · {fallbackMessage(preview.degraded)}</p></div>}
     </details>

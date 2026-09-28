@@ -61,6 +61,35 @@ function mockReply(content, finish = 'stop') {
   return { ok: true, json: async () => ({ choices: [{ message: { content }, finish_reason: finish }] }) };
 }
 
+test('本机日常输入忽略已保存的提示词模式，只在手动优化时调用模型', async (t) => {
+  let active = 'firered2-local';
+  const calls = [];
+  const formatter = new SpeechTextFormatter({ getAsrProfileId: () => active,
+    getApiKey: () => 'test-key', fetchImpl: async (url) => {
+      calls.push(url); return mockReply('请检查录音功能。');
+    } });
+  const p = new TextPolisher({ dataDirectory: temp(t), longFormatter: formatter,
+    hotWordsStore: { snapshot: () => ({ version: 'v1' }), entriesForVersion: () => [
+      { term: '录音', aliases: ['路音'], enabled: true },
+    ] } });
+  for (const mode of ['light', 'prompt']) {
+    const result = await p.polish('请检查路音功能。', { mode, longFormat: { enabled: true } });
+    assert.equal(result.text, '请检查录音功能。');
+    assert.equal(result.mode, 'light');
+    assert.ok(result.stages.some(s => s.skipped === 'local_rules_only'));
+  }
+  assert.equal(calls.length, 0);
+  const manual = await p.polish('请检查路音功能。', { mode: 'prompt', manualPrompt: true });
+  assert.equal(manual.provider, 'local');
+  assert.equal(calls.length, 1);
+  active = 'tencent-direct';
+  await p.polish('请检查录音功能。', { mode: 'prompt', asrProvider: 'firered2' });
+  assert.equal(calls.length, 1, '切换配置后的 FireRed2 结果也不调用大模型');
+  const cloud = await p.polish('请检查录音功能。', { mode: 'prompt', asrProvider: 'tencent' });
+  assert.equal(cloud.provider, 'glm');
+  assert.equal(calls.length, 2);
+});
+
 for (const [name, original, output] of [
   ['否定词', '请不要删除旧配置，检查日志之后再运行。', '请要删除旧配置，检查日志之后再运行。'],
   ['小数', '超时设为 1.23 秒。', '超时设为 12.3 秒。'],

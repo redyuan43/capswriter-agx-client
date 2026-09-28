@@ -66,7 +66,10 @@ class TextPolisher {
   async polish(rawText, options = {}) {
     const started = Date.now();
     const raw = typeof rawText === 'string' ? rawText : '';
-    const mode = options.mode === 'prompt' ? 'prompt' : 'light';
+    const local = this.longFormatter?.usesLocalModel?.(options.asrProvider) === true;
+    const manualPrompt = options.manualPrompt === true && options.mode === 'prompt';
+    // 本机录音与文件识别只走规则；提示词优化必须由用户单独触发。
+    const mode = options.mode === 'prompt' && (!local || manualPrompt) ? 'prompt' : 'light';
     const controller = new AbortController();
     const abort = () => controller.abort();
     options.signal?.addEventListener('abort', abort, { once: true });
@@ -92,9 +95,10 @@ class TextPolisher {
         result.stages.push({ stage: 'aliases', matches: aliased.matches });
       }
       result.corrected_text = current;
-      // CT-Punc 曾破坏代码、英文和已有标点；统一保留腾讯原生标点。
+      // 保留识别服务提供的标点，避免再次改动代码、英文和已有标点。
       if (options.punctuation === 'full') result.stages.push({ stage: 'punctuation', skipped: 'disabled' });
-      const useModel = mode === 'prompt' || options.longFormat?.enabled !== false;
+      const useModel = local ? manualPrompt : mode === 'prompt' || options.longFormat?.enabled !== false;
+      if (local && !useModel) result.stages.push({ stage: 'model', skipped: 'local_rules_only' });
       if (useModel && this.longFormatter && !controller.signal.aborted) {
         const totalBudget = this.longFormatter.getTimeoutMs?.(mode, options.asrProvider) || (mode === 'prompt' ? 30000 : 2000);
         const applied = await this.longFormatter.format(current, { mode, signal: controller.signal,
