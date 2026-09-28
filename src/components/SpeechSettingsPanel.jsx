@@ -6,7 +6,7 @@ const EMPTY = { term: '', weight: 5, aliases: [], exclusions: [], enabled: true 
 const fallbackMessage = (reason) => {
   if (reason === 'cancelled') return '已取消';
   if (reason === 'timeout') return '等待超时，已保留基础结果';
-  if (reason === 'http_429') return '免费服务繁忙，请稍后再试；已保留基础结果';
+  if (reason === 'http_429') return '服务拒绝请求（HTTP 429），请检查限流或额度；已保留基础结果';
   if (reason === 'api_key_missing') return '尚未配置智谱凭据，已保留基础结果';
   if (reason?.startsWith('fidelity:')) return '整理结果未通过原文保护检查，已保留基础结果';
   return reason ? '整理未完成，已保留基础结果' : '整理完成';

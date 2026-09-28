@@ -67,6 +67,7 @@ class TextPolisher {
     const started = Date.now();
     const raw = typeof rawText === 'string' ? rawText : '';
     const local = this.longFormatter?.usesLocalModel?.(options.asrProvider) === true;
+    const asrProvider = local ? 'firered2' : options.asrProvider;
     const manualPrompt = options.manualPrompt === true && options.mode === 'prompt';
     // 本机录音与文件识别只走规则；提示词优化必须由用户单独触发。
     const mode = options.mode === 'prompt' && (!local || manualPrompt) ? 'prompt' : 'light';
@@ -87,7 +88,8 @@ class TextPolisher {
         result.rules_version = this.replacer.version;
         const applied = await this.replacer.applyAsync(current, { signal: controller.signal });
         current = applied.text;
-        result.stages.push({ stage: 'hot_rule', elapsed_ms: Date.now() - started, applied_rules: applied.applied });
+        result.stages.push({ stage: 'hot_rule', elapsed_ms: Date.now() - started, applied_rules: applied.applied,
+          degraded: applied.error || null });
         result.degraded = applied.error;
         const entries = this.hotWordsStore?.entriesForVersion(result.dictionary_version);
         const aliased = require('../../helpers/protectedText').applyAliases(current, entries || []);
@@ -100,9 +102,9 @@ class TextPolisher {
       const useModel = local ? manualPrompt : mode === 'prompt' || options.longFormat?.enabled !== false;
       if (local && !useModel) result.stages.push({ stage: 'model', skipped: 'local_rules_only' });
       if (useModel && this.longFormatter && !controller.signal.aborted) {
-        const totalBudget = this.longFormatter.getTimeoutMs?.(mode, options.asrProvider) || (mode === 'prompt' ? 30000 : 2000);
+        const totalBudget = this.longFormatter.getTimeoutMs?.(mode, asrProvider) || (mode === 'prompt' ? 30000 : 2000);
         const applied = await this.longFormatter.format(current, { mode, signal: controller.signal,
-          asrProvider: options.asrProvider, timeoutMs: Math.max(1, totalBudget - (Date.now() - started)) });
+          asrProvider, timeoutMs: Math.max(0, totalBudget - (Date.now() - started)) });
         current = applied.text;
         result.stages.push({ stage: mode, elapsed_ms: applied.elapsed_ms, applied: applied.changed, degraded: applied.degraded });
         result.degraded = applied.degraded || result.degraded;
@@ -110,6 +112,8 @@ class TextPolisher {
         result.provider = applied.provider;
         result.thinking = applied.thinking;
         result.prompt_version = applied.prompt_version;
+        if (applied.error_code) result.error_code = applied.error_code;
+        if (applied.retry_after_seconds !== undefined) result.retry_after_seconds = applied.retry_after_seconds;
       }
       if (mode === 'light') {
         const enumerated = normalizeEnumerations(current);

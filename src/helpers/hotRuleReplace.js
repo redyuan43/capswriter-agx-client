@@ -163,6 +163,7 @@ class HotRuleReplacer {
 
   applyAsync(text, { timeoutMs = 200, signal } = {}) {
     if (!this.rules.length || !text || signal?.aborted) return Promise.resolve({ text, applied: [], error: signal?.aborted ? 'cancelled' : null });
+    const rules = this.rules;
     return new Promise((resolve) => {
       const worker = fork(__filename, ['--hot-rule-worker'], { windowsHide: true,
         stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: ['--max-old-space-size=64'],
@@ -177,14 +178,21 @@ class HotRuleReplacer {
         resolve(result);
       };
       const cancel = () => finish({ text, applied: [], error: 'cancelled' });
-      const timer = setTimeout(() => finish({ text, applied: [], error: 'rule_timeout' }), timeoutMs);
+      // Electron 子进程启动在 NX6 上可能超过 200 ms；执行期限从 ready 后算起。
+      let timer = setTimeout(() => finish({ text, applied: [], error: 'rule_worker_start_timeout' }), 2000);
       signal?.addEventListener('abort', cancel, { once: true });
-      worker.once('message', finish);
+      worker.on('message', (message) => {
+        if (done) return;
+        if (message?.type === 'ready') {
+          clearTimeout(timer);
+          timer = setTimeout(() => finish({ text, applied: [], error: 'rule_timeout' }), timeoutMs);
+          worker.send({ text, rules }, (error) => {
+            if (error) finish({ text, applied: [], error: 'rule_worker_failed' });
+          });
+        } else finish(message);
+      });
       worker.once('error', () => finish({ text, applied: [], error: 'rule_worker_failed' }));
       worker.once('exit', () => finish({ text, applied: [], error: 'rule_worker_exited' }));
-      worker.send({ text, rules: this.rules }, (error) => {
-        if (error) finish({ text, applied: [], error: 'rule_worker_failed' });
-      });
     });
   }
 }
@@ -196,4 +204,5 @@ if (process.argv.includes('--hot-rule-worker')) {
     replacer.rules = rules;
     process.send(replacer.apply(text));
   });
+  process.send({ type: 'ready' });
 }

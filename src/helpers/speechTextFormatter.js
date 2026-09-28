@@ -94,11 +94,14 @@ class SpeechTextFormatter {
       elapsed_ms: Date.now() - started, degraded });
     if (!original.trim()) return finish(original);
     if (original.length > 16000) return finish(original, 'input_too_long');
+    // 上游规则耗尽预算后，不再发起注定超时的模型请求。
+    if (timeoutMs !== undefined && Number(timeoutMs) <= 0) return finish(original, 'timeout');
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     let timer;
+    let httpFailure;
     try {
       const key = local ? '' : this.getApiKey();
       if (!local && !key) return finish(original, 'api_key_missing');
@@ -122,7 +125,18 @@ class SpeechTextFormatter {
             ] : [{ role: 'system', content: LIGHT_PROMPT }, { role: 'user', content: original }],
           }),
         });
-        if (!response.ok) { await response.body?.cancel?.(); throw new Error(`http_${response.status}`); }
+        if (!response.ok) {
+          httpFailure = `http_${response.status}`;
+          // 只保留机器错误码和重试秒数，丢弃供应商正文及可能回显的用户内容。
+          try {
+            const errorData = await response.json();
+            const code = String(errorData?.error?.code ?? errorData?.code ?? '');
+            if (/^[A-Za-z0-9_-]{1,40}$/.test(code)) metadata.error_code = code;
+          } catch { /* 非 JSON 错误仍按 HTTP 状态回退 */ }
+          const retryAfter = response.headers?.get?.('retry-after');
+          if (/^\d{1,6}$/.test(retryAfter || '')) metadata.retry_after_seconds = Number(retryAfter);
+          throw new Error(httpFailure);
+        }
         // 同一截止时间覆盖连接、响应头和完整响应体，不在收到 headers 后清除计时。
         return response.json();
       };
@@ -139,8 +153,8 @@ class SpeechTextFormatter {
       return finish(enhance ? output : normalizeEnumerations(output));
     } catch (error) {
       // 不把供应商错误正文、密钥或原文写日志/返回渲染进程。
-      const reason = signal?.aborted ? 'cancelled' : controller.signal.aborted ? 'timeout' :
-        /^http_\d+$/.test(error.message) ? error.message : 'request_failed';
+      const reason = signal?.aborted ? 'cancelled' : httpFailure || (controller.signal.aborted ? 'timeout' :
+        /^http_\d+$/.test(error.message) ? error.message : 'request_failed');
       return finish(original, reason);
     } finally {
       clearTimeout(timer);

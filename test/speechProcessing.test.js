@@ -146,6 +146,67 @@ test('灾难性回溯在子进程超时后终止，不阻塞主进程', async ()
   assert.ok(Date.now() - start < 1000);
 });
 
+test('正常规则的执行预算不包含子进程启动', async () => {
+  const r = new HotRuleReplacer(); r.load('千问 = Qwen');
+  const result = await r.applyAsync('使用千问。', { timeoutMs: 20 });
+  assert.equal(result.error, null);
+  assert.equal(result.text, '使用Qwen。');
+});
+
+test('供应商失败只记录错误码，不泄露错误正文或改用付费模型', async () => {
+  const formatter = new SpeechTextFormatter({ getApiKey: () => 'test-key',
+    fetchImpl: async () => ({ ok: false, status: 429,
+      headers: { get: () => '10' },
+      json: async () => ({ error: { code: '1302', message: 'private echoed text' } }),
+    }) });
+  const result = await formatter.format('保留原文');
+  assert.equal(result.degraded, 'http_429');
+  assert.equal(result.error_code, '1302');
+  assert.equal(result.retry_after_seconds, 10);
+  assert.equal(result.model, 'glm-4.7-flash');
+  assert.equal(result.text, '保留原文');
+  assert.ok(!JSON.stringify(result).includes('private echoed text'));
+});
+
+test('预算耗尽不发送请求；429 错误正文挂起仍保留 HTTP 原因', async () => {
+  let calls = 0;
+  const formatter = new SpeechTextFormatter({ getApiKey: () => 'test-key',
+    fetchImpl: async () => { calls++; return { ok: false, status: 429, json: () => new Promise(() => {}) }; } });
+  assert.equal((await formatter.format('原文', { timeoutMs: 0 })).degraded, 'timeout');
+  assert.equal(calls, 0);
+  const result = await formatter.format('原文', { timeoutMs: 30 });
+  assert.equal(result.degraded, 'http_429');
+  assert.equal(result.text, '原文');
+  assert.equal(calls, 1);
+});
+
+test('本地手动优化在等待规则时切到腾讯，仍不得发送云端', async (t) => {
+  let active = 'firered2-local';
+  const calls = [];
+  const formatter = new SpeechTextFormatter({ getAsrProfileId: () => active,
+    getApiKey: () => { throw Error('不应读取云端密钥'); },
+    fetchImpl: async (url) => { calls.push(url); return mockReply('请检查录音功能。'); } });
+  const p = new TextPolisher({ dataDirectory: temp(t), longFormatter: formatter });
+  p.replacer.applyAsync = async (text) => {
+    active = 'tencent-direct';
+    return { text, applied: [], error: 'rule_timeout' };
+  };
+  const result = await p.polish('请检查录音功能。', { mode: 'prompt', manualPrompt: true });
+  assert.deepEqual(calls, ['http://127.0.0.1:18087/v1/chat/completions']);
+  assert.equal(result.provider, 'local');
+  assert.equal(result.stages[0].degraded, 'rule_timeout');
+});
+
+test('规则等待子进程期间重新加载，不改变本次规则快照', async () => {
+  const r = new HotRuleReplacer();
+  r.load('千问 = Qwen');
+  const pending = r.applyAsync('使用千问。');
+  r.load('千问 = Other');
+  const result = await pending;
+  assert.equal(result.text, '使用Qwen。');
+  assert.equal(result.error, null);
+});
+
 test('词库超过 128 不丢失，单次请求限制 128，保留旧文件', (t) => {
   const dir = temp(t), legacy = path.join(dir, 'hot-words.txt');
   const original = '# 用户注释\n旧词|7\n'; fs.writeFileSync(legacy, original);
