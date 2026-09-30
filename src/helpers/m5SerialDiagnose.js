@@ -24,25 +24,20 @@
 // ---------------------------------------------------------------------------
 
 const fs = require("fs");
-const path = require("path");
 const { spawnSync } = require("child_process");
-
-const SERIAL_BY_ID_DIR = "/dev/serial/by-id";
-const ESPRESSIF_BY_ID_PREFIX = "usb-Espressif";
+// 串口枚举 / 非阻塞打开 / raw 行规程复用配网模块的同一套实现（M2：不重复实现已有 helper），
+// 从此诊断与配网认的是同一个端口集合，不会再出现两处判定不一致；
+// 若设备不按该前缀枚举，仍可显式指定端口：node m5SerialDiagnose.js /dev/ttyACM0
+const {
+  SERIAL_BY_ID_DIR,
+  listEspressifPorts,
+  openNonBlocking,
+  configureRawTty,
+} = require("./m5SerialProvision");
 
 // ---------------------------------------------------------------------------
 // 1. 串口枚举与打开
 // ---------------------------------------------------------------------------
-
-function listEspressifPorts() {
-  try {
-    return fs.readdirSync(SERIAL_BY_ID_DIR)
-      .filter((n) => n.startsWith(ESPRESSIF_BY_ID_PREFIX))
-      .map((n) => ({ id: n, path: path.join(SERIAL_BY_ID_DIR, n) }));
-  } catch {
-    return [];
-  }
-}
 
 function resolvePort(argPort) {
   if (argPort) {
@@ -64,32 +59,27 @@ function resolvePort(argPort) {
   return ports[0].path;
 }
 
-// USB CDC 不需要强制 stty；但加上 raw -echo 防某些驱动默认做行规程
+// USB CDC 不需要强制 stty；但加上 raw -echo 防某些驱动默认做行规程。
+// 复用配网模块的 configureRawTty（USB CDC 不依赖波特率，故不再单独下发 115200 8N1）。
 function prepareTty(port) {
   try {
-    spawnSync("stty", ["-F", port, "115200", "8", "N", "1", "raw", "-echo"], {
-      timeout: 2000,
-    });
-  } catch {
-    // 非致命
+    configureRawTty(port, spawnSync);
+  } catch (error) {
+    console.error(`[WARN] 设置串口 raw 模式失败（继续监视）：${error?.message || error}`);
   }
 }
 
-// O_RDWR | O_NOCTTY(0x400) | O_NONBLOCK(0x800) = 0xC02
+// 复用配网模块的非阻塞打开；失败时它已抛出带端口号的错误。
 function openPort(port) {
-  const O_RDWR = 2;
-  const O_NOCTTY = 1024;
-  const O_NONBLOCK = 2048;
-  try {
-    const fd = fs.openSync(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    return fd;
-  } catch (error) {
-    throw new Error(`打开串口 ${port} 失败：${error.message}`);
-  }
+  return openNonBlocking(port);
 }
 
 function closePort(fd) {
-  try { fs.closeSync(fd); } catch { /* ignore */ }
+  try {
+    fs.closeSync(fd);
+  } catch (error) {
+    console.error(`[WARN] 关闭串口失败（继续退出）：${error?.message || error}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,13 +88,18 @@ function closePort(fd) {
 
 const lineBuf = { pending: "" };
 
-function readLines(fd, { onData = () => {} } = {}) {
+/** 清空行缓冲（断开/重连以及单测需要从干净状态开始）。 */
+function resetLineBuffer() {
+  lineBuf.pending = "";
+}
+
+function readLines(fd, { onData = () => {}, fsRef = fs } = {}) {
   const buffer = Buffer.alloc(512);
   let totalReceived = 0;
   while (true) {
     let received = 0;
     try {
-      received = fs.readSync(fd, buffer, 0, buffer.length, null);
+      received = fsRef.readSync(fd, buffer, 0, buffer.length, null);
       if (received > 0) {
         lineBuf.pending += buffer.toString("utf8", 0, received);
         totalReceived += received;
@@ -147,13 +142,15 @@ const ERROR_PATTERNS = [
 ];
 
 function classify(line) {
+  // 协议应答优先判定：VSPROV_ERR 的 JSON 里常带 "error" 字样，
+  // 若先跑错误关键字模式，这类应答会被误标成 ERROR。
+  if (/VSPROV_OK|VSOK/.test(line)) return "OK";
+  if (/VSPROV_ERR/.test(line)) return "ERR";
   for (const re of ERROR_PATTERNS) {
     if (re.test(line)) {
       return re.source.replace(/\\d/g, "d").replace(/\\/g, "").slice(0, 12).toUpperCase();
     }
   }
-  if (/VSPROV_OK|VSOK/.test(line)) return "OK";
-  if (/VSPROV_ERR/.test(line)) return "ERR";
   return "";
 }
 
@@ -176,7 +173,6 @@ function run({ port, grep, timeoutSec, probeOnly, reconnect } = {}) {
   const pollMs = 200;
   let fd = null;
   let lastDataAt = Date.now();
-  let lastReconnectAt = 0;
 
   const openWithRetry = () => {
     let attempts = 0;
@@ -248,17 +244,23 @@ function run({ port, grep, timeoutSec, probeOnly, reconnect } = {}) {
           console.error("[INFO] 未启用重连，退出");
           break;
         }
-        // 退避重连
+        // 退避重连：1s 起步、每次 +1s、上限 5s，避免设备拔出后空转刷屏
+        let attempt = 0;
         while (fd === null) {
-          const wait = now - lastReconnectAt < 0 ? 1000 : 1000;
+          attempt += 1;
+          const wait = Math.min(5000, 1000 * attempt);
+          if (attempt > 1) {
+            console.error(`[INFO] ${wait / 1000}s 后重试（第 ${attempt} 次）`);
+          }
           sleep(wait);
-          lastReconnectAt = Date.now();
           try {
             prepareTty(port);
             fd = openPort(port);
             lineBuf.pending = "";
             console.error("[INFO] 重连成功");
-          } catch { /* 继续重试 */ }
+          } catch (error) {
+            console.error(`[WARN] 重连失败：${error?.message || error}`);
+          }
         }
         continue;
       }
@@ -339,6 +341,7 @@ module.exports = {
   openPort,
   closePort,
   readLines,
+  resetLineBuffer,
   classify,
   sendCommand,
   run,
