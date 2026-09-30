@@ -245,21 +245,42 @@ printf 'APPIMAGE_PATH=%q\n' "$APPIMAGE_PATH" >> "$LAUNCHER_PATH"
 printf '%s\n' 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'LOG_FILE="${LOG_DIR}/capswriter-agx-client.log"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'mkdir -p "$LOG_DIR"' >> "$LAUNCHER_PATH"
-printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi' >> "$LAUNCHER_PATH"
 printf '%s\n' 'export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"' >> "$LAUNCHER_PATH"
+# 去重：解包运行（APPIMAGE_EXTRACT_AND_RUN=1）时进程 cmdline 指向 /tmp/appimage_extracted_*/，
+# 只按 AppImage 路径 pgrep 会漏判，从而放进来第二个实例。用 APPIMAGE 环境变量精确识别同一实例。
+printf '%s\n' 'client_running() {' >> "$LAUNCHER_PATH"
+printf '%s\n' '  pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1 && return 0' >> "$LAUNCHER_PATH"
+printf '%s\n' '  local pid' >> "$LAUNCHER_PATH"
+printf '%s\n' '  for pid in $(pgrep -u "$(id -u)" -f "appimage_extracted_" 2>/dev/null || true); do' >> "$LAUNCHER_PATH"
+printf '%s\n' '    tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | grep -qx "APPIMAGE=$APPIMAGE_PATH" && return 0' >> "$LAUNCHER_PATH"
+printf '%s\n' '  done' >> "$LAUNCHER_PATH"
+printf '%s\n' '  return 1' >> "$LAUNCHER_PATH"
+printf '%s\n' '}' >> "$LAUNCHER_PATH"
+printf '%s\n' 'if client_running; then exit 0; fi' >> "$LAUNCHER_PATH"
 # 绕开 AppImage 的 FUSE 挂载：某些内核/Electron 组合下运行时卸载 squashfs 会卡在
 # fuse_dev_release，进程永远退不掉（2026-09-30 在 NX6 实测）。解包运行没有这个问题，
-# 代价是每次启动多几秒解包时间；解包目录每轮会留在 /tmp，启动前清上一轮的（已在运行时
-# 上面的 pgrep 检查会提前 exit，不会误删正在使用的目录）。
-printf '%s\n' 'rm -rf "${TMPDIR:-/tmp}"/appimage_extracted_* 2>/dev/null || true' >> "$LAUNCHER_PATH"
+# 代价是每次启动多几秒解包时间。清理上一轮解包目录时必须只清「没有进程在用」的：
+# /tmp/appimage_extracted_* 是所有 AppImage 共用的命名空间，无条件 rm -rf 会删掉别人的活目录。
+printf '%s\n' 'for dir in "${TMPDIR:-/tmp}"/appimage_extracted_*; do' >> "$LAUNCHER_PATH"
+printf '%s\n' '  [ -d "$dir" ] || continue' >> "$LAUNCHER_PATH"
+printf '%s\n' '  pgrep -u "$(id -u)" -f "$dir" >/dev/null 2>&1 && continue' >> "$LAUNCHER_PATH"
+printf '%s\n' '  rm -rf "$dir"' >> "$LAUNCHER_PATH"
+printf '%s\n' 'done' >> "$LAUNCHER_PATH"
 printf '%s\n' 'export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"' >> "$LAUNCHER_PATH"
-# 主动退出标记：退出时客户端写下这个文件，systemd 若按重启策略把进程拉起来，30 秒内的启动
-# 会被拒绝，保证「点了退出就是退出」；更晚的手动启动照常，并顺手清掉过期标记。
+# 主动退出标记：退出时客户端写下这个文件；systemd 若把 SIGKILL 收尾当成异常再拉起，30 秒内的
+# 「服务拉起」会被拒绝，保证「点了退出就是退出」。只拦服务调用（systemd 会注入 INVOCATION_ID），
+# 用户手动点图标或敲命令照常启动，避免出现「点了没反应」。
 printf '%s\n' 'QUIT_MARKER="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client/intentional-quit"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'if [ -f "$QUIT_MARKER" ]; then' >> "$LAUNCHER_PATH"
 printf '%s\n' '  age=$(( $(date +%s) - $(stat -c %Y "$QUIT_MARKER" 2>/dev/null || echo 0) ))' >> "$LAUNCHER_PATH"
-printf '%s\n' '  if [ "$age" -lt 30 ]; then exit 0; fi' >> "$LAUNCHER_PATH"
-printf '%s\n' '  rm -f "$QUIT_MARKER"' >> "$LAUNCHER_PATH"
+printf '%s\n' '  if [ "$age" -lt 30 ]; then' >> "$LAUNCHER_PATH"
+printf '%s\n' '    if [ -n "${INVOCATION_ID:-}" ]; then' >> "$LAUNCHER_PATH"
+printf '%s\n' '      echo "[$(date -Is)] 上次是主动退出，跳过本次自动拉起（30 秒窗口内）" >> "$LOG_FILE"' >> "$LAUNCHER_PATH"
+printf '%s\n' '      exit 0' >> "$LAUNCHER_PATH"
+printf '%s\n' '    fi' >> "$LAUNCHER_PATH"
+printf '%s\n' '  else' >> "$LAUNCHER_PATH"
+printf '%s\n' '    rm -f "$QUIT_MARKER"' >> "$LAUNCHER_PATH"
+printf '%s\n' '  fi' >> "$LAUNCHER_PATH"
 printf '%s\n' 'fi' >> "$LAUNCHER_PATH"
 printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_FILE" 2>&1' >> "$LAUNCHER_PATH"
 chmod 0755 "$LAUNCHER_PATH"
