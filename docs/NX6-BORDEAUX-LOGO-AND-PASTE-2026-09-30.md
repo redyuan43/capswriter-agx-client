@@ -192,7 +192,7 @@ mount | grep mount_Caps:
 
 ### 9.3 代码修复：退出兜底看门狗
 
-- 新增 `src/helpers/quitWatchdog.js`：`createQuitWatchdog({ app, logger, timeoutMs })` 提供 `arm/disarm/isArmed`，到点调用 `app.exit(0)`；定时器 `unref()`，不会反过来拖住正常退出；预算可由 `CAPSWRITER_QUIT_WATCHDOG_MS` 覆盖，默认 `5000ms`。
+- 新增 `src/helpers/quitWatchdog.js`：`createQuitWatchdog({ app, logger, timeoutMs })` 提供 `arm/disarm/isArmed`，到点调用 `app.exit(0)`；定时器 `unref()`，不会反过来拖住正常退出；预算可由 `CAPSWRITER_QUIT_WATCHDOG_MS` 覆盖，默认 `6000ms`。
 - `main.js`：`before-quit` 里 `quitWatchdog.arm()`。
 - 新增 `test/quitWatchdog.test.js` 5 项（到点强制退出、重复 arm 只装一次、disarm、缺少 `app.exit` 时安全返回、预算解析）。全量单测 **393/393 通过**，`npm run lint` 0 error。
 

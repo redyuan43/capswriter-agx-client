@@ -19,7 +19,7 @@
 ## L0 作者自检
 
 - [ ] `pnpm lint` 通过
-- [ ] `pnpm test` 全绿（当前基线 317/317）
+- [ ] `pnpm test` 全绿（当前基线 398/398）
 - [ ] `pnpm run build:renderer` 通过
 - [ ] diff 新增行 ≤ 300（300–800 需在下方逐 commit 说明；>800 会被 CI 拒绝）
 - [ ] 无凭据 / 无 Tailscale 内网域名进入 diff
