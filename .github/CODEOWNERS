@@ -1,0 +1,28 @@
+# 代码审查所有权 —— 见 docs/CODE-REVIEW-STANDARDS.md
+#
+# 本仓库 PR 主要由 AI agent 生成，CODEOWNERS 的作用是保证
+# 「高风险文件永远有一个人（而不是只有生成它的模型）被强制拉进审查」。
+
+# 兜底：所有文件
+*                                   @redyuan43
+
+# 主进程与安全边界：Electron 配置、IPC 暴露面
+/main.js                            @redyuan43
+/preload.js                         @redyuan43
+/src/helpers/windowManager.js       @redyuan43
+
+# 核心业务链路：录音 / 转写 / ASR / 长文本
+/src/helpers/voiceActionManager.js  @redyuan43
+/src/helpers/longTextFormatter.js   @redyuan43
+/src/helpers/capsLockListener.js    @redyuan43
+/src/hooks/useRecording.js          @redyuan43
+/src/services/backendAPI.js         @redyuan43
+
+# 设备桥接：M5 / Cardputer
+/src/helpers/m5VoiceBridge.js       @redyuan43
+/src/helpers/cardputer              @redyuan43
+
+# 构建 / 发布 / CI：改错会直接产出错的包
+/.github/                           @redyuan43
+/scripts/                           @redyuan43
+/package.json                       @redyuan43

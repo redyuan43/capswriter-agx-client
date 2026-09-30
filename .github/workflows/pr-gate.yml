@@ -1,0 +1,106 @@
+name: PR Gate
+
+# 唯一一个由 pull_request 触发的 workflow：合并前的强制门禁。
+# 对应 docs/CODE-REVIEW-STANDARDS.md 的 L1 层。
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-gate-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint + Test + Build
+    # 注意：不要给本 job 加 `if: draft == false` 之类的跳过条件。
+    # 一旦 job 被 skip，分支保护里的 required status check 会永远等不到 pass，反而卡住合并。
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint (renderer)
+        run: pnpm lint
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Renderer build
+        run: pnpm run build:renderer
+
+  diff-guard:
+    name: Diff size + secrets guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Diff size guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          additions=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json additions --jq .additions)
+          changed_files=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json changedFiles --jq .changedFiles)
+          echo "PR #$PR_NUMBER: +${additions} lines across ${changed_files} files"
+
+          if [ "$additions" -gt 800 ]; then
+            echo "::error::PR 新增 ${additions} 行，超过 800 行硬上限（Blocker B8）。请拆分为多个 PR。"
+            exit 1
+          fi
+          if [ "$additions" -gt 300 ]; then
+            echo "::warning::PR 新增 ${additions} 行，超过 300 行软阈值。必须在描述中逐个 commit 说明，审查时逐 commit 过。"
+          fi
+          echo "diff size OK"
+
+      - name: Secrets / internal-host guard
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -u
+          status=0
+
+          # 1) .env 系列不得进入版本控制
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -qE '(^|/)\.env(\.|$)'; then
+            echo "::error::检测到 .env 文件进入 diff（Blocker B3）。"
+            status=1
+          fi
+
+          # 2) 新增行中的高风险凭据模式
+          if git diff --unified=0 "origin/${BASE_REF}...HEAD" \
+              | grep -E '^\+' \
+              | grep -viE '^\+\+\+' \
+              | grep -iE '(AKID[0-9a-zA-Z]{16}|(secret|passwd|password|api[_-]?key|access[_-]?token)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_/+.-]{16,})'; then
+            echo "::error::diff 中疑似出现硬编码凭据（Blocker B3）。"
+            status=1
+          fi
+
+          # 3) 新增行中不得出现内网 Tailscale 域名
+          if git diff --unified=0 "origin/${BASE_REF}...HEAD" \
+              | grep -E '^\+' \
+              | grep -viE '^\+\+\+' \
+              | grep -oE '[a-z0-9-]+\.tail[a-z0-9]+\.ts\.net' >/dev/null; then
+            echo "::warning::diff 中出现 Tailscale 内网域名。本仓库为公开仓库，请确认是否必要（Blocker B3）。"
+          fi
+
+          if [ "$status" -ne 0 ]; then
+            exit 1
+          fi
+          echo "secrets guard OK"
