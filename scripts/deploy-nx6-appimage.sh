@@ -114,7 +114,7 @@ fi
 #   - APPIMAGE_EXTRACT_AND_RUN=1  绕开会让退出卡死的 FUSE 卸载
 #   - 解包目录清理                只清没有进程在用的，/tmp/appimage_extracted_* 是所有 AppImage 共用的命名空间
 #   - 解包运行下的去重            只看 cmdline 会漏判，用 APPIMAGE 环境变量识别同一实例
-#   - 主动退出标记检查            只拦 systemd 的自动拉起，手动启动照常，保证「退出就是退出」且不会「点了没反应」
+#   - 主动退出标记检查            只拦 systemd 的自动拉起（INVOCATION_ID），手动启动照常，保证「退出就是退出」且不会「点了没反应」
 write_launcher() {
   local path="$1"
   local appimage_path="$2"

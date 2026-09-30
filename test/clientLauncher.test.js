@@ -41,18 +41,18 @@ function makeStubAppImage() {
 }
 
 function runLauncher(launcher, { cacheDir, stub, extraEnv = {} }) {
-  return execFileSync('bash', [launcher], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      HOME: path.dirname(cacheDir),
-      // 启动器的 LOG_DIR / QUIT_MARKER 都落在 ${XDG_CACHE_HOME}/capswriter-agx-client
-      XDG_CACHE_HOME: cacheDir,
-      APPIMAGE_PATH: stub,
-      ...extraEnv,
-    },
-    stdio: 'pipe',
-  });
+  const env = {
+    ...process.env,
+    HOME: path.dirname(cacheDir),
+    // 启动器的 LOG_DIR / QUIT_MARKER 都落在 ${XDG_CACHE_HOME}/capswriter-agx-client
+    XDG_CACHE_HOME: cacheDir,
+    APPIMAGE_PATH: stub,
+  };
+  // 关键：INVOCATION_ID 是「由 systemd 拉起」的判据，而 CI runner 自身就跑在 systemd 会话里，
+  // 会把该变量带进进程环境。测试必须显式控制它，否则「手动启动」用例会被误判成服务拉起。
+  delete env.INVOCATION_ID;
+  Object.assign(env, extraEnv);
+  return execFileSync('bash', [launcher], { encoding: 'utf8', env, stdio: 'pipe' });
 }
 
 /** 把启动器里的 APPIMAGE_PATH 换成本地桩，便于观察「是否真的启动」。 */

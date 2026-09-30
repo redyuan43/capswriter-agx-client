@@ -270,6 +270,8 @@ printf '%s\n' 'export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"'
 # 主动退出标记：退出时客户端写下这个文件；systemd 若把 SIGKILL 收尾当成异常再拉起，30 秒内的
 # 「服务拉起」会被拒绝，保证「点了退出就是退出」。只拦服务调用（systemd 会注入 INVOCATION_ID），
 # 用户手动点图标或敲命令照常启动，避免出现「点了没反应」。
+# 边界：若手动启动的父进程本身由 systemd 拉起（例如从 systemd 启动的终端里敲命令），
+# 也可能继承 INVOCATION_ID 而被拦一次，代价是等 30 秒，属可接受范围。
 printf '%s\n' 'QUIT_MARKER="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client/intentional-quit"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'if [ -f "$QUIT_MARKER" ]; then' >> "$LAUNCHER_PATH"
 printf '%s\n' '  age=$(( $(date +%s) - $(stat -c %Y "$QUIT_MARKER" 2>/dev/null || echo 0) ))' >> "$LAUNCHER_PATH"
