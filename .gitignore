@@ -164,3 +164,9 @@ python
 # Assistant workspace data (memory, skills, local session state)
 .workbuddy/
 _tmp_*
+
+# IDE project data (assistant workspace state, never committed)
+.codebuddy/
+
+# Local review artifacts (generated during code review, never committed)
+artifacts/
