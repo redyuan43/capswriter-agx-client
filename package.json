@@ -1,6 +1,6 @@
 {
   "name": "speech-transcription",
-  "version": "1.0.35",
+  "version": "1.0.36",
   "description": "语音转写-基于HTTP后端和可配置AI模型的中文语音转文字应用",
   "main": "main.js",
   "private": true,
@@ -146,7 +146,8 @@
       "!node_modules/.cache/**/*",
       "!src/node_modules/**/*",
       "!python/**/*.pyc",
-      "!python/**/__pycache__/**/*"
+      "!python/**/__pycache__/**/*",
+      "!src/helpers/m5SerialDiagnose.js"
     ],
     "asarUnpack": [
       "python/**/*",
