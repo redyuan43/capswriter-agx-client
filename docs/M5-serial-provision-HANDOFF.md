@@ -12,8 +12,8 @@ CapsWriter AGX Client 通过 USB 串口连接 M5Stack Cardputer-Adv（跑 VibeSt
 
 约束：
 - 设备（ESP32-S3）**仅支持 2.4G WiFi**，不支持 5G。
-- 实际网络有两个 SSID：`HANYUAN`（2.4G）和 `HANYUAN_5G`（5G），同一路由器。
-- 设备只能连 `HANYUAN`（2.4G），拿到的 IP 形如 `192.168.100.189`。
+- 实际网络有两个 SSID：2.4G 一个、5G 一个（同一路由器）。真实名称不入库，下文写作 `<ssid-2g>` / `<ssid-5g>`。
+- 设备只能连 `<ssid-2g>`（2.4G），拿到的 IP 形如 `192.168.100.x`。
 
 ---
 
@@ -68,11 +68,11 @@ CapsWriter AGX Client 通过 USB 串口连接 M5Stack Cardputer-Adv（跑 VibeSt
 
 ## 4. 当前痛点（未闭环）
 
-### 痛点 A：设备连不上 HANYUAN（2.4G），bridge 指向错
-- **现象**：串口 `VSGET` 持续返回 `connected=false, ssid="", bridge_host=192.168.100.142`
-  （AMD 旧值），设备卡在 `Wi-Fi reconnect attempt=5` 重连循环。
-- **已验证**：HANYUAN 2.4G 确实存在（3 个 BSSID，信号 100%）。
-- **高度怀疑**：PSK 密码为空。客户端从 `HANYUAN.nmconnection` 读 psk 时，
+### 痛点 A：设备连不上 `<ssid-2g>`（2.4G），bridge 指向错
+- **现象**：串口 `VSGET` 持续返回 `connected=false, ssid="", bridge_host=192.168.100.x`
+  （旧主机地址），设备卡在 `Wi-Fi reconnect attempt=5` 重连循环。
+- **已验证**：`<ssid-2g>` 2.4G 确实存在（3 个 BSSID，信号 100%）。
+- **高度怀疑**：PSK 密码为空。客户端从 `<ssid-2g>.nmconnection` 读 psk 时，
   该连接是 **INI 格式**（非 legacy keyfile），`grep psk=` 读不到值 → 设备拿到空密码 → 连不上。
   **需确认 `.nmconnection` 真实格式并取到正确 psk。**
 
@@ -96,16 +96,16 @@ CapsWriter AGX Client 通过 USB 串口连接 M5Stack Cardputer-Adv（跑 VibeSt
 
 ## 5. 待办清单（按优先级）
 
-1. **取到正确 PSK**：确认 `/etc/NetworkManager/system-connections/HANYUAN.nmconnection`
-   是 INI 还是 keyfile 格式；INI 格式下用 `nmcli -s connection show HANYUAN` 或
+1. **取到正确 PSK**：确认 `/etc/NetworkManager/system-connections/<ssid-2g>.nmconnection`
+   是 INI 还是 keyfile 格式；INI 格式下用 `nmcli -s connection show <ssid-2g>` 或
    解析 `[802-11-wireless-security]` 段的 `psk=` 字段。验证客户端 `readHostWifiProfile`
    的 sudo 回退能否覆盖两种格式。
 2. **修固件 bridge fallback（痛点 B）**：连不上时跳过 bridge 写入并显式回报，
    重编译 `vibe_stick_serial_prov3.bin`，重烧。
 3. **客户端默认 apply:false（痛点 C）**：M5BridgePanel 配网动作默认不重连，
    提供单独的"重新连接"按钮。
-4. **端到端复验**：真机配网 → 设备入网（2.4G .189）→ VSGET 确认
-   `bridge_host=192.168.100.199` 稳定 → NX6 `/devices` 出现设备。
+4. **端到端复验**：真机配网 → 设备入网（2.4G）→ VSGET 确认
+   `bridge_host=192.168.100.x` 稳定 → NX6 `/devices` 出现设备。
 5. **提交未跟踪文件**：`src/helpers/m5SerialDiagnose.js`（已 node --check 通过）
    需决定是否纳入版本管理。
 
@@ -128,15 +128,16 @@ cd ~/firmware && chmod o+w /dev/ttyACM0
 uvx esptool@5.4.0 --port /dev/ttyACM0 --baud 921600 write_flash 0x20000 vibe_stick_serial_prov2.bin
 
 # 配网（不重连，只写 NVS）
-node ~/firmware/serial-provision-cli.js provision HANYUAN "<PSK>" 192.168.100.199:8765 false
+node ~/firmware/serial-provision-cli.js provision <ssid-2g> "<PSK>" 192.168.100.x:8765 false
 # 触发重连
-node ~/firmware/serial-provision-cli.js provision HANYUAN "<PSK>" 192.168.100.199:8765 true
+node ~/firmware/serial-provision-cli.js provision <ssid-2g> "<PSK>" 192.168.100.x:8765 true
 ```
 
-### 关键 IP 备忘
-- NX6：无线 `HANYUAN_5G` = `.199`，有线 = `.151`
-- AMD（旧 bridge）：`192.168.100.142`
-- 设备（2.4G HANYUAN）：`192.168.100.189`
+### 关键 IP 备忘（真实值不入库，按需现查）
+- NX6：无线（`<ssid-5g>`）与有线各一个地址，均在 `192.168.100.0/24`
+- AMD（旧 bridge）：`192.168.100.x`
+- 设备（2.4G `<ssid-2g>`）：`192.168.100.x`
+- 现查命令：`ip -4 addr show`、`nmcli -g IP4.ADDRESS device show`
 
 ---
 

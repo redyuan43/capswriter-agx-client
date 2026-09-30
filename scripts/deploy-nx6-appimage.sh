@@ -38,8 +38,18 @@ CLIENT_PATTERN="CapsWriter-GUI[.]AppImage"
 EXIT_WAIT_SECONDS="${EXIT_WAIT_SECONDS:-15}"
 BACKUP_DIR="$HOME/.local/share/capswriter-backups/$(date +%Y%m%d-%H%M%S)-${LABEL}"
 
+  # 识别本客户端进程：FUSE 运行时 cmdline 含 AppImage 路径；解包运行
+  # （APPIMAGE_EXTRACT_AND_RUN=1）时 cmdline 指向 /tmp/appimage_extracted_*/，
+  # 只按 cmdline 匹配会把「正在运行」误判成「已退出」，因此再用 APPIMAGE 环境变量兜一层。
 client_pids() {
-  pgrep -f "$CLIENT_PATTERN" 2>/dev/null || true
+  {
+    pgrep -f "$CLIENT_PATTERN" 2>/dev/null || true
+    for pid in $(pgrep -u "$(id -u)" -f "appimage_extracted_" 2>/dev/null || true); do
+      if grep -qa "^APPIMAGE=$APPIMAGE$" "/proc/$pid/environ" 2>/dev/null; then
+        echo "$pid"
+      fi
+    done
+  } | sort -u
 }
 
 echo "== 1/6 停止服务并等待旧实例退出（最多 ${EXIT_WAIT_SECONDS}s）"
@@ -102,30 +112,50 @@ fi
 
 # 启动器必须是这个形状，缺一不可：
 #   - APPIMAGE_EXTRACT_AND_RUN=1  绕开会让退出卡死的 FUSE 卸载
-#   - 清掉上一轮的解包目录        解包目录每轮留在 /tmp，不清会一直堆积
-#   - 主动退出标记检查            退出后 30 秒内拒绝被 systemd 拉起来，保证「退出就是退出」
+#   - 解包目录清理                只清没有进程在用的，/tmp/appimage_extracted_* 是所有 AppImage 共用的命名空间
+#   - 解包运行下的去重            只看 cmdline 会漏判，用 APPIMAGE 环境变量识别同一实例
+#   - 主动退出标记检查            只拦 systemd 的自动拉起（INVOCATION_ID），手动启动照常，保证「退出就是退出」且不会「点了没反应」
 write_launcher() {
   local path="$1"
   local appimage_path="$2"
   { printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' '# 由 scripts/deploy-nx6-appimage.sh 维护：解包运行 + 主动退出标记检查。'
+    printf '%s\n' '# 由 scripts/deploy-nx6-appimage.sh 维护：解包运行 + 去重 + 主动退出标记检查。'
     printf 'APPIMAGE_PATH=%q\n' "$appimage_path"
     printf '%s\n' 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client"'
+    printf '%s\n' 'LOG_FILE="$LOG_DIR/capswriter-agx-client.log"'
     printf '%s\n' 'mkdir -p "$LOG_DIR"'
-    printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi'
+    printf '%s\n' 'client_running() {'
+    printf '%s\n' '  pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1 && return 0'
+    printf '%s\n' '  local pid'
+    printf '%s\n' '  for pid in $(pgrep -u "$(id -u)" -f "appimage_extracted_" 2>/dev/null || true); do'
+    printf '%s\n' '    tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | grep -qx "APPIMAGE=$APPIMAGE_PATH" && return 0'
+    printf '%s\n' '  done'
+    printf '%s\n' '  return 1'
+    printf '%s\n' '}'
+    printf '%s\n' 'if client_running; then exit 0; fi'
     printf '%s\n' 'QUIT_MARKER="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client/intentional-quit"'
     printf '%s\n' 'if [ -f "$QUIT_MARKER" ]; then'
     printf '%s\n' '  age=$(( $(date +%s) - $(stat -c %Y "$QUIT_MARKER" 2>/dev/null || echo 0) ))'
-    printf '%s\n' '  if [ "$age" -lt 30 ]; then exit 0; fi'
-    printf '%s\n' '  rm -f "$QUIT_MARKER"'
+    printf '%s\n' '  if [ "$age" -lt 30 ]; then'
+    printf '%s\n' '    if [ -n "${INVOCATION_ID:-}" ]; then'
+    printf '%s\n' '      echo "[$(date -Is)] 上次是主动退出，跳过本次自动拉起（30 秒窗口内）" >> "$LOG_FILE"'
+    printf '%s\n' '      exit 0'
+    printf '%s\n' '    fi'
+    printf '%s\n' '  else'
+    printf '%s\n' '    rm -f "$QUIT_MARKER"'
+    printf '%s\n' '  fi'
     printf '%s\n' 'fi'
-    printf '%s\n' 'rm -rf "${TMPDIR:-/tmp}"/appimage_extracted_* 2>/dev/null || true'
+    printf '%s\n' 'for dir in "${TMPDIR:-/tmp}"/appimage_extracted_*; do'
+    printf '%s\n' '  [ -d "$dir" ] || continue'
+    printf '%s\n' '  pgrep -u "$(id -u)" -f "$dir" >/dev/null 2>&1 && continue'
+    printf '%s\n' '  rm -rf "$dir"'
+    printf '%s\n' 'done'
     printf '%s\n' 'export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"'
     printf '%s\n' 'export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"'
-    printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_DIR/capswriter-agx-client.log" 2>&1'
+    printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_FILE" 2>&1'
   } > "$path"
   chmod 0755 "$path"
-  echo "   已重写启动器（解包运行 + 退出标记检查）: $path"
+  echo "   已重写启动器（解包运行 + 去重 + 退出标记检查）: $path"
 }
 write_launcher "$HOME/.local/bin/capswriter-gui" "$APPIMAGE"
 

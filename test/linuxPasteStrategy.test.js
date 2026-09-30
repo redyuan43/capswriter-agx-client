@@ -7,9 +7,10 @@ let spawnBehavior = 'close-ok';
 
 function fakeSpawn(command, args) {
   const handlers = {};
+  const stderrHandlers = [];
   const proc = {
     stdout: { on() {} },
-    stderr: { on() {} },
+    stderr: { on(event, handler) { if (event === 'data') stderrHandlers.push(handler); } },
     on(event, handler) { handlers[event] = handler; return proc; },
     kill() {},
   };
@@ -17,6 +18,14 @@ function fakeSpawn(command, args) {
   process.nextTick(() => {
     if (command === 'ydotool' && spawnBehavior === 'ydotool-missing') {
       handlers.error?.({ message: 'spawn ydotool ENOENT', code: 'ENOENT' });
+      return;
+    }
+    if (command === 'ydotool' && spawnBehavior === 'ydotool-runtime-error') {
+      // 二进制存在，只是运行期失败（例如 ydotoold socket 没起来）——不能被当成「工具缺失」
+      for (const handler of stderrHandlers) {
+        handler(Buffer.from('failed to connect to ydotoold socket: No such file or directory'));
+      }
+      handlers.close?.(1);
       return;
     }
     handlers.close?.(0);
@@ -88,6 +97,25 @@ test('既有终端、Remmina、微信与默认窗口的粘贴策略不回归', (
   const cached = manager.chooseLinuxPasteMethods('some-editor', 'Editor');
   assert.equal(cached.source, 'cache');
   assert.equal(cached.preferredMethod, 'ctrl_shift_v');
+});
+
+test('运行期失败不写死可用性缓存，仍会在下次重试', async () => {
+  const previousSessionType = process.env.XDG_SESSION_TYPE;
+  process.env.XDG_SESSION_TYPE = 'x11';
+  try {
+    const { manager } = createManager();
+    spawnBehavior = 'ydotool-runtime-error';
+    spawned.length = 0;
+
+    const result = await manager.runLinuxPasteCommand('shift_insert', 'Shift+Insert');
+    assert.equal(result.backend, 'xdotool');
+    // 关键：ydotool 只是这一趟失败，不能被永久标记为「不存在」
+    assert.equal(manager.isLinuxPasteToolAvailable('ydotool'), true);
+  } finally {
+    spawnBehavior = 'close-ok';
+    if (previousSessionType === undefined) delete process.env.XDG_SESSION_TYPE;
+    else process.env.XDG_SESSION_TYPE = previousSessionType;
+  }
 });
 
 test('注入后端缺失只探测一次，后续直接走 xdotool', async () => {

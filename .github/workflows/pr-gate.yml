@@ -100,6 +100,23 @@ jobs:
             echo "::warning::diff 中出现 Tailscale 内网域名。本仓库为公开仓库，请确认是否必要（Blocker B3）。"
           fi
 
+          # 4) 新增行中的私网地址：与 3) 同属内网信息暴露，文档请写成 192.168.100.x 这类占位符
+          if git diff --unified=0 "origin/${BASE_REF}...HEAD" \
+              | grep -E '^\+' \
+              | grep -viE '^\+\+\+' \
+              | grep -oE '(192\.168\.[0-9]{1,3}\.[0-9]{1,3}|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})' >/dev/null; then
+            echo "::warning::diff 中出现私网地址（Blocker B3：内网信息不得入库）。"
+          fi
+
+          # 5) 无引号/短值的凭据赋值：2) 只覆盖引号包裹的长值，这里补漏报面
+          if git diff --unified=0 "origin/${BASE_REF}...HEAD" \
+              | grep -E '^\+' \
+              | grep -viE '^\+\+\+' \
+              | grep -iE '(secret|passwd|password|api[_-]?key|access[_-]?token)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_/+.-]{12,}' \
+              | grep -viE '(process\.env|getSetting|\$\{|placeholder|example)' >/dev/null; then
+            echo "::warning::diff 中出现无引号的凭据赋值，请确认不是真实密钥（Blocker B3）。"
+          fi
+
           if [ "$status" -ne 0 ]; then
             exit 1
           fi

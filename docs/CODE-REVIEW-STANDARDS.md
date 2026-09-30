@@ -18,13 +18,13 @@
 |---|---|---|
 | 源码规模 | 212 个文件（js/jsx/mjs/py），JS 部分 45,010 行 | 中等偏大 |
 | 巨型文件 | 20 个 ≥500 行；最大 `FloatingBallApp.jsx` 3,546 行、`m5VoiceBridge.js` 3,166 行 | ⚠️ 难以审查 |
-| 单元测试 | 317 通过 / 0 失败 / 3.7s | ✅ 基础很好，可直接做门禁 |
+| 单元测试 | 398 通过 / 0 失败 / 3.7s（2026-09-30 复测） | ✅ 基础很好，可直接做门禁 |
 | ESLint（现状） | `src/` 内 0 error / 6 warning | ✅ |
 | **ESLint 盲区** | `main.js` `preload.js` `scripts/` `test/` `services/` **完全不在 lint 范围**，实测 21 warning | ❌ 覆盖缺口 |
 | **PR 门禁 CI** | **0 个**。三个 workflow 触发条件分别是 `schedule` / `workflow_dispatch` / `push tags` | ❌ 最大漏洞 |
 | 分支保护 | 未开启；仓库 **PUBLIC** | ❌ P0 |
 | 凭据入库 | `.env` 已被 gitignore、未入库 ✅；源码内无真实凭据 | ✅ |
-| 内网信息暴露 | `docs/` 中出现 `ai-x10drg.taild500c8.ts.net`、`spark-31d6.taild500c8.ts.net` | ⚠️ 公开仓库可见 |
+| 内网信息暴露 | `docs/` 中出现 Tailscale 内网主机名（形如 `<主机>.<tailnet>.ts.net`，本文件不再复述具体值）与若干私网 IP | ⚠️ 公开仓库可见 |
 | Electron 安全基线 | `nodeIntegration:false` + `contextIsolation:true`（管理窗口另加 `sandbox:true`/`webSecurity:true`） | ✅ 做得对 |
 | preload 攻击面 | 3 处 `exposeInMainWorld`，约 139 个 API 字段、138 处 ipc 调用；主进程 23 个 ipc handler | ⚠️ 面大 |
 | 入参校验 | `main.js` / `windowManager.js` 中 `validate/sanitize/whitelist` **零命中** | ⚠️ |
@@ -39,7 +39,7 @@
 | 级别 | 问题 | 影响 | 处置 |
 |---|---|---|---|
 | **P0** | 公开仓库 + `main` 无分支保护 | 任何人可直推；AI agent 分支可无审查合入生产代码 | 立即开启分支保护 |
-| **P0** | PR 无任何自动门禁 | 317 个测试、lint 形同虚设——只在定时任务里跑 | 立即加 `pr-gate.yml` |
+| **P0** | PR 无任何自动门禁 | 398 个测试、lint 形同虚设——只在定时任务里跑 | 立即加 `pr-gate.yml` |
 | **P1** | lint 只覆盖 `src/` | 主进程/脚本/测试 21 个问题长期不可见 | 本周扩展 eslint 至全仓 |
 | **P1** | 巨型文件 + 大 diff | 审查者（含 AI）读不完，漏检率陡增 | 设 diff 硬上限 |
 | **P2** | 注释密度低、调试残留、重复实现 | 可维护性 | 随 PR 逐步收敛 |
@@ -57,7 +57,7 @@
 | B3 | **凭据与内网地址不得入库** | `.env`、`*token*`、`AKID*`、Tailscale 内网域名不得出现在 tracked 文件。已有 `docs/` 中的内网域名不再新增 |
 | B4 | **禁止吞异常** | 空 `catch {}`、只 `console.log` 不记录不降级的 catch 一律打回。本项目踩过：v1.0.27/1.0.29 都在修"异常路径下录音被丢弃" |
 | B5 | **禁止静默数据丢失** | 录音音频、转写结果、用户配置在**任何**中断路径（异常、超时、设备断开、进程退出）下都不得被直接丢弃，必须有 salvage/落盘/提示三选一 |
-| B6 | **不得破坏既有测试** | 317 个测试必须全绿；删除或弱化断言需书面说明理由 |
+| B6 | **不得破坏既有测试** | 398 个测试必须全绿；删除或弱化断言需书面说明理由 |
 | B7 | **功能修复必须附验证证据** | 录音/转写/ASR/长文本整理链路的修改，必须在 PR 描述中给出**真实回放**结果（不是手搓合成用例）。这是本项目的一条死规矩 |
 | B8 | **diff 规模超限** | 单次 PR 新增行 > 800 直接拒绝，要求拆分；300–800 行必须在描述中给出逐个 commit 的说明 |
 
@@ -89,7 +89,7 @@
 
 ### L0 · 作者自检（提交 PR 前必做）
 - [ ] `pnpm lint` 通过
-- [ ] `pnpm test` 全绿（317/317）
+- [ ] `pnpm test` 全绿（398/398）
 - [ ] `pnpm run build:renderer` 通过
 - [ ] diff ≤ 300 行；超出则在描述中逐 commit 说明
 - [ ] 无凭据、无内网地址进入 diff
@@ -147,7 +147,7 @@
 ### 批次 2（需原哥操作，5 分钟）
 - [ ] **开启分支保护**：Settings → Branches → `main` → 勾选
   - Require a pull request before merging
-  - Require status checks to pass（勾选 `verify`）
+  - Require status checks to pass（勾选 `Lint + Test + Build`，必要时再加 `Diff size + secrets guard`；注意要填 job 的 **display name**，`verify` 只是 job id，填错会永远等不到 pass）
   - 建议同时 Require linear history
 - [ ] **评估仓库可见性**：当前 PUBLIC 且 docs 中含 Tailscale 内网域名。要么转 private，要么清理 `docs/` 中的内网域名
 

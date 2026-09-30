@@ -385,7 +385,11 @@ class ClipboardManager {
 
   markLinuxPasteToolMissing(tool, result) {
     if (!result || result.ok) return;
-    if (/\bENOENT\b|not found/i.test(String(result.stderr || ""))) {
+    const stderr = String(result.stderr || "");
+    // 只认「二进制本身不存在」：spawn 失败时 spawnWithResult 会给出 code=-1 且 stderr 为 error.message。
+    // 不能把 ydotool 运行期报的「socket not found」之类当成缺失，否则临时故障会被永久缓存，
+    // 之后即使工具恢复（或 ydotoold 起来）也不会再尝试。
+    if (result.code === -1 && /\bENOENT\b/.test(stderr)) {
       this.linuxPasteToolAvailability[tool] = false;
     }
   }

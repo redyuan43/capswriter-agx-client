@@ -27,9 +27,11 @@ test('多行终端/未知窗口仅复制，已知编辑器粘贴，保留单行�
   windowClass = 'code'; await paste({}, 'line1\nline2');
   assert.equal(pasted, process.platform === 'linux' ? 1 : 0);
   // WorkBuddy 桌面端（Electron）的对话输入框同样是可安全接收多行文本的目标
+  // 注意：非 Linux 平台 resolveTerminalState 直接返回 null（textPolishHandlers.js:6），
+  // 多行文本一律只复制，因此这里的期望值仍是 0
   windowClass = 'workbuddy WorkBuddy'; await paste({}, 'line1\nline2');
-  assert.equal(pasted, process.platform === 'linux' ? 2 : 1);
-  await paste({}, 'single line'); assert.equal(pasted, process.platform === 'linux' ? 3 : 2);
+  assert.equal(pasted, process.platform === 'linux' ? 2 : 0);
+  await paste({}, 'single line'); assert.equal(pasted, process.platform === 'linux' ? 3 : 1);
 });
 
 test('取消当前发送者的整理，并阻止替换模式漏掉同一取消入口', async () => {

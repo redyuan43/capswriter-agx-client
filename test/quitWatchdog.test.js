@@ -194,8 +194,10 @@ test('装载外部杀手失败时不影响退出流程', () => {
   });
 
   assert.ok(watchdog.arm());
-  assert.equal(messages.warn.length, 1);
-  assert.match(messages.warn[0].message, /装载退出外部杀手失败/);
+  const messages2 = messages.warn.map((entry) => entry.message).join('\n');
+  // starttime 读不到会先告警一次，随后 spawn 失败再告警一次，两条都必须在
+  assert.match(messages2, /starttime 字段缺失/);
+  assert.match(messages2, /装载退出外部杀手失败/);
 });
 
 test('缺少 app.exit 时不装看门狗也不排定定时器', () => {
@@ -222,6 +224,7 @@ test('主动退出标记写到启动器检查的同一路径，写失败只告�
     },
     logger: { info() {}, warn() {} },
     now: () => new Date('2026-09-30T00:00:00Z'),
+    platform: 'linux',
   });
 
   assert.equal(marker, '/tmp/quit-marker/intentional-quit');
@@ -243,10 +246,26 @@ test('主动退出标记写到启动器检查的同一路径，写失败只告�
       env: {},
       fsRef: { mkdirSync() { throw new Error('EACCES'); } },
       logger: { warn: (message) => warnings.push(message) },
+      platform: 'linux',
     }),
     null
   );
   assert.equal(warnings.length, 1);
+
+  // 非 Linux 平台没有读取该标记的启动器，不写无用标记文件
+  const writesOnMac = [];
+  assert.equal(
+    markIntentionalQuit({
+      env: {},
+      fsRef: {
+        mkdirSync() {},
+        writeFileSync: (...args) => writesOnMac.push(args),
+      },
+      platform: 'darwin',
+    }),
+    null
+  );
+  assert.equal(writesOnMac.length, 0);
 });
 
 test('启动器与 systemd 单元都带上了退出修复（防回退）', () => {
@@ -281,6 +300,37 @@ test('starttime 解析与杀手脚本：只认同一进程，避免 pid 复用�
   const script = buildKillerScript({ pid: 1234, startTime: '987654', graceSeconds: 6 });
   assert.match(script, /^sleep 6$/m);
   assert.match(script, /\[ -r "\/proc\/\$pid\/stat" \] \|\| exit 0/);
-  assert.match(script, /\[ "\$actual" != "\$expected" \] && exit 0/);
+  // 身份校验必须「失败即放弃」：空值分支各自短路，不能因为 && 链短路而落到 kill
+  assert.match(script, /\[ -n "\$expected" \] \|\| exit 0/);
+  assert.match(script, /\[ -n "\$actual" \] \|\| exit 0/);
+  assert.match(script, /\[ "\$actual" = "\$expected" \] \|\| exit 0/);
   assert.match(script, /kill -9 "\$pid" 2>\/dev\/null \|\| true$/m);
+  // kill 必须排在三条校验之后，不能出现「校验失败反而继续执行 kill」的顺序
+  assert.ok(script.indexOf('kill -9 "$pid"') > script.indexOf('[ -n "$actual" ] || exit 0'));
+});
+
+test('读不到 starttime 时必须留痕并放弃身份校验', () => {
+  const { messages, logger } = createLogger();
+  assert.equal(readProcessStartTime(1, { readFileSync: () => { throw new Error('ENOENT'); } }, logger), '');
+  assert.equal(messages.warn.length, 1);
+  assert.match(messages.warn[0].message, /读取 \/proc\/<pid>\/stat 失败/);
+
+  const timers = createFakeTimers();
+  const spawns = [];
+  const watchdog = createQuitWatchdog({
+    app: { exit() {} },
+    logger,
+    env: {},
+    timerRef: timers.timerRef,
+    clearRef: timers.clearRef,
+    spawnRef: (cmd, args) => { spawns.push(args[1]); return { unref() {} }; },
+    platform: 'linux',
+    pid: 4242,
+    fsRef: { readFileSync: () => { throw new Error('ENOENT'); } },
+  });
+  watchdog.arm();
+  // 脚本里 expected 为空 → 到点不会杀，交给进程内定时器与 systemd 兜底
+  assert.equal(spawns.length, 1);
+  assert.match(spawns[0], /^expected=''$/m);
+  assert.match(messages.warn.map((entry) => entry.message).join('\n'), /放弃身份校验/);
 });

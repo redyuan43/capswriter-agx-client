@@ -41,25 +41,39 @@ function resolveGracefulMs(totalMs) {
 }
 
 /** 读 /proc/<pid>/stat 的 starttime（第 22 个字段），unix 下用于识别 pid 复用。 */
-function readProcessStartTime(pid, fsRef = fs) {
+function readProcessStartTime(pid, fsRef = fs, logger = null) {
   try {
     const stat = fsRef.readFileSync(`/proc/${pid}/stat`, "utf8");
     const afterComm = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
     // 去掉 "pid (comm)" 后第一个字段是 state（原第 3 个字段），starttime 是原第 22 个。
-    return afterComm[19] || "";
-  } catch {
+    const startTime = afterComm[19] || "";
+    if (!startTime) {
+      logger?.warn?.("starttime 字段缺失，外部杀手将放弃身份校验（读不到即不杀）", { pid });
+    }
+    return startTime;
+  } catch (error) {
+    // 不吞异常：读不到 /proc 说明进程可能已退出或权限不足，必须留痕而非静默返回空值。
+    logger?.warn?.("读取 /proc/<pid>/stat 失败，外部杀手将放弃身份校验（读不到即不杀）", {
+      pid,
+      error: error?.message || String(error),
+    });
     return "";
   }
 }
 
 function buildKillerScript({ pid, startTime, graceSeconds }) {
+  // 身份校验一律「失败即放弃」：expected / actual 任一为空都不能杀，
+  // 否则 pid 被系统复用后会误杀无关进程（原写法用 && 串联，短路后反而落到 kill）。
+  // 放弃击杀不影响退出：进程内定时器仍会 app.exit(0)，systemd 侧还有 TimeoutStopSec 兜底。
   return [
     `sleep ${graceSeconds}`,
     `pid=${pid}`,
     `expected='${startTime}'`,
     '[ -r "/proc/$pid/stat" ] || exit 0',
     `actual="$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f20)"`,
-    '[ -n "$expected" ] && [ -n "$actual" ] && [ "$actual" != "$expected" ] && exit 0',
+    '[ -n "$expected" ] || exit 0',
+    '[ -n "$actual" ] || exit 0',
+    '[ "$actual" = "$expected" ] || exit 0',
     'kill -9 "$pid" 2>/dev/null || true',
   ].join("\n");
 }
@@ -103,7 +117,7 @@ function createQuitWatchdog({
       timer?.unref?.();
 
       if (platform === "linux" && !hardKillDisabled(env) && !isTestContext(env)) {
-        const startTime = readProcessStartTime(pid, fsRef);
+        const startTime = readProcessStartTime(pid, fsRef, logger);
         const script = buildKillerScript({
           pid,
           startTime,
@@ -160,7 +174,15 @@ function resolveQuitMarkerPath(env = process.env) {
  * 即使把 Restart 调成 on-abnormal 也会被当成异常而重新拉起，用户看到的就是「点了退出它又回来了」。
  * 启动器看到这个标记就消费掉并拒绝启动一次，从而保证主动退出真的退出；随后手动启动照常工作。
  */
-function markIntentionalQuit({ env = process.env, fsRef = fs, logger = null, now = () => new Date() } = {}) {
+function markIntentionalQuit({
+  env = process.env,
+  fsRef = fs,
+  logger = null,
+  now = () => new Date(),
+  platform = process.platform,
+} = {}) {
+  // 只有 Linux 的安装/部署脚本会生成读取该标记的启动器；其它平台写标记只会留下无用文件。
+  if (platform !== "linux") return null;
   const marker = resolveQuitMarkerPath(env);
   try {
     fsRef.mkdirSync(path.dirname(marker), { recursive: true });
