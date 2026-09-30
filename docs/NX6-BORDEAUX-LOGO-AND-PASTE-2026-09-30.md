@@ -163,11 +163,66 @@ systemctl --user start capswriter-agx-client.service
 - `audio_input_empty` 后自愈失败：15:48 两次录音失败（`bytes:0`）都伴随 `MiniJoy Bluetooth audio recovery ... spawn m5bridge-doctor ENOENT`，该自愈脚本在 NX6 上未安装；本次未纳入。
 - 快速输入的整理硬预算 / 失败熔断（把「整理不许阻塞投递」固化到代码）仍未实现，等预算档位（800/1200/2000ms）确认后再做。
 
-## 九、提交状态
+## 九、托盘退出卡死与 1.0.33（2026-09-30 16:2x）
 
-改动仅在本机工作区，**未推送**（本仓库此前记录的 GitHub 认证问题依旧）。本地按两个提交整理：
+### 9.1 现象与取证
+
+用户反馈「点退出退不掉」。只读采集到的事实：
+
+```
+pid 235579  state=S  threads=2
+  主线程  wchan=fuse_dev_release        ← 卡在这里
+  第二线程 wchan=pipe_write
+  fd 3 -> ~/.local/opt/capswriter-agx-client/CapsWriter-GUI.AppImage
+  fd 5 -> /dev/fuse                     ← FUSE 设备仍被占用
+mount | grep mount_Caps:
+  /tmp/.mount_CapsWr8JuLHT  (旧实例，已被孤儿 crashpad 占用)
+  /tmp/.mount_CapsWrWbPtt0
+孤儿进程: /tmp/.mount_CapsWr8JuLHT/chrome_crashpad_handler（无父进程）
+日志: 16:08:50.886 "Clipboard watch stopped"（will-quit 的清理项）之后再无输出
+服务: Restart=on-failure, NRestarts=0, TimeoutStopSec=10
+```
+
+即：托盘「退出」使 Electron 走完 `before-quit`/`will-quit`，最后 AppImage 运行时卸载 squashfs 时卡在 `fuse_dev_release`，进程既不再输出也不退出。那条孤儿 crashpad 由 16:03 重新部署时 SIGTERM 旧实例引入，抱着旧挂载不放，是挂死的诱因之一。
+
+### 9.2 处置（已完成）
+
+- 停服务（`TimeoutStopSec=10` 后 SIGKILL）+ 结束孤儿 crashpad + `fusermount -u` 清理残留挂载：最终无客户端进程、无 crashpad、残留挂载 0 条；服务处于 `failed`（已停，不会自动拉起）。
+- 退出后的偶发挂载残留也一并清理：把非运行实例的 `/tmp/.mount_Caps*` 卸载干净（实测清理掉一条 `...Yn8309`），只保留运行实例自己的挂载。
+
+### 9.3 代码修复：退出兜底看门狗
+
+- 新增 `src/helpers/quitWatchdog.js`：`createQuitWatchdog({ app, logger, timeoutMs })` 提供 `arm/disarm/isArmed`，到点调用 `app.exit(0)`；定时器 `unref()`，不会反过来拖住正常退出；预算可由 `CAPSWRITER_QUIT_WATCHDOG_MS` 覆盖，默认 `5000ms`。
+- `main.js`：`before-quit` 里 `quitWatchdog.arm()`。
+- 新增 `test/quitWatchdog.test.js` 5 项（到点强制退出、重复 arm 只装一次、disarm、缺少 `app.exit` 时安全返回、预算解析）。全量单测 **393/393 通过**，`npm run lint` 0 error。
+
+### 9.4 部署流程加固：`scripts/deploy-nx6-appimage.sh`
+
+按序执行：停服务 → **等旧实例真正退出**（最多 15s，超时 SIGKILL）→ 结束该客户端的孤儿 crashpad → `fusermount -u` 清理残留 AppImage 挂载 → 备份（旧包 + `previous-appimage.sha256`）→ 替换 → 刷新桌面图标与 autostart 图标引用 → 启动并校验。这样不再出现「旧实例还抱着挂载就换包」的情形。
+
+### 9.5 1.0.33 部署与验证
+
+| 项 | 值 |
+| --- | --- |
+| 产物 | `CapsWriter-GUI-1.0.33-linux-arm64.AppImage` |
+| 新包 sha256 | `592a77eead16fd70a59cc2e28ea75ee0d2fdc9e31051cfa4e7fc400d889b65a3` |
+| 备份目录 | `~/.local/share/capswriter-backups/20260930-162039-bordeaux-1033/` |
+| 原生模块 | uiohook 与 better-sqlite3 均 AArch64（`verify:appimage:native`） |
+| 包内资源 | `main.js` `3688649d…`、`src/helpers/quitWatchdog.js` `e26b0489…`、`src/helpers/clipboard.js` `1865093f…`、`assets/icon.png` `e02b25a3…`，与本地一致 |
+| 服务 | active，进程已切换到 1.0.33 |
+
+验证结果：
+
+- 一次 `systemctl --user stop` 用时 **0.46s** 干净退出，未触发看门狗（说明这次收尾没有卡），退出后无孤儿 crashpad。
+- 退出后仍出现一条残留挂载，已单独卸载；说明「退出后偶发挂载残留」在 1.0.33 上依旧可能发生，靠部署脚本与手动清理兜住（看门狗只负责「进程一定能退」）。
+- **托盘「退出」按钮的实测待用户点一次确认**（日志会给出两条判据：干净退出时无额外日志；若收尾再卡死，会出现 `退出收尾超时，强制结束进程` 并在 5 秒内消失）。
+
+## 十、提交状态
+
+改动仅在本机工作区，**未推送**（本仓库此前记录的 GitHub 认证问题依旧）。本地按三个提交整理：
 
 1. `feat(brand): recolor startup logo to bordeaux (#691E2E / #F7F2EE)` —— `assets/icon.png`、`assets/tray-icon.png`、`scripts/recolor-brand-icon.py`、`test/brandIcon.test.js`
 2. `fix(linux): prefer Ctrl+V and allow multiline paste for WorkBuddy` —— `src/helpers/clipboard.js`、`src/platform/electron/ipc/textPolishHandlers.js`、`test/speechIpc.test.js`、`test/linuxPasteStrategy.test.js`、`package.json`（1.0.32）、本文档
+3. `fix(app): add quit watchdog and harden NX6 AppImage deploy` —— `main.js`、`src/helpers/quitWatchdog.js`、`test/quitWatchdog.test.js`、`scripts/deploy-nx6-appimage.sh`、`package.json`（1.0.33）、本文档
 
 `.codebuddy/`（IDE 数据，勿删）、`artifacts/` 以及既有未跟踪文件（`.github/CODEOWNERS`、`.github/workflows/pr-gate.yml`、`.github/pull_request_template.md`、`docs/CODE-REVIEW-STANDARDS.md`、`docs/M5-serial-provision-HANDOFF.md`、`src/helpers/m5SerialDiagnose.js`）不纳入本次提交。

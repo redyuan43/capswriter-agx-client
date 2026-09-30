@@ -136,6 +136,7 @@ const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles")
 const HostTriggerOperationQueue = require("./src/helpers/hostTriggerOperationQueue");
 const PipeWirePlaybackController = require("./src/helpers/pipeWirePlaybackController");
 const { KnobMapperManager } = require("./src/helpers/knobMapperManager");
+const { createQuitWatchdog } = require("./src/helpers/quitWatchdog");
 
 const m5BridgePublicHost = process.env.M5_VOICE_BRIDGE_HOST || "0.0.0.0";
 const m5BridgePublicPort = Number(process.env.M5_VOICE_BRIDGE_PORT || 8765);
@@ -449,6 +450,7 @@ const tencentDirectBridge = new TencentDirectBridge({ dataDirectory, getCredenti
 asrConnectionProfiles.directConnection = () => tencentDirectBridge.connection();
 const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter, hotWordsStore });
 const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory });
+const quitWatchdog = createQuitWatchdog({ app, logger });
 const nx1QwenRouter = new Nx1QwenRouter({ logger, databaseManager });
 const voiceLearningManager = new VoiceLearningManager({ logger });
 const voiceTeacherClassifier = new VoiceTeacherClassifier({ logger, cwd: __dirname });
@@ -1228,6 +1230,9 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   // Window close handlers must allow closing before Electron can emit will-quit.
   app.isQuitting = true;
+  // AppImage(FUSE) 环境下收尾可能卡死（NX6 实测停在 fuse_dev_release），
+  // 兜底保证「退出」一定能在看门狗时限内结束进程。
+  quitWatchdog.arm();
   textPolisher.dispose();
   tencentDirectBridge.dispose();
   codexTerminalManager.stop();
