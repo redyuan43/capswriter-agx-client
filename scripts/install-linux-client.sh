@@ -247,6 +247,20 @@ printf '%s\n' 'LOG_FILE="${LOG_DIR}/capswriter-agx-client.log"' >> "$LAUNCHER_PA
 printf '%s\n' 'mkdir -p "$LOG_DIR"' >> "$LAUNCHER_PATH"
 printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi' >> "$LAUNCHER_PATH"
 printf '%s\n' 'export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"' >> "$LAUNCHER_PATH"
+# 绕开 AppImage 的 FUSE 挂载：某些内核/Electron 组合下运行时卸载 squashfs 会卡在
+# fuse_dev_release，进程永远退不掉（2026-09-30 在 NX6 实测）。解包运行没有这个问题，
+# 代价是每次启动多几秒解包时间；解包目录每轮会留在 /tmp，启动前清上一轮的（已在运行时
+# 上面的 pgrep 检查会提前 exit，不会误删正在使用的目录）。
+printf '%s\n' 'rm -rf "${TMPDIR:-/tmp}"/appimage_extracted_* 2>/dev/null || true' >> "$LAUNCHER_PATH"
+printf '%s\n' 'export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"' >> "$LAUNCHER_PATH"
+# 主动退出标记：退出时客户端写下这个文件，systemd 若按重启策略把进程拉起来，30 秒内的启动
+# 会被拒绝，保证「点了退出就是退出」；更晚的手动启动照常，并顺手清掉过期标记。
+printf '%s\n' 'QUIT_MARKER="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client/intentional-quit"' >> "$LAUNCHER_PATH"
+printf '%s\n' 'if [ -f "$QUIT_MARKER" ]; then' >> "$LAUNCHER_PATH"
+printf '%s\n' '  age=$(( $(date +%s) - $(stat -c %Y "$QUIT_MARKER" 2>/dev/null || echo 0) ))' >> "$LAUNCHER_PATH"
+printf '%s\n' '  if [ "$age" -lt 30 ]; then exit 0; fi' >> "$LAUNCHER_PATH"
+printf '%s\n' '  rm -f "$QUIT_MARKER"' >> "$LAUNCHER_PATH"
+printf '%s\n' 'fi' >> "$LAUNCHER_PATH"
 printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_FILE" 2>&1' >> "$LAUNCHER_PATH"
 chmod 0755 "$LAUNCHER_PATH"
 
@@ -277,7 +291,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${LAUNCHER_PATH}
-Restart=on-failure
+# on-abnormal：只有信号终止/超时这类异常才重启。用户主动退出（托盘退出、非零退出码）
+# 不再被当成故障拉起来——那会让「退出」看起来无效。
+Restart=on-abnormal
 RestartSec=2
 KillMode=control-group
 TimeoutStopSec=10

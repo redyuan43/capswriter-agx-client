@@ -136,7 +136,7 @@ const { AsrConnectionProfiles } = require("./src/helpers/asrConnectionProfiles")
 const HostTriggerOperationQueue = require("./src/helpers/hostTriggerOperationQueue");
 const PipeWirePlaybackController = require("./src/helpers/pipeWirePlaybackController");
 const { KnobMapperManager } = require("./src/helpers/knobMapperManager");
-const { createQuitWatchdog } = require("./src/helpers/quitWatchdog");
+const { createQuitWatchdog, markIntentionalQuit } = require("./src/helpers/quitWatchdog");
 
 const m5BridgePublicHost = process.env.M5_VOICE_BRIDGE_HOST || "0.0.0.0";
 const m5BridgePublicPort = Number(process.env.M5_VOICE_BRIDGE_PORT || 8765);
@@ -1233,6 +1233,8 @@ app.on("before-quit", () => {
   // AppImage(FUSE) 环境下收尾可能卡死（NX6 实测停在 fuse_dev_release），
   // 兜底保证「退出」一定能在看门狗时限内结束进程。
   quitWatchdog.arm();
+  // 同时记下这是主动退出：即使最终被 SIGKILL 收尾，启动器也不会把它再拉起来。
+  markIntentionalQuit({ logger });
   textPolisher.dispose();
   tencentDirectBridge.dispose();
   codexTerminalManager.stop();

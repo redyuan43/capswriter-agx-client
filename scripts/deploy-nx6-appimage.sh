@@ -89,7 +89,7 @@ echo "== 4/6 替换安装"
 install -m 0755 "$APPIMAGE_SRC" "$APPIMAGE.new"
 mv -f "$APPIMAGE.new" "$APPIMAGE"
 
-echo "== 5/6 刷新桌面图标与 autostart 图标引用"
+echo "== 5/6 刷新桌面图标、autostart 引用与启动器"
 ASSETS_DIR="$(cd "$(dirname "$APPIMAGE_SRC")/.." && pwd)/assets"
 if [ -f "$ASSETS_DIR/tray-icon.png" ]; then
   mkdir -p "$HOME/.local/share/icons/hicolor/64x64/apps"
@@ -98,6 +98,43 @@ if [ -f "$ASSETS_DIR/tray-icon.png" ]; then
 fi
 if [ -f "$HOME/.config/autostart/capswriter-agx-client.desktop" ]; then
   sed -i 's|^Icon=.*|Icon=capswriter-agx-client|' "$HOME/.config/autostart/capswriter-agx-client.desktop"
+fi
+
+# 启动器必须是这个形状，缺一不可：
+#   - APPIMAGE_EXTRACT_AND_RUN=1  绕开会让退出卡死的 FUSE 卸载
+#   - 清掉上一轮的解包目录        解包目录每轮留在 /tmp，不清会一直堆积
+#   - 主动退出标记检查            退出后 30 秒内拒绝被 systemd 拉起来，保证「退出就是退出」
+write_launcher() {
+  local path="$1"
+  local appimage_path="$2"
+  { printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' '# 由 scripts/deploy-nx6-appimage.sh 维护：解包运行 + 主动退出标记检查。'
+    printf 'APPIMAGE_PATH=%q\n' "$appimage_path"
+    printf '%s\n' 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client"'
+    printf '%s\n' 'mkdir -p "$LOG_DIR"'
+    printf '%s\n' 'if pgrep -u "$(id -u)" -f "$APPIMAGE_PATH" >/dev/null 2>&1; then exit 0; fi'
+    printf '%s\n' 'QUIT_MARKER="${XDG_CACHE_HOME:-$HOME/.cache}/capswriter-agx-client/intentional-quit"'
+    printf '%s\n' 'if [ -f "$QUIT_MARKER" ]; then'
+    printf '%s\n' '  age=$(( $(date +%s) - $(stat -c %Y "$QUIT_MARKER" 2>/dev/null || echo 0) ))'
+    printf '%s\n' '  if [ "$age" -lt 30 ]; then exit 0; fi'
+    printf '%s\n' '  rm -f "$QUIT_MARKER"'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'rm -rf "${TMPDIR:-/tmp}"/appimage_extracted_* 2>/dev/null || true'
+    printf '%s\n' 'export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"'
+    printf '%s\n' 'export CAPS_LISTENER_BACKEND="${CAPS_LISTENER_BACKEND:-evdev}"'
+    printf '%s\n' 'exec "$APPIMAGE_PATH" --no-sandbox "$@" >>"$LOG_DIR/capswriter-agx-client.log" 2>&1'
+  } > "$path"
+  chmod 0755 "$path"
+  echo "   已重写启动器（解包运行 + 退出标记检查）: $path"
+}
+write_launcher "$HOME/.local/bin/capswriter-gui" "$APPIMAGE"
+
+# 服务单元：主动退出不该被当成故障重启（on-failure 会把非零退出码判为失败）。
+UNIT_PATH="$HOME/.config/systemd/user/capswriter-agx-client.service"
+if [ -f "$UNIT_PATH" ] && grep -q '^Restart=on-failure' "$UNIT_PATH"; then
+  sed -i 's|^Restart=on-failure|Restart=on-abnormal|' "$UNIT_PATH"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  echo "   服务重启策略已改为 on-abnormal: $UNIT_PATH"
 fi
 
 echo "== 6/6 启动并校验"
