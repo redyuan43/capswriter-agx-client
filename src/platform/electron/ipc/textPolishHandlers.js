@@ -12,9 +12,12 @@ function resolveTerminalState(ctx) {
     if (isTerminalWindow(meta.windowClass, meta.windowTitle)) return true;
     // 未命中终端名单不等于已确认可安全接收多行文本。
     const classes = String(meta.windowClass || '').toLowerCase().split(/\s+/);
+    // workbuddy / codebuddy / buddycn 是 WorkBuddy 桌面端（Electron），其对话输入框
+    // 是普通多行输入：此前被判为"未知窗口"，长口述结果只会复制到剪贴板而从不粘贴。
     const editors = new Set(['code', 'code-oss', 'vscodium', 'gedit', 'org.gnome.gedit',
       'org.gnome.texteditor', 'kate', 'kwrite', 'mousepad', 'leafpad', 'sublime_text',
-      'libreoffice-writer', 'firefox', 'google-chrome', 'chromium', 'chromium-browser']);
+      'libreoffice-writer', 'firefox', 'google-chrome', 'chromium', 'chromium-browser',
+      'workbuddy', 'codebuddy', 'buddycn']);
     return classes.some(name => editors.has(name)) ? false : null;
   } catch (error) {
     ctx.logger?.debug?.("判断前台窗口类型失败", { error: error?.message || String(error) });

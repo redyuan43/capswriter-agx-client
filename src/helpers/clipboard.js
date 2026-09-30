@@ -7,6 +7,22 @@ const LINUX_PASTE_METHOD = {
   SHIFT_INSERT: "shift_insert",
   CTRL_V: "ctrl_v",
 };
+// WorkBuddy 桌面端（Electron/Chromium，WM_CLASS 形如 "workbuddy WorkBuddy"）。
+// 已确证的事实：历史缓存里固化过 shift_insert，而成功判据只看注入命令的退出码，
+// 因此错误方法会被永久沿用；实际在 WorkBuddy 输入框里落字的是 Ctrl+V。该家族固定
+// 由规则决定（优先 Ctrl+V），既不读缓存也不写缓存，避免再次固化未验证的结论。
+const LINUX_WORKBUDDY_CLASS_PATTERN = /(workbuddy|codebuddy|buddycn)/;
+// 各窗口家族在首选方法之后的回退顺序。表驱动，避免在分支里堆嵌套三元。
+const LINUX_PASTE_FALLBACKS = {
+  workbuddy: [LINUX_PASTE_METHOD.CTRL_SHIFT_V, LINUX_PASTE_METHOD.SHIFT_INSERT],
+  remmina: [LINUX_PASTE_METHOD.CTRL_V, LINUX_PASTE_METHOD.SHIFT_INSERT],
+  wechatOrUnknown: [LINUX_PASTE_METHOD.CTRL_SHIFT_V, LINUX_PASTE_METHOD.CTRL_V],
+  default: [
+    LINUX_PASTE_METHOD.SHIFT_INSERT,
+    LINUX_PASTE_METHOD.CTRL_SHIFT_V,
+    LINUX_PASTE_METHOD.CTRL_V,
+  ],
+};
 const LINUX_TARGET_ACTIVATION_SETTLE_MS = 80;
 const LINUX_CLIPBOARD_SETTLE_MS = 60;
 const LINUX_PASTE_COMMAND_TIMEOUT_MS = 1800;
@@ -26,6 +42,8 @@ class ClipboardManager {
     
     // 尝试加载 osascript 模块（仅在 macOS 上）
     this.osascript = null;
+    // Linux 注入后端可用性：null 未探测，false 本进程内已确认缺失（spawn ENOENT）。
+    this.linuxPasteToolAvailability = { wtype: null, ydotool: null };
     if (process.platform === "darwin") {
       try {
         this.osascript = require("osascript");
@@ -119,11 +137,16 @@ class ClipboardManager {
     );
   }
 
+  isLinuxWorkBuddyWindow(windowClass) {
+    return LINUX_WORKBUDDY_CLASS_PATTERN.test(this.normalizeWindowClass(windowClass));
+  }
+
   chooseLinuxPasteMethods(windowClass, windowTitle) {
     const normalizedClass = this.normalizeWindowClass(windowClass);
     const normalizedTitle = String(windowTitle || "").toLowerCase();
     const isRemminaWindow = /remmina/.test(normalizedClass);
     const isWeChatWindow = this.isLinuxWeChatWindow(normalizedClass, normalizedTitle);
+    const isWorkBuddyWindow = this.isLinuxWorkBuddyWindow(normalizedClass);
     const isTerminalWindow =
       /(gnome-terminal|ptyxis|kgx|konsole|xterm|alacritty|kitty|wezterm|terminator|tilix)/.test(normalizedClass) ||
       /(terminal|shell|bash|zsh)/.test(normalizedTitle);
@@ -137,14 +160,24 @@ class ClipboardManager {
 
     let preferredMethod = cachedMethod;
     let source = cachedMethod ? "cache" : "rule";
+    let cacheIgnored = false;
+    let family = "default";
 
-    // Remmina 已验证使用 Ctrl+Shift+V，旧缓存不应覆盖该规则。
-    if (isRemminaWindow) {
+    if (isWorkBuddyWindow) {
+      // 该家族历史缓存里已固化了未验证的 shift_insert，规则必须压过缓存。
+      cacheIgnored = Boolean(cached);
+      preferredMethod = LINUX_PASTE_METHOD.CTRL_V;
+      source = "workbuddy_rule";
+      family = "workbuddy";
+    } else if (isRemminaWindow) {
+      // Remmina 已验证使用 Ctrl+Shift+V，旧缓存不应覆盖该规则。
       preferredMethod = LINUX_PASTE_METHOD.CTRL_SHIFT_V;
       source = "remmina_rule";
+      family = "remmina";
     } else if (isWeChatWindow) {
       preferredMethod = LINUX_PASTE_METHOD.SHIFT_INSERT;
       source = "wechat_rule";
+      family = "wechatOrUnknown";
     } else if (!preferredMethod) {
       if (isTerminalWindow) {
         preferredMethod = LINUX_PASTE_METHOD.CTRL_SHIFT_V;
@@ -152,6 +185,7 @@ class ClipboardManager {
       } else if (isUnknownWindow) {
         preferredMethod = LINUX_PASTE_METHOD.SHIFT_INSERT;
         source = "unknown_window_rule";
+        family = "wechatOrUnknown";
       } else if (isCompatRemoteWindow) {
         preferredMethod = LINUX_PASTE_METHOD.SHIFT_INSERT;
         source = "compat_rule";
@@ -161,29 +195,14 @@ class ClipboardManager {
       }
     }
 
-    const fallbackOrder = isRemminaWindow
-      ? [
-          preferredMethod,
-          LINUX_PASTE_METHOD.CTRL_V,
-          LINUX_PASTE_METHOD.SHIFT_INSERT,
-        ]
-      : isWeChatWindow || isUnknownWindow
-        ? [
-            preferredMethod,
-            LINUX_PASTE_METHOD.CTRL_SHIFT_V,
-            LINUX_PASTE_METHOD.CTRL_V,
-          ]
-      : [
-          preferredMethod,
-          LINUX_PASTE_METHOD.SHIFT_INSERT,
-          LINUX_PASTE_METHOD.CTRL_SHIFT_V,
-          LINUX_PASTE_METHOD.CTRL_V,
-        ];
-
     return {
       preferredMethod,
       source,
-      sequence: this.uniqueMethods(fallbackOrder),
+      cacheIgnored,
+      sequence: this.uniqueMethods([
+        preferredMethod,
+        ...LINUX_PASTE_FALLBACKS[family],
+      ]),
     };
   }
 
@@ -360,10 +379,22 @@ class ClipboardManager {
       && String(process.env.XDG_SESSION_TYPE || "").toLowerCase() === "wayland";
   }
 
+  isLinuxPasteToolAvailable(tool) {
+    return this.linuxPasteToolAvailability[tool] !== false;
+  }
+
+  markLinuxPasteToolMissing(tool, result) {
+    if (!result || result.ok) return;
+    if (/\bENOENT\b|not found/i.test(String(result.stderr || ""))) {
+      this.linuxPasteToolAvailability[tool] = false;
+    }
+  }
+
   async runLinuxPasteCommand(method, keyCombo) {
     const fallbackErrors = [];
+    const attemptedBackends = [];
     const wtypeKeys = this.getWtypeKeySequence(method);
-    if (this.isWaylandSession() && wtypeKeys) {
+    if (this.isWaylandSession() && wtypeKeys && this.isLinuxPasteToolAvailable("wtype")) {
       const wtypeResult = await this.spawnWithResult(
         "wtype",
         wtypeKeys,
@@ -375,11 +406,13 @@ class ClipboardManager {
           backend: "wtype",
         };
       }
+      this.markLinuxPasteToolMissing("wtype", wtypeResult);
       fallbackErrors.push(`wtype: ${wtypeResult.stderr}`);
+      attemptedBackends.push("wtype");
     }
 
     const ydotoolKeys = this.getYdotoolKeySequence(method);
-    if (ydotoolKeys) {
+    if (ydotoolKeys && this.isLinuxPasteToolAvailable("ydotool")) {
       const ydotoolResult = await this.spawnWithResult(
         "ydotool",
         ["key", "--key-delay", String(LINUX_YDOTOOL_KEY_DELAY_MS), ...ydotoolKeys],
@@ -392,20 +425,12 @@ class ClipboardManager {
           fallbackError: fallbackErrors.join("; "),
         };
       }
-
+      this.markLinuxPasteToolMissing("ydotool", ydotoolResult);
       fallbackErrors.push(`ydotool: ${ydotoolResult.stderr}`);
-
-      const xdotoolResult = await this.spawnWithResult(
-        "xdotool",
-        ["key", "--delay", String(LINUX_XDOTOOL_KEY_DELAY_MS), keyCombo],
-        LINUX_PASTE_COMMAND_TIMEOUT_MS
-      );
-      return {
-        ...xdotoolResult,
-        backend: "xdotool",
-        fallbackFrom: this.isWaylandSession() ? "wtype,ydotool" : "ydotool",
-        fallbackError: fallbackErrors.join("; "),
-      };
+      attemptedBackends.push("ydotool");
+    } else if (ydotoolKeys) {
+      // 本进程内已确认缺失，不再重复付出一次 spawn 失败的开销。
+      fallbackErrors.push("ydotool: unavailable (cached ENOENT)");
     }
 
     const xdotoolResult = await this.spawnWithResult(
@@ -416,7 +441,7 @@ class ClipboardManager {
     return {
       ...xdotoolResult,
       backend: "xdotool",
-      fallbackFrom: this.isWaylandSession() ? "wtype" : "",
+      fallbackFrom: attemptedBackends.join(","),
       fallbackError: fallbackErrors.join("; "),
     };
   }
@@ -503,6 +528,15 @@ class ClipboardManager {
   rememberLinuxPasteMethod(windowClass, method) {
     const key = this.normalizeWindowClass(windowClass);
     if (!key || !method) return;
+    if (this.isLinuxWorkBuddyWindow(key)) {
+      // WorkBuddy 家族的方法由规则决定。这里的"成功"只代表注入命令退出码为 0，
+      // 不能证明文字真的落进输入框，写回缓存会把错误结论固化。
+      this.safeLog("📌 跳过写入粘贴方式缓存（WorkBuddy 家族由规则决定）", {
+        windowClass: key,
+        method,
+      });
+      return;
+    }
     this.pasteMethodMap[key] = method;
     this.savePasteMethodMap();
   }
@@ -773,6 +807,7 @@ class ClipboardManager {
       windowTitle: "",
       preferredMethod: "",
       strategySource: "",
+      cacheIgnored: false,
       attempts: [],
       finalMethod: "",
       clipboardRestored: false,
@@ -824,6 +859,7 @@ class ClipboardManager {
     const restoreClipboardAfterPaste = targetActivationOk && hasWindowMeta && !isRemoteWindow && !isWeChatWindow;
     trace.preferredMethod = strategy.preferredMethod;
     trace.strategySource = strategy.source;
+    trace.cacheIgnored = strategy.cacheIgnored;
     trace.clipboardRestoreReason = restoreClipboardAfterPaste
       ? "local_window"
       : !targetActivationOk
@@ -840,6 +876,7 @@ class ClipboardManager {
       windowTitle: windowMeta.windowTitle,
       preferredMethod: strategy.preferredMethod,
       source: strategy.source,
+      cacheIgnored: strategy.cacheIgnored,
       sequence: strategy.sequence,
       targetActivationOk,
       hasWindowMeta,
