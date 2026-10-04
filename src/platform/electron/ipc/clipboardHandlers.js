@@ -7,6 +7,13 @@ function registerClipboardHandlers(ctx) {
     const result = await ctx.clipboardManager.copyText(text);
     return { ...result, mode: 'copied' };
   };
+  ipcMain.handle('deliver-speech-job', async (event, id) => {
+    if (!ctx.speechJobs) return { success: false, mode: 'cancelled' };
+    return ctx.speechJobs.deliver(id, event.sender.id, async text => {
+      const copied = await copyMultilineIfNeeded(text);
+      return copied || ctx.clipboardManager.pasteText(text);
+    });
+  });
   ipcMain.handle("copy-text", async (_event, text) => {
     try {
       return await ctx.clipboardManager.copyText(text);

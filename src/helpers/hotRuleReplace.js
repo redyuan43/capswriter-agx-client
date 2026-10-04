@@ -163,43 +163,82 @@ class HotRuleReplacer {
 
   applyAsync(text, { timeoutMs = 200, signal } = {}) {
     if (!this.rules.length || !text || signal?.aborted) return Promise.resolve({ text, applied: [], error: signal?.aborted ? 'cancelled' : null });
-    const rules = this.rules;
-    return new Promise((resolve) => {
-      const worker = fork(__filename, ['--hot-rule-worker'], { windowsHide: true,
-        stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: ['--max-old-space-size=64'],
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
-      let done = false;
-      const finish = (result) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        signal?.removeEventListener('abort', cancel);
-        worker.kill('SIGKILL');
-        resolve(result);
+    return new Promise(resolve => {
+      const task = { text, rules: this.rules, timeoutMs, signal, resolve };
+      task.cancel = () => {
+        if (this.runningTask === task) this.finishTask({ text, applied: [], error: 'cancelled' }, true);
+        else {
+          this.pendingTasks = (this.pendingTasks || []).filter(t => t !== task);
+          signal?.removeEventListener('abort', task.cancel);
+          resolve({ text, applied: [], error: 'cancelled' });
+        }
       };
-      const cancel = () => finish({ text, applied: [], error: 'cancelled' });
-      // Electron 子进程启动在 NX6 上可能超过 200 ms；执行期限从 ready 后算起。
-      let timer = setTimeout(() => finish({ text, applied: [], error: 'rule_worker_start_timeout' }), 2000);
-      signal?.addEventListener('abort', cancel, { once: true });
-      worker.on('message', (message) => {
-        if (done) return;
-        if (message?.type === 'ready') {
-          clearTimeout(timer);
-          timer = setTimeout(() => finish({ text, applied: [], error: 'rule_timeout' }), timeoutMs);
-          worker.send({ text, rules }, (error) => {
-            if (error) finish({ text, applied: [], error: 'rule_worker_failed' });
-          });
-        } else finish(message);
-      });
-      worker.once('error', () => finish({ text, applied: [], error: 'rule_worker_failed' }));
-      worker.once('exit', () => finish({ text, applied: [], error: 'rule_worker_exited' }));
+      signal?.addEventListener('abort', task.cancel, { once: true });
+      (this.pendingTasks ||= []).push(task);
+      this.pump();
     });
   }
+
+  pump() {
+    if (this.runningTask || !this.pendingTasks?.length) return;
+    this.runningTask = this.pendingTasks.shift();
+    if (this.worker && this.workerReady) {
+      this.worker.ref(); this.worker.channel?.ref();
+      this.dispatch();
+      return;
+    }
+    const worker = fork(__filename, ['--hot-rule-worker'], { windowsHide: true,
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: ['--max-old-space-size=64'],
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
+    this.worker = worker;
+    this.workerReady = false;
+    this.workerTimer = setTimeout(() => this.finishTask({ text: this.runningTask.text, applied: [], error: 'rule_worker_start_timeout' }, true), 2000);
+    worker.on('message', message => {
+      if (worker !== this.worker) return;
+      if (message?.type === 'ready') { this.workerReady = true; this.dispatch(); }
+      else this.finishTask(message);
+    });
+    const failed = () => {
+      if (worker !== this.worker) return;
+      if (this.runningTask) this.finishTask({ text: this.runningTask.text, applied: [], error: 'rule_worker_failed' }, true);
+      else { this.worker = null; this.workerReady = false; }
+    };
+    worker.once('error', failed); worker.once('exit', failed);
+  }
+
+  dispatch() {
+    clearTimeout(this.workerTimer);
+    const task = this.runningTask;
+    this.workerTimer = setTimeout(() => this.finishTask({ text: task.text, applied: [], error: 'rule_timeout' }, true), task.timeoutMs);
+    this.worker.send({ text: task.text, rules: task.rules }, error => {
+      if (error && this.runningTask === task) this.finishTask({ text: task.text, applied: [], error: 'rule_worker_failed' }, true);
+    });
+  }
+
+  finishTask(result, reset = false) {
+    const task = this.runningTask;
+    if (!task) return;
+    clearTimeout(this.workerTimer);
+    this.runningTask = null;
+    task.signal?.removeEventListener('abort', task.cancel);
+    if (reset) { const worker = this.worker; this.worker = null; this.workerReady = false; worker?.kill('SIGKILL'); }
+    else { this.worker?.unref(); this.worker?.channel?.unref(); }
+    task.resolve(result);
+    this.pump();
+  }
+
+  dispose() {
+    const queued = this.pendingTasks || []; this.pendingTasks = [];
+    for (const task of queued) { task.signal?.removeEventListener('abort', task.cancel); task.resolve({ text: task.text, applied: [], error: 'cancelled' }); }
+    if (this.runningTask) this.finishTask({ text: this.runningTask.text, applied: [], error: 'cancelled' }, true);
+    this.worker?.kill('SIGKILL'); this.worker = null;
+  }
+
 }
 
 module.exports = { HotRuleReplacer, parseRules, convertBackreference };
 if (process.argv.includes('--hot-rule-worker')) {
-  process.once('message', ({ text, rules }) => {
+  process.on('message', ({ text, rules }) => {
     const replacer = new HotRuleReplacer();
     replacer.rules = rules;
     process.send(replacer.apply(text));

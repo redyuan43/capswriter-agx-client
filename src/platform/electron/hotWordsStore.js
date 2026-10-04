@@ -7,6 +7,12 @@ const BUNDLED_FILE = path.join(PROJECT_ROOT, "assets", "hot-words.txt");
 const FILE_NAME = "hot-words.txt";
 const MAX_TERMS = 128; // 腾讯硬上限
 const DEFAULT_WEIGHT = 5;
+const GROUPS = { coding: ['GitHub', 'commit', 'release', 'API', 'skills', 'bug', 'AGENTS.md', 'Codex', 'Markdown', 'branch', 'worker', 'README', 'agent', 'Git', 'Qwen3', 'fallback', 'skill', 'subagent', 'upstream', 'ACP', 'DeepSeek', 'TUI', 'NPM', 'analysis', 'repo', 'token', 'SDK', 'context', 'clone', 'fork', 'CLI', 'OpenClaw'],
+  hardware: ['ADB', 'APK', 'Nano', 'USB', 'TTS', 'Ubuntu', 'OTA', 'AGX', 'GUI', 'GPU', 'AMD', 'ASR', 'Linux', 'CPU', 'ESP', 'GPS', 'IMU', 'K20', 'VAD', 'ARM', 'nx1', 'nx2', 'nx3', 'nx4', 'nx5', 'nx6', 'nx7'],
+  network: ['WiFi', 'Wi-Fi', 'SSH', 'VNC', 'VPN', 'Tailscale', 'server', 'CDP', 'VPS'],
+  personal: ['Ivan', 'Hermes', 'iPhone', 'Windows', 'Mac', 'Chrome'] };
+const GROUP_NAMES = { coding: '开发与模型', hardware: '设备与硬件', network: '网络', personal: '常用专名', general: '其他词' };
+const defaultGroup = term => Object.keys(GROUPS).find(g => GROUPS[g].some(t => t.toLowerCase() === term.toLowerCase())) || 'general';
 
 /**
  * 决定词表文件来源，优先级从高到低：
@@ -80,6 +86,8 @@ class HotWordsStore {
     this.candidates = [];
     this.sourceHash = '';
     this.snapshots = new Map();
+    this.activeGroups = Object.keys(GROUP_NAMES);
+    this.managedWeights = false;
     this.load();
   }
 
@@ -92,6 +100,8 @@ class HotWordsStore {
         this.entries = saved.entries.map(normalizeEntry);
         this.candidates = Array.isArray(saved.candidates) ? saved.candidates.filter((s) => typeof s === 'string' && !termError(s)) : [];
         this.sourceHash = saved.sourceHash || '';
+        this.activeGroups = Array.isArray(saved.activeGroups) ? saved.activeGroups.filter(g => GROUP_NAMES[g]) : Object.keys(GROUP_NAMES);
+        this.managedWeights = saved.managedWeights === true;
       }
       const text = this.fs.readFileSync(this.filePath, "utf8");
       const hash = require('crypto').createHash('sha256').update(text).digest('hex');
@@ -129,19 +139,21 @@ class HotWordsStore {
 
   snapshot(context = '') {
     this.load();
-    const active = this.entries.filter((e) => e.enabled !== false && !termError(e.term));
+    const active = this.entries.filter((e) => e.enabled !== false && !termError(e.term) &&
+      (this.activeGroups.includes(e.group) || (e.updatedAt && Date.now() - e.updatedAt < 3 * 86400000)));
     const ranked = active.map((entry, index) => ({ entry, index,
       score: (context && [entry.term, ...entry.aliases].some((s) => context.includes(s)) ? 100 : 0) + entry.weight +
         (entry.updatedAt && Date.now() - entry.updatedAt < 3 * 86400000 ? 8 : 0),
     })).sort((a, b) => b.score - a.score || (b.entry.updatedAt || 0) - (a.entry.updatedAt || 0) || a.index - b.index);
-    const selected = ranked.slice(0, MAX_TERMS).map(({ entry }) => ({ ...entry }));
-    const version = require('crypto').createHash('sha256').update(JSON.stringify(this.entries)).digest('hex').slice(0, 16);
+    const selected = ranked.slice(0, MAX_TERMS).map(({ entry }) => ({ ...entry,
+      weight: this.managedWeights ? (entry.strong ? 11 : 5) : entry.weight }));
+    const version = require('crypto').createHash('sha256').update(JSON.stringify([this.entries, this.activeGroups, this.managedWeights])).digest('hex').slice(0, 16);
     this.snapshots.set(version, structuredClone(this.entries));
     if (this.snapshots.size > 20) this.snapshots.delete(this.snapshots.keys().next().value);
     return { entries: selected, terms: selected.map((e) => e.term),
       ...(this.loadError ? { degraded: this.loadError } : {}),
       hotword: selected.map((e) => `${e.term}|${e.weight}`).join(','), version,
-      total: this.entries.length, selected: selected.length,
+      total: this.entries.length, selected: selected.length, groups: GROUP_NAMES, activeGroups: this.activeGroups, managedWeights: this.managedWeights,
       omitted: active.length - selected.length,
       invalid: this.entries.filter((e) => termError(e.term)).map((e) => ({ term: e.term, reason: termError(e.term) })),
     };
@@ -149,6 +161,15 @@ class HotWordsStore {
 
   entriesForVersion(version) {
     return version ? this.snapshots.get(version) : this.entries;
+  }
+
+  configure({ activeGroups, managedWeights }) {
+    this.load();
+    const oldGroups = this.activeGroups, oldManaged = this.managedWeights;
+    if (Array.isArray(activeGroups)) this.activeGroups = [...new Set(activeGroups.filter(g => GROUP_NAMES[g]))];
+    if (typeof managedWeights === 'boolean') this.managedWeights = managedWeights;
+    if (!this.persist()) { this.activeGroups = oldGroups; this.managedWeights = oldManaged; throw new Error('词组保存失败'); }
+    return this.snapshot();
   }
 
   /**
@@ -211,7 +232,8 @@ class HotWordsStore {
         this.logger?.warn("热词表路径不可写，跳过持久化", { path: this.filePath });
         return false;
       }
-      const body = JSON.stringify({ version: 2, sourceHash: this.sourceHash, entries: this.entries, candidates: this.candidates }, null, 2) + '\n';
+      const body = JSON.stringify({ version: 3, sourceHash: this.sourceHash, entries: this.entries, candidates: this.candidates,
+        activeGroups: this.activeGroups, managedWeights: this.managedWeights }, null, 2) + '\n';
       const temporary = `${this.dictionaryPath}.tmp`;
       this.fs.writeFileSync(temporary, body, 'utf8');
       this.fs.renameSync(temporary, this.dictionaryPath);
@@ -235,6 +257,7 @@ function normalizeEntry(entry) {
   return { term: String(entry.term || '').trim(),
     weight: Number.isInteger(Number(entry.weight)) && Number(entry.weight) >= 1 && Number(entry.weight) <= 11 ? Number(entry.weight) : DEFAULT_WEIGHT,
     enabled: entry.enabled !== false, aliases: strings(entry.aliases), exclusions: strings(entry.exclusions),
+    group: GROUP_NAMES[entry.group] ? entry.group : defaultGroup(String(entry.term || '')), strong: entry.strong === true,
     updatedAt: Number.isFinite(entry.updatedAt) ? Math.max(0, entry.updatedAt) : 0 };
 }
 

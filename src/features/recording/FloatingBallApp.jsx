@@ -454,6 +454,7 @@ export default function FloatingBallApp() {
   const MIN_STAGE_DURATION_MS = 250;
   const lastClipboardTextRef = useRef("");
   const ttsEnabledRef = useRef(false);
+  const voiceTtsGenerationRef = useRef(null);
   const ttsSpeedRef = useRef(DEFAULT_TTS_SPEED);
   const ttsSpeakerRef = useRef(DEFAULT_TTS_SPEAKER);
   const ttsInstructionRef = useRef(DEFAULT_TTS_INSTRUCTION);
@@ -608,7 +609,7 @@ export default function FloatingBallApp() {
     };
   }, []);
 
-  const safePaste = useCallback(async (text, expectedGeneration = outputControlRef.current.generation) => {
+  const safePaste = useCallback(async (text, expectedGeneration = outputControlRef.current.generation, jobId = null) => {
     const allowInterruptedConfirm =
       outputControlRef.current.interrupted && outputControlRef.current.reason === "confirm";
 
@@ -640,7 +641,7 @@ export default function FloatingBallApp() {
       }
       try {
         if (window.electronAPI) {
-          const pasteResult = await window.electronAPI.pasteText(text);
+          const pasteResult = jobId ? await window.electronAPI.deliverSpeechJob(jobId) : await window.electronAPI.pasteText(text);
           if (pasteResult && pasteResult.success === false) {
             return { ok: false, mode: "failed" };
           }
@@ -955,6 +956,7 @@ export default function FloatingBallApp() {
       currentStatus === "processing"
     ) {
       pendingDictationConfirmRef.current = true;
+      window.electronAPI?.cancelTextPolish?.({ waitOnly: true }).catch(() => {});
       logRuntime("info", "Dictation confirm queued until recording finalizes", {
         status: currentStatus,
         isRecording: isRecordingRef.current,
@@ -1774,7 +1776,7 @@ export default function FloatingBallApp() {
    * 转写文本整理：原文 → 受保护的规则/别名替换 → 当前 ASR 对应的整理模型。
    * 失败保留上一阶段文本，原文与整理结果分别记录。
    */
-  const polishRecognizedText = useCallback(async (rawText, dictionaryVersion, asrProvider) => {
+  const polishRecognizedText = useCallback(async (rawText, dictionaryVersion, asrProvider, transcriptionResult, waitForModel = true) => {
     const settings = textPolishRef.current;
     if (!settings.enabled || !rawText || typeof window.electronAPI?.polishText !== "function") {
       return { text: rawText, changed: false, degraded: null };
@@ -1785,6 +1787,12 @@ export default function FloatingBallApp() {
         punctuation: settings.punctuation,
         dictionaryVersion,
         asrProvider,
+        live: true,
+        waitForModel,
+        sessionId: transcriptionResult.session_id || transcriptionResult.request_id || `dictation-${outputControlRef.current.generation}-${Date.now()}`,
+        stoppedAtMs: transcriptionResult.timing?.client_stop_at_ms,
+        segments: transcriptionResult.segments || [],
+        words: transcriptionResult.words || [],
         // 整理与交付分开：终端/未知窗口的多行结果只复制。
         longFormat: settings.longFormat,
       });
@@ -1859,14 +1867,14 @@ export default function FloatingBallApp() {
       let polishDegraded = null;
       if (postprocessMode !== 'translate' && recognizedText) {
         // 文件入口可能已经整理，避免再次改写和重复调用模型。
-        const polished = transcriptionResult.processing || await polishRecognizedText(recognizedText, transcriptionResult.dictionary_version, transcriptionResult.provider);
+        const polished = transcriptionResult.processing || await polishRecognizedText(recognizedText, transcriptionResult.dictionary_version, transcriptionResult.provider, transcriptionResult, !queuedConfirm);
         transcriptionResult.processing = polished;
         transcriptionResult.corrected_text = polished.corrected_text || recognizedText;
         transcriptionResult.final_text = polished.text;
         finalText = polished.text;
         polishDegraded = polished.degraded;
         // 整理是异步的：期间可能已被取消或切换任务，迟到结果不得粘贴
-        if (!isCurrentOutputGeneration(outputGeneration)) {
+        if (polished.degraded === 'cancelled' || !isCurrentOutputGeneration(outputGeneration)) {
           logRuntime("info", "Discard polished text after output interruption", {
             reason: outputControlRef.current.reason,
           });
@@ -1879,9 +1887,9 @@ export default function FloatingBallApp() {
 
       transcriptionResult.final_text = finalText;
 
-      if (transcriptionResult.provider === 'firered2' && transcriptionResult.timing?.client_stop_at_ms) {
+      if (transcriptionResult.timing?.client_stop_at_ms) {
         transcriptionResult.timing.stop_to_text_ready_ms = Date.now() - transcriptionResult.timing.client_stop_at_ms;
-        logRuntime('info', 'FireRed2 local timing', transcriptionResult.timing);
+        logRuntime('info', 'Dictation delivery timing', transcriptionResult.timing);
       }
 
       if (!fastMode) {
@@ -1889,7 +1897,8 @@ export default function FloatingBallApp() {
       }
 
       const triggerVoiceTts = () => {
-        if (!ttsEnabledRef.current || !finalText) return;
+        if (!ttsEnabledRef.current || !finalText || voiceTtsGenerationRef.current === outputGeneration) return;
+        voiceTtsGenerationRef.current = outputGeneration;
         lastClipboardTextRef.current = finalText;
         const skipTranslate = postprocessMode === 'cleanup' || postprocessMode === 'translate';
         logRuntime("info", "TTS trigger from voice recognition", {
@@ -1904,7 +1913,7 @@ export default function FloatingBallApp() {
 
       if (fastMode) {
         const pasteStartedAt = performance.now();
-        const pasteResult = await safePaste(finalText, outputGeneration);
+        const pasteResult = await safePaste(finalText, outputGeneration, transcriptionResult.processing?.job_id);
         transcriptionResult.delivery = { mode: pasteResult.mode, delivered: pasteResult.ok };
         transcriptionResult.delivered_text = pasteResult.ok ? finalText : '';
         if (!isCurrentOutputGeneration(outputGeneration)) {
@@ -1936,7 +1945,7 @@ export default function FloatingBallApp() {
             return;
           }
           setStatus("completed");
-          setMessage(pasteResult.mode === "copied" ? "已复制" : "已粘贴");
+          setMessage(polishDegraded === "model_unverified" ? "基础结果已交付，模型待验收" : polishDegraded === "background_pending" ? "基础结果已交付，后台整理中" : pasteResult.mode === "copied" ? "已复制" : "已粘贴");
           setTimeout(() => {
             resetUI();
             hideFloatingBall();
@@ -1959,7 +1968,7 @@ export default function FloatingBallApp() {
       }
       triggerVoiceTts();
 
-      const pasteTask = safePaste(finalText, outputGeneration);
+      const pasteTask = safePaste(finalText, outputGeneration, transcriptionResult.processing?.job_id);
       await transitionStatus("preview_ready");
       if (!isCurrentOutputGeneration(outputGeneration)) {
         return;
@@ -1984,7 +1993,7 @@ export default function FloatingBallApp() {
           copied: "已复制",
           skipped: "已粘贴",
         };
-        setMessage(messageMap[pasteResult.mode] || "已粘贴");
+        setMessage(polishDegraded === "model_unverified" ? "基础结果已交付，模型待验收" : polishDegraded === "background_pending" ? "基础结果已交付，后台整理中" : messageMap[pasteResult.mode] || "已粘贴");
       } else {
         setMessage("粘贴失败，请从历史记录复制文本");
       }
@@ -2156,7 +2165,7 @@ export default function FloatingBallApp() {
     };
 
     recordingModeRef.current = "dictation";
-    window.electronAPI?.cancelTextPolish?.().catch(() => {});
+    window.electronAPI?.cancelTextPolish?.({ background: false }).catch(() => {});
     outputControlRef.current = {
       generation: outputControlRef.current.generation + 1,
       interrupted: false,
@@ -2312,6 +2321,7 @@ export default function FloatingBallApp() {
   }, [cancelCurrentOutput, logRuntime, reportExternalRecordingResult]);
 
   const stopExternalRecording = useCallback(async (payload = {}) => {
+    const clientStopAt = Number(payload.stop_received_at_ms) || Date.now();
     const sessionId = String(payload.session_id || "").trim();
     const session = externalRecordingRef.current;
     if (!session || session.sessionId !== sessionId) {
@@ -2490,6 +2500,9 @@ export default function FloatingBallApp() {
       }
 
       const transcriptionResult = normalizeASRPayload(finalPayload, wavBlob);
+      transcriptionResult.session_id ||= sessionId;
+      transcriptionResult.timing = { ...transcriptionResult.timing, client_stop_at_ms: clientStopAt,
+        stop_to_asr_result_ms: Date.now() - clientStopAt };
       transcriptionResult.audio_stats = transcriptionResult.audio_stats || stats;
       const hasUsableResult = isUsableASRPayload(transcriptionResult);
       logRuntime(hasUsableResult ? "info" : "warn", "External M5 ASR result selected", {
@@ -2824,7 +2837,7 @@ export default function FloatingBallApp() {
       return;
     }
 
-    window.electronAPI?.cancelTextPolish?.().catch(() => {});
+    window.electronAPI?.cancelTextPolish?.({ background: false }).catch(() => {});
     outputControlRef.current = {
       generation: outputControlRef.current.generation + 1,
       interrupted: false,
@@ -2869,7 +2882,7 @@ export default function FloatingBallApp() {
     setMessage("");
   }, [abortActiveTtsRequests, logRuntime, modelStatus, setAnimatedRealtimeTarget, startInitialLoadingTimer, startRecording, stopCurrentTtsPlayback, stopInitialLoadingTimer, transitionStatus]);
 
-  const stopRecordingWithCheck = useCallback(() => {
+  const stopRecordingWithCheck = useCallback((releasedAtMs = Date.now()) => {
     if (pendingStopTimerRef.current) {
       clearTimeout(pendingStopTimerRef.current);
       pendingStopTimerRef.current = null;
@@ -2878,7 +2891,7 @@ export default function FloatingBallApp() {
     if (isRecording) {
       transitionStatus("processing");
       setMessage("");
-      stopRecording();
+      stopRecording({ releasedAtMs });
       return;
     }
 
@@ -2902,7 +2915,7 @@ export default function FloatingBallApp() {
         stopSeq,
         releaseGraceMs: 0
       });
-      stopRecordingWithCheck();
+      stopRecordingWithCheck(requestedAt);
       return;
     }
 
@@ -2920,7 +2933,7 @@ export default function FloatingBallApp() {
         waitedMs: Date.now() - requestedAt,
         isRecording: isRecordingRef.current
       });
-      stopRecordingWithCheck();
+      stopRecordingWithCheck(requestedAt);
     }, delayMs);
   }, [logRuntime, normalizeReleaseGraceMs, stopRecordingWithCheck, voiceReleaseGraceMs]);
 

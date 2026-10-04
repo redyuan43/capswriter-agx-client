@@ -44,10 +44,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
   recordVoiceDatasetSample: (sample) =>
     ipcRenderer.invoke("record-voice-dataset-sample", sample),
   polishText: (text, options) => ipcRenderer.invoke("polish-text", text, options),
-  cancelTextPolish: () => ipcRenderer.invoke('cancel-text-polish'),
+  cancelTextPolish: (options) => ipcRenderer.invoke('cancel-text-polish', options),
+  deliverSpeechJob: (id) => ipcRenderer.invoke('deliver-speech-job', id),
+  retrySpeechJob: (id) => ipcRenderer.invoke('retry-speech-job', id),
   getProviderStatus: () => ipcRenderer.invoke('get-provider-status'),
   saveProviderSecrets: (patch) => ipcRenderer.invoke('save-provider-secrets', patch),
   updateHotWord: (entry) => ipcRenderer.invoke('update-hot-word', entry),
+  configureHotWords: (options) => ipcRenderer.invoke('configure-hot-words', options),
   proposeHotWords: (terms) => ipcRenderer.invoke('propose-hot-words', terms),
 
   // M5 串口配网（Cardputer USB 线连接）

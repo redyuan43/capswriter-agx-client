@@ -910,7 +910,7 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
         log: logRecordingDebug,
       });
 
-      if (window.electronAPI && rawText.trim()) {
+      if (window.electronAPI && rawText.trim() && !transcriptionResult.processing?.history_managed) {
         window.electronAPI.saveTranscription(transcriptionData).catch(() => {});
       }
     } catch (err) {
@@ -920,7 +920,8 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
     }
   }, [logRecordingDebug, translateMode, translateTarget]);
 
-  const stopRecording = useCallback(() => {
+  const stopRecording = useCallback((options = {}) => {
+    const releasedAtMs = Number(options?.releasedAtMs) || Date.now();
     if (isStartingRef.current && !wavRecorderRef.current) {
       abortPendingStart('stop_before_recorder_ready');
       setError('音频处理失败：录音尚未真正开始就已结束，请按住稍久一点后再松开');
@@ -1057,9 +1058,9 @@ export const useRecording = ({ translateMode = 'transcribe', translateTarget = '
             });
             throw realtimeFailedError || new Error('实时语音识别失败');
           }
-          if (realtimePayload?.provider === 'firered2') {
-            realtimePayload.timing = { ...realtimePayload.timing, client_stop_at_ms: stopAt,
-              stop_to_asr_result_ms: Date.now() - stopAt };
+          if (realtimePayload) {
+            realtimePayload.timing = { ...realtimePayload.timing, client_stop_at_ms: releasedAtMs, recording_stopped_at_ms: stopAt,
+              stop_to_asr_result_ms: Date.now() - releasedAtMs };
           }
           await processAudio(audioBlob, localAudioStats, realtimePayload);
         } finally {
