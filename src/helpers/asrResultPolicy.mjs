@@ -13,7 +13,7 @@ export function extractASRText(payload) {
 // 桌面与外部设备共用；不能在整理前丢掉实际识别所用的词库快照和词时间戳。
 export function asrProcessingMetadata(payload) {
   return Object.fromEntries([
-    'dictionary_version', 'hotword', 'segments', 'provider', 'engine', 'session_id',
+    'dictionary_version', 'hotword', 'words', 'segments', 'provider', 'engine', 'session_id',
     'timing', 'processing', 'corrected_text', 'final_text',
   ].filter((key) => payload?.[key] !== undefined).map((key) => [key, payload[key]]));
 }

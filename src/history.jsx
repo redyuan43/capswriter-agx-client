@@ -60,14 +60,15 @@ const HistoryPage = () => {
 const HistoryContent = ({ onCopy }) => {
   const [transcriptions, setTranscriptions] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
+  const [retryError, setRetryError] = React.useState('');
   const [searchQuery, setSearchQuery] = React.useState("");
   const [filteredTranscriptions, setFilteredTranscriptions] = React.useState([]);
 
   // 加载转录历史
-  const loadTranscriptions = async () => {
+  const loadTranscriptions = async (silent = false) => {
     if (!window.electronAPI) return;
     
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const result = await window.electronAPI.getTranscriptions(100, 0);
       setTranscriptions(result || []);
@@ -75,7 +76,7 @@ const HistoryContent = ({ onCopy }) => {
     } catch (error) {
       console.error("加载历史记录失败:", error);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -86,7 +87,9 @@ const HistoryContent = ({ onCopy }) => {
     } else {
       const filtered = transcriptions.filter(item => 
         item.text?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        item.processed_text?.toLowerCase().includes(searchQuery.toLowerCase())
+        item.processed_text?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        item.raw_text?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        item.candidate_text?.toLowerCase().includes(searchQuery.toLowerCase())
       );
       setFilteredTranscriptions(filtered);
     }
@@ -95,6 +98,8 @@ const HistoryContent = ({ onCopy }) => {
   // 组件挂载时加载数据
   React.useEffect(() => {
     loadTranscriptions();
+    const timer = setInterval(() => { if (!document.hidden) void loadTranscriptions(true); }, 1500);
+    return () => clearInterval(timer);
   }, []);
 
   // 删除转录记录
@@ -167,6 +172,7 @@ const HistoryContent = ({ onCopy }) => {
         </div>
       </div>
 
+      {retryError && <p role="alert" className="px-6 text-sm text-amber-700">{retryError}</p>}
       {/* 内容区域 */}
       <div className="flex-1 overflow-y-auto p-6">
         <div className="max-w-4xl mx-auto">
@@ -225,24 +231,42 @@ const HistoryContent = ({ onCopy }) => {
                     </div>
                   </div>
 
+                  {item.processing_status && <div className="mb-3 text-sm text-gray-600 dark:text-gray-300">
+                    {{ processing: '正在整理', background: '后台整理中', completed: '整理完成', review_required: '整理结果需要复核', failed: '整理未完成，基础文本已保留', cancelled: '整理已取消', preempted: '新输入优先，旧整理已取消', interrupted: '上次整理被重启中断' }[item.processing_status] || item.processing_status}
+                    {item.delivered_text && <span> · {item.delivered_text === item.corrected_text ? '基础结果已交付' : '整理结果已交付'}{item.delivery_ms != null ? ` · 松键到交付 ${item.delivery_ms} ms` : ''}</span>}
+                    {item.processing_json && (() => { try { const info = JSON.parse(item.processing_json); return <span> · {info.route === 'short_basic' ? '短句基础处理' : `${info.provider === 'ai' ? 'ai' : '本机'} · ${info.model || '整理模型'}`} · {({ timeout: '模型超过 15 秒未完成', insufficient_memory: '本机显存/内存不足', model_missing: '本机模型文件不存在', request_failed: '整理服务离线或请求失败', natural_api_key_missing: '整理服务凭据未配置', model_identity_mismatch: '模型身份不一致', thinking_not_disabled: '服务未按要求关闭思考', incomplete_response: '模型未完整生成' }[info.degraded] || info.degraded) || `${info.background ? '后台整理完成 · ' : ''}生成 ${info.generation_ms ?? info.elapsed_ms ?? 0} ms · 首字 ${info.first_token_ms ?? '—'} ms${info.verification_ms != null ? ` · 复核 ${info.verification_ms} ms` : ''} · 合计 ${info.elapsed_ms ?? 0} ms`}{info.verification_reason ? ` · ${info.verification_reason}` : ''}{info.auto_delivery_approved === false ? ' · 尚未通过模型验收，仅供查看' : ''}</span>; } catch { return null; } })()}
+                    {['processing', 'background'].includes(item.processing_status) && <button className="ml-3 text-blue-600" onClick={async () => { await window.electronAPI.cancelTextPolish({ jobId: item.session_id }); await loadTranscriptions(true); }}>取消整理</button>}
+                    {!['processing', 'background'].includes(item.processing_status) && <button className="ml-3 text-blue-600" onClick={async () => { try { const r = await window.electronAPI.retrySpeechJob(item.id); setRetryError(r?.error || ''); await loadTranscriptions(true); } catch (e) { setRetryError(e.message); } }}>重新整理</button>}
+                  </div>}
                   {/* 最终文本 */}
                   <div className="mb-4">
-                    <h4 className="text-sm font-medium text-gray-800 dark:text-gray-200 mb-2">最终结果:</h4>
-                    <p className="chinese-content leading-relaxed bg-gray-50 dark:bg-gray-700/60 p-4 rounded-lg border dark:border-gray-600/30">
-                      {item.text}
+                    <h4 className="text-sm font-medium text-gray-800 dark:text-gray-200 mb-2">{item.session_id ? item.delivered_text ? '实际交付文本:' : '基础文本（尚未交付）:' : '最终结果:'}</h4>
+                    <p className="whitespace-pre-wrap chinese-content leading-relaxed bg-gray-50 dark:bg-gray-700/60 p-4 rounded-lg border dark:border-gray-600/30">
+                      {item.delivered_text || item.corrected_text || item.text}
                     </p>
                   </div>
 
                   {/* AI优化文本 */}
-                  {item.processed_text && item.processed_text.trim() !== (item.raw_text || '').trim() && (
+                  {item.processed_text && (
                     <div className="mb-4">
-                      <h4 className="text-sm font-medium text-emerald-700 dark:text-emerald-400 mb-2">AI优化:</h4>
-                      <p className="chinese-content leading-relaxed bg-emerald-50 dark:bg-emerald-900/20 p-4 rounded-lg border border-emerald-200 dark:border-emerald-700">
+                      <h4 className="text-sm font-medium text-emerald-700 dark:text-emerald-400 mb-2">整理结果（复制后自行使用）:</h4>
+                      <p className="whitespace-pre-wrap chinese-content leading-relaxed bg-emerald-50 dark:bg-emerald-900/20 p-4 rounded-lg border border-emerald-200 dark:border-emerald-700">
                         {item.processed_text}
                       </p>
                     </div>
                   )}
 
+                  {item.candidate_text && <div className="mb-4 rounded bg-amber-50 p-3 text-sm text-gray-900">
+                    <p>待复核结果（未自动交付）</p><p className="whitespace-pre-wrap">{item.candidate_text}</p>
+                    <button className="mt-2 text-blue-700" onClick={() => onCopy(item.candidate_text)}>复制待复核文本</button>
+                  </div>}
+                  {item.processing_json && (() => { try {
+                    const edits = JSON.parse(item.processing_json).edits || [];
+                    return edits.length > 0 && <details className="mb-3 text-sm"><summary>查看整理差异（{edits.length} 处）</summary>
+                      {edits.map((edit, index) => <p key={index} className="mt-1 whitespace-pre-wrap"><del className="text-red-700">{edit.before}</del>{' → '}<ins className="text-emerald-700">{edit.after || '（删除）'}</ins></p>)}
+                    </details>;
+                  } catch { return null; } })()}
+                  {item.corrected_text && item.corrected_text !== item.raw_text && <details className="mb-3 text-sm"><summary>热词与规则处理结果</summary><p className="whitespace-pre-wrap">{item.corrected_text}</p></details>}
                   {/* 原始识别文本 */}
                   {item.raw_text && item.raw_text.trim() !== item.text.trim() && (
                     <div>

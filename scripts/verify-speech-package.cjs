@@ -51,6 +51,11 @@ async function main() {
   const root = path.resolve(__dirname, '..');
   let sourceFiles = 0;
   const verifySource = (relative) => {
+    if (relative === 'src/helpers/m5SerialDiagnose.js') {
+      assert.equal(fs.existsSync(path.join(archive, relative)), false,
+        '串口诊断工具必须保持在 AppImage 之外');
+      return;
+    }
     const source = path.join(root, relative);
     if (fs.statSync(source).isDirectory()) {
       for (const name of fs.readdirSync(source)) verifySource(path.join(relative, name));

@@ -4,10 +4,17 @@ function registerDatabaseHandlers(ctx) {
   ipcMain.handle("save-transcription", (_event, data) => ctx.databaseManager.saveTranscription(data));
   ipcMain.handle("get-transcriptions", (_event, limit, offset) => ctx.databaseManager.getTranscriptions(limit, offset));
   ipcMain.handle("get-transcription", (_event, id) => ctx.databaseManager.getTranscriptionById(id));
-  ipcMain.handle("delete-transcription", (_event, id) => ctx.databaseManager.deleteTranscription(id));
+  ipcMain.handle("delete-transcription", (_event, id) => {
+    const row = ctx.databaseManager.getTranscriptionById(id);
+    if (row?.session_id) ctx.speechJobs?.cancel(row.session_id, 'deleted');
+    return ctx.databaseManager.deleteTranscription(id);
+  });
   ipcMain.handle("search-transcriptions", (_event, query, limit) => ctx.databaseManager.searchTranscriptions(query, limit));
   ipcMain.handle("get-transcription-stats", () => ctx.databaseManager.getTranscriptionStats());
-  ipcMain.handle("clear-all-transcriptions", () => ctx.databaseManager.clearAllTranscriptions());
+  ipcMain.handle("clear-all-transcriptions", () => {
+    ctx.speechJobs?.dispose();
+    return ctx.databaseManager.clearAllTranscriptions();
+  });
 
   ipcMain.handle("save-translated-clipboard", (_event, originalText, translatedText) => {
     try {

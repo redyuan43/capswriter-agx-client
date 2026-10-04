@@ -126,6 +126,8 @@ const { VoiceLearningManager } = require("./src/helpers/voiceLearningManager");
 const { VoiceTeacherClassifier } = require("./src/helpers/voiceTeacherClassifier");
 const VoiceDatasetRecorder = require("./src/helpers/voiceDatasetRecorder");
 const { SpeechTextFormatter } = require("./src/helpers/speechTextFormatter");
+const { NaturalTextFormatter } = require('./src/helpers/naturalTextFormatter');
+const { AiNaturalFormatter } = require('./src/helpers/aiNaturalFormatter');
 const { ProviderSecrets } = require("./src/helpers/providerSecrets");
 const { TencentDirectBridge } = require('./src/helpers/tencentDirectBridge');
 const { TextPolisher } = require("./src/platform/electron/textPolish");
@@ -448,7 +450,10 @@ const longTextFormatter = new SpeechTextFormatter({
 const hotWordsStore = new HotWordsStore({ dataDirectory, logger });
 const tencentDirectBridge = new TencentDirectBridge({ dataDirectory, getCredentials: () => providerSecrets.get(), hotWordsStore });
 asrConnectionProfiles.directConnection = () => tencentDirectBridge.connection();
-const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter, hotWordsStore });
+const naturalProfile = databaseManager.getSetting('natural_formatter_profile', 'cec3');
+const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter,
+  naturalFormatter: naturalProfile === 'ai-natural' ? new AiNaturalFormatter()
+    : new NaturalTextFormatter({ profile: ['cec3', 'qwen-punctuation'].includes(naturalProfile) ? naturalProfile : 'cec3' }), hotWordsStore });
 const codexTerminalManager = new CodexTerminalManager({ logger, dataDirectory });
 const quitWatchdog = createQuitWatchdog({ app, logger });
 const nx1QwenRouter = new Nx1QwenRouter({ logger, databaseManager });
@@ -1218,7 +1223,12 @@ app.whenReady().then(async () => {
     logger.warn('Realtime ASR proxy resolution failed', error?.message || error);
   });
 
-  // 云端模型按需请求，不在启动时预热。
+  textPolisher.loadRules();
+  void textPolisher.replacer.applyAsync('预热');
+  // The dedicated local service keeps the model warm, independently of ASR.
+  if (databaseManager.getSetting('text_processing_mode', 'light') === 'natural') {
+    textPolisher.naturalFormatter.probe().catch(() => {});
+  }
 });
 
 app.on("window-all-closed", () => {
@@ -1235,6 +1245,7 @@ app.on("before-quit", () => {
   quitWatchdog.arm();
   // 同时记下这是主动退出：即使最终被 SIGKILL 收尾，启动器也不会把它再拉起来。
   markIntentionalQuit({ logger });
+  ipcHandlers.speechJobs?.dispose();
   textPolisher.dispose();
   tencentDirectBridge.dispose();
   codexTerminalManager.stop();
@@ -1248,6 +1259,7 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
   app.isQuitting = true;
+  ipcHandlers.speechJobs?.dispose();
   textPolisher.dispose();
   stopClipboardWatch();
   pipeWirePlayback.stop("app_quit");

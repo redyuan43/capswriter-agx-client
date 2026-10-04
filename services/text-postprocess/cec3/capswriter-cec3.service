@@ -1,0 +1,25 @@
+[Unit]
+Description=CapsWriter local ChineseErrorCorrector3 4B (quality gated)
+PartOf=capswriter-agx-client.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=exec
+ExecStart=%h/.local/opt/capswriter-cec3/start.sh
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=75 78
+TimeoutStopSec=8
+KillMode=control-group
+Nice=5
+OOMScoreAdjust=500
+MemoryHigh=5G
+MemoryMax=6G
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=%h/.local/state/capswriter-cec3
+StandardOutput=journal
+StandardError=journal
