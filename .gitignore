@@ -170,3 +170,4 @@ _tmp_*
 
 # Local review artifacts (generated during code review, never committed)
 artifacts/
+*.gguf
