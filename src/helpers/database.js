@@ -68,6 +68,31 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_translated_clipboard_created_at 
       ON translated_clipboard_history(created_at DESC)
     `);
+    const columns = new Set(this.db.prepare('PRAGMA table_info(transcriptions)').all().map(c => c.name));
+    for (const name of ['session_id', 'corrected_text', 'delivered_text', 'candidate_text', 'processing_status', 'processing_json', 'delivery_state', 'delivery_ms']) {
+      if (!columns.has(name)) this.db.exec(`ALTER TABLE transcriptions ADD COLUMN ${name} TEXT`);
+    }
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id)');
+    this.db.prepare("UPDATE transcriptions SET processing_status = 'interrupted' WHERE processing_status IN ('processing', 'background')").run();
+  }
+
+  createSpeechRecord(sessionId, text) {
+    this.db.prepare(`INSERT OR IGNORE INTO transcriptions (session_id, text, raw_text, corrected_text, delivered_text, processing_status, delivery_state)
+      VALUES (?, ?, ?, ?, '', 'processing', 'not_delivered')`).run(sessionId, text, text, text);
+    return this.db.prepare('SELECT * FROM transcriptions WHERE session_id = ?').get(sessionId);
+  }
+
+  updateSpeechRecord(sessionId, patch) {
+    const allowed = ['corrected_text', 'processed_text', 'candidate_text', 'processing_status', 'processing_json'];
+    const keys = allowed.filter(k => Object.hasOwn(patch, k));
+    if (!keys.length) return;
+    return this.db.prepare(`UPDATE transcriptions SET ${keys.map(k => `${k} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?`)
+      .run(...keys.map(k => patch[k]), sessionId);
+  }
+
+  markSpeechDelivery(sessionId, text, mode, elapsedMs = null) {
+    return this.db.prepare(`UPDATE transcriptions SET text = ?, delivered_text = ?, delivery_state = ?, delivery_ms = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE session_id = ? AND delivery_state = 'not_delivered'`).run(text, text, mode, elapsedMs, sessionId);
   }
 
   saveTranscription(data) {

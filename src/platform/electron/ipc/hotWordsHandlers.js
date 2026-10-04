@@ -24,6 +24,7 @@ function registerHotWordsHandlers(ctx, ipcMainImpl = ipcMain) {
     if (!ctx.hotWordsStore) throw new Error('词库不可用');
     return ctx.hotWordsStore.update(entry);
   });
+  ipcMainImpl.handle('configure-hot-words', (_event, options) => ctx.hotWordsStore.configure(options || {}));
   ipcMainImpl.handle('propose-hot-words', (_event, terms) => ctx.hotWordsStore.propose(Array.isArray(terms) ? terms.slice(0, 256) : []));
 
   ipcMainImpl.handle("reload-hot-words", () => {

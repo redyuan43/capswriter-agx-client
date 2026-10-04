@@ -18,6 +18,7 @@ app.whenReady().then(async () => {
   const words = new HotWordsStore({ dataDirectory: folder });
   const settings = new Map();
   let configured = {};
+  let naturalProfile = 'cec3';
   const polisher = new TextPolisher({ dataDirectory: folder, hotWordsStore: words, longFormatter: {
     format: async (text, options) => ({ text, changed: false, model: 'glm-4.7-flash', thinking: false, mode: options.mode, elapsed_ms: 1 }),
   } });
@@ -32,6 +33,10 @@ app.whenReady().then(async () => {
     readClipboard: () => ({ success: true, text: '示例候选词' }),
     activateAsrConnectionProfile: (id) => { settings.set('profile', id); },
     polishText: (text, options) => polisher.polish(text, options),
+    configureHotWords: (options) => words.configure(options),
+    probeLongTextService: () => naturalProfile === 'ai-natural'
+      ? ({available:true,qualityApproved:false,profile:'ai-natural',provider:'ai',scope:'natural',model:'siyuan/qwen38-v100-196k'})
+      : ({available:true,qualityApproved:false,model:'capswriter-cec3-4b'}),
     cancelTextPolish: () => polisher.dispose(),
   };
   ipcMain.handle('speech-qa', (_event, name, args) => methods[name](...args));
@@ -68,12 +73,20 @@ app.whenReady().then(async () => {
   await evaluate(`(()=>{const input=document.querySelector('textarea');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'请使用测试词。');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
   await evaluate(`([...document.querySelectorAll('button')].find(b=>b.textContent==='预览')).click()`);
   await waitFor(`document.body.innerText.includes('请使用TestTerm。')`);
+  await evaluate(`(()=>{const s=document.querySelector('select[aria-label="处理模式"]');s.value='natural';s.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await waitFor(`document.body.innerText.includes('本机模型已加载')`);
+  assert.equal(settings.get('text_processing_mode'), 'natural');
+  naturalProfile = 'ai-natural';
+  await evaluate(`([...document.querySelectorAll('button')].find(b=>b.textContent==='刷新状态')).click()`);
+  await waitFor(`document.body.innerText.includes('ai 整理服务可用') && document.body.innerText.includes('Handy 默认整理流程')`);
+  await evaluate(`([...document.querySelectorAll('label')].find(l=>l.textContent.includes('普通词统一为 5'))).querySelector('input').click()`);
+  await waitFor(`document.body.innerText.includes('普通词统一为 5')`);
   assert.equal(errors.length, 0, errors.join('\n'));
   const output = path.join(root, 'artifacts/asr-review'); fs.mkdirSync(output, { recursive: true });
   await evaluate(`document.querySelectorAll('details')[0].open=false`);
   await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
   const screenshot = await win.webContents.capturePage(); fs.writeFileSync(path.join(output, 'speech-settings.png'), screenshot.toPNG());
-  const report = { modeSwitch: true, aliasEditing: true, candidateConfirmation: true, preview: true, consoleErrors: errors };
+  const report = { modeSwitch: true, naturalHealthAndGate: true, groupsAndWeights: true, aliasEditing: true, candidateConfirmation: true, preview: true, consoleErrors: errors };
   fs.writeFileSync(path.join(output, 'ui-check.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report));
   win.destroy(); polisher.dispose(); app.quit();

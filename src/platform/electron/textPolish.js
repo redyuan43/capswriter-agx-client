@@ -52,9 +52,10 @@ function resolveRulePath(dataDirectory, fsImpl) {
 }
 
 class TextPolisher {
-  constructor({ dataDirectory, logger = null, longFormatter = null, hotWordsStore = null } = {}) {
+  constructor({ dataDirectory, logger = null, longFormatter = null, naturalFormatter = null, hotWordsStore = null } = {}) {
     this.logger = logger;
     this.longFormatter = longFormatter;
+    this.naturalFormatter = naturalFormatter;
     this.hotWordsStore = hotWordsStore;
     this.rulePath = resolveRulePath(dataDirectory, fs);
     this.replacer = new HotRuleReplacer({ filePath: this.rulePath, fs, logger });
@@ -70,7 +71,7 @@ class TextPolisher {
     const asrProvider = local ? 'firered2' : options.asrProvider;
     const manualPrompt = options.manualPrompt === true && options.mode === 'prompt';
     // 本机录音与文件识别只走规则；提示词优化必须由用户单独触发。
-    const mode = options.mode === 'prompt' && (!local || manualPrompt) ? 'prompt' : 'light';
+    const mode = options.mode === 'natural' ? 'natural' : options.mode === 'prompt' && (!local || manualPrompt) ? 'prompt' : 'light';
     const controller = new AbortController();
     const abort = () => controller.abort();
     options.signal?.addEventListener('abort', abort, { once: true });
@@ -99,7 +100,7 @@ class TextPolisher {
       result.corrected_text = current;
       // 保留识别服务提供的标点，避免再次改动代码、英文和已有标点。
       if (options.punctuation === 'full') result.stages.push({ stage: 'punctuation', skipped: 'disabled' });
-      const useModel = local ? manualPrompt : mode === 'prompt' || options.longFormat?.enabled !== false;
+      const useModel = !options.skipModel && mode !== 'natural' && (local ? manualPrompt : mode === 'prompt' || options.longFormat?.enabled !== false);
       if (local && !useModel) result.stages.push({ stage: 'model', skipped: 'local_rules_only' });
       if (useModel && this.longFormatter && !controller.signal.aborted) {
         const totalBudget = this.longFormatter.getTimeoutMs?.(mode, asrProvider) || (mode === 'prompt' ? 30000 : 2000);
@@ -115,7 +116,16 @@ class TextPolisher {
         if (applied.error_code) result.error_code = applied.error_code;
         if (applied.retry_after_seconds !== undefined) result.retry_after_seconds = applied.retry_after_seconds;
       }
-      if (mode === 'light') {
+      if (mode === 'natural' && !options.skipModel && this.naturalFormatter && !controller.signal.aborted) {
+        const applied = await this.naturalFormatter.format(current, { signal: controller.signal,
+          segments: options.segments, words: options.words, terms: snapshot?.terms || [] });
+        current = applied.text;
+        Object.assign(result, { model: applied.model, provider: applied.provider, prompt_version: applied.prompt_version,
+          candidate_text: applied.candidate_text, degraded: applied.degraded || result.degraded });
+        result.stages.push({ stage: 'natural', elapsed_ms: applied.elapsed_ms, first_token_ms: applied.first_token_ms,
+          applied: applied.changed, degraded: applied.degraded });
+      }
+      if (mode === 'light' || mode === 'natural') {
         const enumerated = normalizeEnumerations(current);
         if (enumerated !== current) result.stages.push({ stage: 'enumeration_format', elapsed_ms: 0, applied: true });
         current = enumerated;
@@ -140,6 +150,7 @@ class TextPolisher {
   dispose() {
     for (const controller of this.active) controller.abort();
     this.active.clear();
+    this.replacer.dispose();
   }
 }
 

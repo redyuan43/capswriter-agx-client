@@ -1858,6 +1858,7 @@ loadBluetoothDevices();
   }
 
   async handleRecordingStop(req, res) {
+    const stopReceivedAt = Date.now();
     const body = parseJson(await readRequestBody(req, MAX_JSON_BYTES));
     const sessionId = String(body.session_id || this.latestSessionId() || "").trim();
     const session = this.sessions.get(sessionId);
@@ -1897,6 +1898,7 @@ loadBluetoothDevices();
       });
       return;
     }
+    session.stopReceivedAt ||= stopReceivedAt;
     if (session.protocolVersion >= 2) {
       if (body.upload_failed === true) {
         this.abortSession(session, "device_audio_upload_failed");
@@ -2182,6 +2184,7 @@ loadBluetoothDevices();
     if (!session || session.done) {
       return { handled: true, session_id: sessionId };
     }
+    session.stopReceivedAt ||= Date.now();
     session.status = "stopping";
     if (session.watchdogTimer) {
       clearTimeout(session.watchdogTimer);
@@ -2464,6 +2467,7 @@ loadBluetoothDevices();
     session.status = "processing";
     this.sendToRenderer("external-recording-stop", {
       session_id: session.id,
+      stop_received_at_ms: session.stopReceivedAt || Date.now(),
       paste: session.paste !== false,
       mode: session.intent,
       trigger_mode: session.mode,
@@ -2624,6 +2628,7 @@ loadBluetoothDevices();
     session.status = "processing";
     this.sendToRenderer("external-recording-stop", {
       session_id: session.id,
+      stop_received_at_ms: session.stopReceivedAt || Date.now(),
       paste: session.paste !== false,
       mode: session.intent,
       trigger_mode: session.mode,
