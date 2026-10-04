@@ -1,0 +1,37 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const Database = require('better-sqlite3');
+const DatabaseManager = require('../src/helpers/database');
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capswriter-natural-db-'));
+let manager;
+try {
+  const old = new Database(path.join(dir, 'transcriptions.db'));
+  old.exec(`CREATE TABLE transcriptions(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, raw_text TEXT, processed_text TEXT, confidence REAL, language TEXT, duration REAL, file_size INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    INSERT INTO transcriptions(text, raw_text) VALUES('旧历史','旧原文');
+    CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+    INSERT INTO settings(key,value) VALUES('asr','"tencent-direct"');`);
+  old.close();
+  manager = new DatabaseManager(); manager.initialize(dir);
+  assert.equal(manager.getTranscriptionById(1).text, '旧历史');
+  assert.equal(manager.getSetting('asr'), 'tencent-direct');
+  const row = manager.createSpeechRecord('session', '原始文本');
+  assert.equal(manager.createSpeechRecord('session', '重复回调').id,row.id);
+  manager.updateSpeechRecord('session',{corrected_text:'基础文本',processing_status:'background'});
+  assert.equal(manager.markSpeechDelivery('session','基础文本','pasted',1990).changes,1);
+  assert.equal(manager.markSpeechDelivery('session','错误再次输入','copied',3000).changes,0);
+  manager.updateSpeechRecord('session',{processed_text:'后台结果',processing_status:'completed'});
+  const done = manager.getTranscriptionById(row.id);
+  assert.equal(done.raw_text,'原始文本'); assert.equal(done.corrected_text,'基础文本');
+  assert.equal(done.delivered_text,'基础文本'); assert.equal(done.text,'基础文本'); assert.equal(done.processed_text,'后台结果');
+  assert.equal(Number(done.delivery_ms),1990);
+  manager.deleteTranscription(row.id);
+  assert.equal(manager.updateSpeechRecord('session',{processed_text:'迟到'}).changes,0);
+  assert.equal(manager.getTranscriptions().length,1);
+  const pending=manager.createSpeechRecord('interrupted','重启前'); manager.close();
+  manager = new DatabaseManager(); manager.initialize(dir);
+  assert.equal(manager.getTranscriptionById(pending.id).processing_status,'interrupted');
+  manager.createTables(); assert.equal(manager.getTranscriptions().length,2);
+  console.log(JSON.stringify({ migration:true, oldDataPreserved:true, duplicateCallbacks:true, lateAfterDelete:true, restart:true, deliveryTiming:true }));
+} finally { manager?.close(); fs.rmSync(dir,{recursive:true,force:true}); }
