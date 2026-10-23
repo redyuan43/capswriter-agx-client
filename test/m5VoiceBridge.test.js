@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const test = require("node:test");
-const { once } = require("node:events");
+const { once, EventEmitter } = require("node:events");
 
 const M5VoiceBridge = require("../src/helpers/m5VoiceBridge");
 const {
@@ -1110,6 +1110,273 @@ test("MiniJoy host trigger captures native HFP PCM without browser recording", a
   ]);
   assert.equal(rendererEvents[4].payload.bytes, 644);
   assert.equal(rendererEvents[4].payload.chunks, 2);
+});
+
+async function startDrainingHostCapture(t) {
+  const events = [];
+  const { bridge } = await startBridge(t, (name, payload) => events.push({ name, payload }));
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => true;
+  bridge.pipeWireCapture.spawnProcess = () => child;
+  bridge.audioRouting.clearActiveRoute = () => events.push({ name: "clear-route" });
+  bridge.restoreUnifiedDefaultSource = () => events.push({ name: "restore-route" });
+  const session = bridge.createHostRecordingSession({
+    sessionId: "host-drain",
+    triggerId: "keyboard",
+    route: { source_id: "pipewire:test-source" },
+    targetWindowId: "42",
+    captureMode: "host_capture",
+  });
+  bridge.pipeWireCapture.start(session.id, session.sourceId,
+    (chunk) => bridge.appendRecordingAudio(session, chunk));
+  child.stdout.emit("data", Buffer.alloc(4096));
+  return { bridge, child, session, events };
+}
+
+async function startHttpDrainingHostCapture(t) {
+  const capture = await startDrainingHostCapture(t);
+  const { bridge, session } = capture;
+  let receivedStops = 0;
+  const handleStop = bridge.handleRecordingStop.bind(bridge);
+  bridge.handleRecordingStop = (req, res) => {
+    req.once("end", () => { receivedStops += 1; });
+    return handleStop(req, res);
+  };
+  return {
+    ...capture,
+    postStop: (body = {}, headers = {}) => requestJson(bridge.server.address().port, "/recording/stop", {
+      method: "POST", headers, body: { session_id: session.id, ...body },
+    }),
+    waitForStops: (count) => waitFor(() => assert.equal(receivedStops, count)),
+  };
+}
+
+for (const retryPhase of ["draining", "processing"]) {
+  test(`HTTP host stop retry during ${retryPhase} shares the result and preserves the first request`, async (t) => {
+    const { bridge, child, session, events, postStop, waitForStops } = await startHttpDrainingHostCapture(t);
+    const signals = [];
+    child.kill = (signal) => { signals.push(signal); return true; };
+    let completedRequests = 0;
+    const firstStop = postStop({ intent: "dictation", mode: "first-mode", paste: false })
+      .then((response) => { completedRequests += 1; return response; });
+    await waitForStops(1);
+    assert.equal(session.status, "stopping");
+    const stopReceivedAt = session.stopReceivedAt;
+    const closeCapture = () => {
+      child.stdout.emit("data", Buffer.alloc(1600));
+      child.emit("close", 1, null);
+    };
+    if (retryPhase === "processing") {
+      closeCapture();
+      await waitFor(() => assert.equal(session.status, "processing"));
+    }
+    const repeatedStop = postStop({ intent: "codex", mode: "retry-mode", paste: true }, {
+      "X-Vibe-Stick-Device-Id": "keyboard",
+      "X-Vibe-Stick-Firmware-Name": "vibestick",
+    }).then((response) => { completedRequests += 1; return response; });
+    await waitForStops(2);
+    assert.equal(session.status, retryPhase === "draining" ? "stopping" : "processing");
+    if (retryPhase === "draining") closeCapture();
+    await waitFor(() => assert.equal(session.status, "processing"));
+    assert.equal(session.done, false);
+    assert.equal(session.stopReceivedAt, stopReceivedAt);
+    assert.equal(session.intent, "dictation");
+    assert.equal(session.mode, "first-mode");
+    assert.equal(session.paste, false);
+    assert.equal(completedRequests, 0);
+    assert.deepEqual(signals, ["SIGTERM"]);
+    const stops = events.filter(({ name }) => name === "external-recording-stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0].payload.bytes, 5696);
+    assert.equal(stops[0].payload.trigger_mode, "first-mode");
+    assert.equal(stops[0].payload.paste, false);
+    assert.equal(events.some(({ name }) => name === "external-recording-cancel"), false);
+    const unauthorized = await postStop({ device_id: "another-device" });
+    assert.equal(unauthorized.statusCode, 403);
+    assert.equal(session.status, "processing");
+    await bridge.handleRendererResult({
+      session_id: session.id, success: true, status: "transcribed", text: "完整录音",
+    });
+    const [firstResponse, repeatedResponse] = await Promise.all([firstStop, repeatedStop]);
+    assert.equal(firstResponse.statusCode, 200);
+    assert.equal(repeatedResponse.statusCode, 200);
+    const firstBody = JSON.parse(firstResponse.body);
+    const repeatedBody = JSON.parse(repeatedResponse.body);
+    assert.deepEqual(repeatedBody.recording, firstBody.recording);
+    assert.equal(firstBody.recording.transcript, "完整录音");
+    assert.equal(firstBody.success, true);
+    assert.equal(repeatedBody.success, true);
+    assert.equal("state" in firstBody, true);
+    assert.equal("state" in repeatedBody, false);
+    assert.equal((await postStop()).statusCode, 404);
+  });
+
+  test(`HTTP host stop retries cannot revive a recording cancelled during ${retryPhase}`, async (t) => {
+    const { bridge, child, session, events, postStop, waitForStops } = await startHttpDrainingHostCapture(t);
+    const firstStop = postStop();
+    await waitForStops(1);
+    if (retryPhase === "processing") {
+      child.emit("close", 0, null);
+      await waitFor(() => assert.equal(session.status, "processing"));
+    }
+    const repeatedStop = postStop({ intent: "codex", paste: true });
+    await waitForStops(2);
+    bridge.terminateSession(session, { status: "cancelled", success: true });
+    child.stdout.emit("data", Buffer.alloc(1600));
+    child.emit("close", null, "SIGTERM");
+    const responses = await Promise.all([firstStop, repeatedStop]);
+    for (const response of responses) {
+      assert.equal(response.statusCode, retryPhase === "draining" ? 422 : 200);
+      assert.equal(JSON.parse(response.body).recording.status, "cancelled");
+    }
+    const afterCancellation = await postStop({ intent: "codex", paste: true });
+    assert.equal(afterCancellation.statusCode, 200);
+    assert.equal(JSON.parse(afterCancellation.body).recording.status, "cancelled");
+    await bridge.handleRendererResult({ session_id: session.id, success: true, status: "pasted", text: "late result" });
+    assert.equal(session.status, "cancelled");
+    assert.equal(session.done, true);
+    assert.equal(session.bytes, 4096);
+    assert.equal(session.intent, "dictation");
+    assert.equal(events.filter(({ name }) => name === "external-recording-stop").length,
+      retryPhase === "draining" ? 0 : 1);
+    assert.equal(events.filter(({ name }) => name === "external-recording-cancel").length, 1);
+  });
+}
+
+test("concurrent HTTP host stops retain a real drain failure", async (t) => {
+  const { child, session, events, postStop, waitForStops } = await startHttpDrainingHostCapture(t);
+  const firstStop = postStop();
+  await waitForStops(1);
+  const repeatedStop = postStop();
+  await waitForStops(2);
+  child.emit("close", 2, null);
+  const responses = await Promise.all([firstStop, repeatedStop]);
+  assert.deepEqual(responses[1], responses[0]);
+  assert.equal(responses[0].statusCode, 422);
+  assert.equal(JSON.parse(responses[0].body).error, "audio_capture_drain_failed");
+  assert.equal(session.done, true);
+  assert.equal(session.status, "recording_failed");
+  assert.equal(events.some(({ name }) => name === "external-recording-stop"), false);
+  assert.equal(events.filter(({ name }) => name === "external-recording-cancel").length, 1);
+});
+
+test("host release accepts pw-record code 1 and drains PCM before renderer stop and route restoration", async (t) => {
+  const { bridge, child, session, events } = await startDrainingHostCapture(t);
+  const firstStop = bridge.handleHostTriggerUp("keyboard");
+  const repeatedStop = bridge.handleHostTriggerUp("keyboard");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.some(({ name }) => name === "external-recording-stop" || name === "restore-route"), false);
+  child.emit("exit", 1, null);
+  child.stdout.emit("data", Buffer.alloc(1600));
+  assert.equal(events.at(-1).name, "external-recording-chunk");
+  child.emit("close", 1, null);
+  await Promise.all([firstStop, repeatedStop]);
+  const stops = events.filter(({ name }) => name === "external-recording-stop");
+  assert.equal(stops.length, 1);
+  assert.equal(session.status, "processing");
+  assert.equal(stops[0].payload.bytes, 5696);
+  assert.equal(stops[0].payload.chunks, 2);
+  const delivered = events.filter(({ name }) => name === "external-recording-chunk");
+  assert.equal(delivered.reduce((bytes, { payload }) => bytes + payload.byte_length, 0), session.bytes);
+  assert.ok(events.findIndex(({ name }) => name === "restore-route") > events.indexOf(stops[0]));
+});
+
+test("a new host press during drain waits and starts a distinct recording", async (t) => {
+  const { bridge, child, session, events } = await startDrainingHostCapture(t);
+  const route = { source_id: "pipewire:test-source", available: true,
+    source: { node_name: "test-source" } };
+  bridge.activatePreparedTrigger = async () => ({ route });
+  bridge.prepareAudioRoute = async () => ({ route });
+  bridge.applyAudioRoute = () => {};
+  let startedCaptures = 0;
+  bridge.pipeWireCapture.start = () => { startedCaptures += 1; return {}; };
+  const stopped = bridge.handleHostTriggerUp("keyboard");
+  const pressed = bridge.handleHostTriggerDown("keyboard", "42");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(startedCaptures, 0);
+  assert.equal(bridge.hostTriggerSessions.get("keyboard"), session.id);
+  child.stdout.emit("data", Buffer.alloc(1600));
+  child.emit("close", 0, null);
+  await stopped;
+  const next = await pressed;
+  assert.equal(next.handled, true);
+  assert.equal(next.duplicate, undefined);
+  assert.notEqual(next.session_id, session.id);
+  assert.equal(bridge.hostTriggerSessions.get("keyboard"), next.session_id);
+  assert.equal(startedCaptures, 1);
+  assert.equal(events.filter(({ name }) => name === "external-recording-stop").length, 1);
+});
+
+test("a quick press and release during drain does not leave the next capture running", async (t) => {
+  const { bridge, child } = await startDrainingHostCapture(t);
+  const route = { source_id: "pipewire:test-source", available: true,
+    source: { node_name: "test-source" } };
+  bridge.activatePreparedTrigger = async () => ({ route });
+  bridge.prepareAudioRoute = async () => ({ route });
+  bridge.applyAudioRoute = () => {};
+  bridge.captureOptionsForSession = () => ({});
+  const nextChild = new EventEmitter();
+  nextChild.stdout = new EventEmitter();
+  nextChild.stderr = new EventEmitter();
+  const signals = [];
+  nextChild.kill = (signal) => { signals.push(signal); return true; };
+  bridge.pipeWireCapture.spawnProcess = () => nextChild;
+  const oldStop = bridge.handleHostTriggerUp("keyboard");
+  const nextPress = bridge.handleHostTriggerDown("keyboard", "42");
+  const nextRelease = bridge.handleHostTriggerUp("keyboard");
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit("close", 0, null);
+  await oldStop;
+  const next = await nextPress;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(signals, ["SIGTERM"]);
+  nextChild.stdout.emit("data", Buffer.alloc(1600));
+  nextChild.emit("close", 0, null);
+  assert.equal((await nextRelease).session_id, next.session_id);
+  assert.equal(bridge.sessions.get(next.session_id).rendererStopped, true);
+  assert.equal(bridge.hostTriggerSessions.has("keyboard"), false);
+  assert.equal(bridge.pipeWireCapture.captures.size, 0);
+});
+
+test("bridge shutdown prevents a queued press from opening another capture", async (t) => {
+  const { bridge } = await startDrainingHostCapture(t);
+  let startedCaptures = 0;
+  bridge.pipeWireCapture.start = () => { startedCaptures += 1; return {}; };
+  const stopped = bridge.handleHostTriggerUp("keyboard");
+  const pressed = bridge.handleHostTriggerDown("keyboard", "42");
+  await new Promise((resolve) => setImmediate(resolve));
+  bridge.stop();
+  await stopped;
+  assert.equal((await pressed).cancelled, true);
+  assert.equal(startedCaptures, 0);
+  assert.equal(bridge.pipeWireCapture.captures.size, 0);
+});
+
+test("host capture cancelled during drain never sends a later renderer stop", async (t) => {
+  const { bridge, child, session, events } = await startDrainingHostCapture(t);
+  const stopped = bridge.handleHostTriggerUp("keyboard");
+  await new Promise((resolve) => setImmediate(resolve));
+  bridge.terminateSession(session, { status: "cancelled", success: true });
+  child.stdout.emit("data", Buffer.alloc(1600));
+  child.emit("close", null, "SIGTERM");
+  await stopped;
+  assert.equal(session.bytes, 4096);
+  assert.equal(events.some(({ name }) => name === "external-recording-stop"), false);
+  assert.equal(events.filter(({ name }) => name === "external-recording-cancel").length, 1);
+});
+
+test("host drain timeout fails explicitly without delivering a truncated recording", async (t) => {
+  const { bridge, child, session, events } = await startDrainingHostCapture(t);
+  bridge.pipeWireCapture.stopTimeoutMs = 10;
+  const result = await bridge.handleHostTriggerUp("keyboard");
+  assert.equal(result.error, "audio_capture_drain_failed");
+  assert.equal(session.done, true);
+  assert.equal(session.result.reason, "audio_capture_drain_failed");
+  assert.equal(events.some(({ name }) => name === "external-recording-stop"), false);
+  child.stdout.emit("data", Buffer.alloc(1600));
+  assert.equal(session.bytes, 4096);
 });
 
 test("concurrent host triggers arm only the renderer-owned session", async (t) => {

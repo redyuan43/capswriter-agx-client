@@ -11,11 +11,13 @@ class PipeWireCaptureController {
     spawnProcess = spawn,
     firstChunkRetryMs = 1000,
     maxStartAttempts = 3,
+    stopTimeoutMs = 1500,
   } = {}) {
     this.logger = logger;
     this.spawnProcess = spawnProcess;
     this.firstChunkRetryMs = firstChunkRetryMs;
     this.maxStartAttempts = maxStartAttempts;
+    this.stopTimeoutMs = stopTimeoutMs;
     this.captures = new Map();
   }
 
@@ -38,6 +40,8 @@ class PipeWireCaptureController {
       retryTimer: null,
       attempt: 0,
       receivedAudio: false,
+      stopPromise: null,
+      finishStop: null,
     };
     const firstChunkRetryMs = Math.max(
       1,
@@ -160,7 +164,8 @@ class PipeWireCaptureController {
       capture.child = child;
 
       child.stdout?.on("data", (chunk) => {
-        if (capture.child !== child || capture.retrying || !chunk?.length) return;
+        if (capture.child !== child || this.captures.get(id) !== capture ||
+            capture.retrying || !chunk?.length) return;
         if (!capture.receivedAudio && validateInitialAudio && initialAudioBytes > 0) {
           const bufferedChunk = Buffer.from(chunk);
           initialChunks.push(bufferedChunk);
@@ -267,16 +272,70 @@ class PipeWireCaptureController {
     return { session_id: id, source_id: sourceId, pid: capture.child?.pid || null };
   }
 
-  stop(sessionId) {
+  stop(sessionId, { drain = false } = {}) {
     const id = String(sessionId || "").trim();
     const capture = this.captures.get(id);
-    if (!capture) return false;
-    this.captures.delete(id);
+    if (!capture) return drain ? Promise.resolve(false) : false;
+    if (drain && capture.stopPromise) return capture.stopPromise;
+    const alreadyStopping = capture.stopping;
     capture.stopping = true;
     if (capture.retryTimer) clearTimeout(capture.retryTimer);
     capture.retryTimer = null;
-    capture.child.kill?.("SIGTERM");
-    return true;
+    if (!drain) {
+      this.captures.delete(id);
+      capture.finishStop?.(null, false);
+      capture.child.kill?.(alreadyStopping ? "SIGKILL" : "SIGTERM");
+      return true;
+    }
+
+    // close follows stdout drain; exit alone can precede the final PCM chunk.
+    const child = capture.child;
+    const wasRunning = child.exitCode == null && child.signalCode == null;
+    let stopSignalSent = false;
+    capture.stopPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      let timer;
+      const finish = (error, drained = true) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener("close", onClose);
+        child.removeListener("error", onError);
+        child.stdout?.removeListener("error", onError);
+        if (this.captures.get(id) === capture) this.captures.delete(id);
+        capture.finishStop = null;
+        if (error) reject(error);
+        else resolve(drained);
+      };
+      const onClose = (code, signal) => {
+        // pw-record handles SIGTERM and exits with status 1 after draining stdout.
+        const requestedStop = wasRunning && stopSignalSent && code === 1 && signal === null;
+        const cleanExit = code === 0 || (code === null && signal === "SIGTERM") || requestedStop;
+        finish(cleanExit ? null : new Error(`PipeWire capture stopped abnormally (${code}, ${signal})`));
+      };
+      const onError = (error) => {
+        finish(error);
+        try { child.kill?.("SIGKILL"); }
+        catch (killError) {
+          this.logger?.warn?.("Unable to stop failed PipeWire capture", {
+            sessionId: id,
+            error: killError?.message || String(killError),
+          });
+        }
+      };
+      capture.finishStop = finish;
+      child.once("close", onClose);
+      child.once("error", onError);
+      child.stdout?.once("error", onError);
+      timer = setTimeout(() => {
+        const error = new Error(`PipeWire capture stop timed out (${this.stopTimeoutMs}ms)`);
+        error.code = "PIPEWIRE_CAPTURE_STOP_TIMEOUT";
+        onError(error);
+      }, this.stopTimeoutMs);
+      try { stopSignalSent = child.kill?.("SIGTERM") === true; }
+      catch (error) { onError(error); }
+    });
+    return capture.stopPromise;
   }
 
   stopAll() {

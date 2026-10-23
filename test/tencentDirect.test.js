@@ -5,12 +5,34 @@ const os = require('os');
 const path = require('path');
 const { once } = require('events');
 const { WebSocketServer, WebSocket } = require('ws');
-const { realtimeUrl, cloudRequest, normalizeSegments, joinSegments, STANDARD, MODEL2 } = require('../src/helpers/tencentProvider');
+const { TencentProvider, realtimeUrl, cloudRequest, normalizeSegments, joinSegments, STANDARD, MODEL2 } = require('../src/helpers/tencentProvider');
 const { TencentQuota, freeSeconds } = require('../src/helpers/tencentQuota');
 const { TencentDirectBridge } = require('../src/helpers/tencentDirectBridge');
 const { HotWordsStore } = require('../src/platform/electron/hotWordsStore');
 const { relayTencent } = require('../src/helpers/tencentRealtimeRelay');
 const { EventEmitter } = require('events');
+
+test('握手期间切换下次录音偏好不会覆盖当前会话实际引擎', async () => {
+  const events = [];
+  const client = new EventEmitter();
+  client.readyState = WebSocket.OPEN;
+  client.send = raw => events.push(JSON.parse(raw));
+  client.close = () => {};
+  class Upstream extends EventEmitter {
+    constructor() { super(); queueMicrotask(() => this.emit('message', Buffer.from('{"code":0}'))); }
+    terminate() {}
+  }
+  const relay = relayTencent(client, { provider: { realtimeUrl: engine => {
+    assert.equal(engine, MODEL2); return 'ws://test.invalid';
+  } }, quota: { begin: () => MODEL2, record() {}, status: () => ({ engine: STANDARD }) },
+  snapshot: { hotword: 'Term|100', version: 'frozen' }, WebSocketImpl: Upstream });
+  try {
+    client.emit('message', Buffer.from('{"type":"start","sample_rate":16000}'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(events.find(event => event.type === 'ready').engine, MODEL2);
+    assert.equal(events.find(event => event.type === 'ready').hotword, 'Term|100');
+  } finally { relay.cancel(); }
+});
 
 test('腾讯异常 JSON 和分句结构返回错误，不抛出未捕获异常', async () => {
   for (const malformed of [null, [], 42, { sentences: { sentence_list: {} } }, { sentences: { sentence_list: [null] } }]) {
@@ -48,6 +70,81 @@ test('腾讯控制通道拒绝 JSON null，不建立上游连接', () => {
   } finally { relay.cancel(); }
 });
 
+test('可选句尾静音保持原 PCM、节奏和时长，finish 后不再触发录音空闲超时', { timeout: 5000 }, async (t) => {
+  const schedule = global.setTimeout;
+  // 缩短录音空闲窗口，验证 finish 后等待排队音频和云端最终结果不受它提前打断。
+  t.mock.method(global, 'setTimeout', (callback, ms, ...args) => schedule(callback, ms === 15000 ? 20 : ms, ...args));
+  for (const tailSilenceMs of [0, 200]) {
+    const source = Buffer.alloc(7662, 0x23), frames = [], records = [], events = [];
+    let endAt = 0, resolveDone;
+    const completed = new Promise(resolve => { resolveDone = resolve; });
+    class Upstream extends EventEmitter {
+      bufferedAmount = 0;
+      constructor() { super(); queueMicrotask(() => this.emit('message', Buffer.from('{"code":0}'))); }
+      send(raw, callback) {
+        if (Buffer.isBuffer(raw)) { frames.push({ bytes: Buffer.from(raw), at: performance.now() }); callback?.(); return; }
+        assert.equal(JSON.parse(raw).type, 'end');
+        endAt = performance.now();
+        queueMicrotask(() => this.emit('message', Buffer.from('{"code":0,"final":1}')));
+      }
+      terminate() {}
+    }
+    const client = new EventEmitter();
+    client.readyState = WebSocket.OPEN;
+    client.close = () => { client.readyState = WebSocket.CLOSED; resolveDone(); };
+    client.send = raw => {
+      const event = JSON.parse(raw); events.push(event);
+      if (event.type === 'ready') {
+        client.emit('message', source, true);
+        client.emit('message', Buffer.from('{"type":"finish"}'), false);
+      }
+    };
+    const relay = relayTencent(client, { provider: { realtimeUrl: () => 'ws://test.invalid' },
+      quota: { begin: () => STANDARD, status: () => ({}), record: (_id, seconds, state) => records.push({ seconds, state }) },
+      snapshot: { hotword: '', version: 'test' }, WebSocketImpl: Upstream, tailSilenceMs });
+    try {
+      client.emit('message', Buffer.from('{"type":"start","sample_rate":16000}'), false);
+      await completed;
+      const sent = Buffer.concat(frames.map(frame => frame.bytes));
+      assert.deepEqual(sent.subarray(0, source.length), source);
+      assert.deepEqual(sent.subarray(source.length), Buffer.alloc(tailSilenceMs * 32));
+      assert.equal(events.find(event => event.type === 'final')?.duration, source.length / 32000);
+      assert.deepEqual(records.at(-1), { seconds: sent.length / 32000, state: 'completed' });
+      assert.ok(endAt - frames[0].at >= sent.length / 32 - 15);
+      assert.equal(events.filter(event => event.type === 'final').length, 1);
+    } finally { relay.cancel(); }
+  }
+});
+
+test('句尾静音配置拒绝越界和小数，取消录音不追加静音或提交 end', async () => {
+  for (const tailSilenceMs of [-1, 2001, 1.5, 'invalid', Infinity, 1000]) {
+    const events = [], sent = [];
+    class Upstream extends EventEmitter {
+      bufferedAmount = 0;
+      constructor() { super(); queueMicrotask(() => this.emit('message', Buffer.from('{"code":0}'))); }
+      send(raw) { sent.push(raw); }
+      terminate() {}
+    }
+    const client = new EventEmitter(); client.readyState = WebSocket.OPEN; client.close = () => {};
+    client.send = raw => {
+      const event = JSON.parse(raw); events.push(event);
+      if (event.type === 'ready') {
+        client.emit('message', Buffer.alloc(640), true);
+        client.emit('message', Buffer.from('{"type":"cancel"}'), false);
+      }
+    };
+    const relay = relayTencent(client, { provider: { realtimeUrl: () => 'ws://test.invalid' },
+      quota: { begin: () => STANDARD, status: () => ({}), record() {} },
+      snapshot: { hotword: '', version: 'test' }, WebSocketImpl: Upstream, tailSilenceMs });
+    try {
+      client.emit('message', Buffer.from('{"type":"start","sample_rate":16000}'), false);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(events[0].type, tailSilenceMs === 1000 ? 'ready' : 'error');
+      assert.deepEqual(sent, []);
+    } finally { relay.cancel(); }
+  }
+});
+
 const credentials = { tencentAppId: '123456', tencentSecretId: 'test-id', tencentSecretKey: 'test-secret' };
 function directory(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caps-tencent-'));
@@ -72,6 +169,26 @@ test('额度 TC3 请求签名固定输入，正文与被签字节一致', () => 
   assert.equal(request.body, '{"AvailableType":0,"Page":1,"PageSize":100}');
   assert.match(request.headers.Authorization, /^TC3-HMAC-SHA256 Credential=test-id\/2026-09-21\/asr\/tc3_request,/);
   assert.equal(request.headers['X-TC-Action'], 'DescribePidOrders');
+});
+
+test('低电平录音的 VAD 校准参与签名，默认请求保持不变', () => {
+  const crypto = require('crypto');
+  const standard = new URL(realtimeUrl(credentials, STANDARD, 'voice', '', 1790000000, 123));
+  assert.equal(standard.searchParams.has('noise_threshold'), false);
+  const adjusted = new URL(realtimeUrl(credentials, STANDARD, 'voice', '', 1790000000, 123, { noiseThreshold: '-1' }));
+  assert.equal(adjusted.searchParams.get('noise_threshold'), '-1');
+  assert.equal(adjusted.searchParams.get('needvad'), '1');
+  const signature = adjusted.searchParams.get('signature');
+  adjusted.searchParams.delete('signature');
+  const query = [...adjusted.searchParams].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('&');
+  assert.equal(signature, crypto.createHmac('sha1', credentials.tencentSecretKey)
+    .update(`${adjusted.host}${adjusted.pathname}?${query}`).digest('base64'));
+  assert.notEqual(signature, standard.searchParams.get('signature'));
+  const provider = new TencentProvider({ getCredentials: () => credentials, noiseThreshold: -1 });
+  assert.equal(new URL(provider.realtimeUrl(STANDARD, 'voice', 'WorkBuddy|5')).searchParams.get('noise_threshold'), '-1');
+  for (const noiseThreshold of [-2.1, 2.1, 'invalid', Infinity]) {
+    assert.throws(() => realtimeUrl(credentials, STANDARD, 'voice', '', 1790000000, 123, { noiseThreshold }), /噪声阈值/);
+  }
 });
 
 test('两种腾讯结果保留句索引、时间戳和词信息，中英不粘词', () => {

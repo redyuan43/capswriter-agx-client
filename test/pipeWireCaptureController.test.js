@@ -1,8 +1,143 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { EventEmitter } = require("events");
+const { EventEmitter, once } = require("events");
+const { spawn } = require("node:child_process");
 
 const PipeWireCaptureController = require("../src/helpers/pipeWireCaptureController");
+
+function drainingCapture(options = {}, captureOptions = {}) {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  const signals = [];
+  child.kill = (signal) => { signals.push(signal); return true; };
+  const chunks = [];
+  const controller = new PipeWireCaptureController({ spawnProcess: () => child, ...options });
+  controller.start("drain", "pipewire:source", (chunk) => chunks.push(chunk), "", captureOptions);
+  return { controller, child, chunks, signals };
+}
+
+test("draining stop waits for close and preserves PCM emitted after exit", async () => {
+  const { controller, child, chunks, signals } = drainingCapture();
+  child.stdout.emit("data", Buffer.alloc(4096, 1));
+  const stopped = controller.stop("drain", { drain: true });
+  assert.equal(controller.stop("drain", { drain: true }), stopped);
+  let settled = false;
+  stopped.then(() => { settled = true; });
+  child.emit("exit", 0, null);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  child.stdout.emit("data", Buffer.alloc(1600, 2));
+  child.emit("close", 0, null);
+  assert.equal(await stopped, true);
+  assert.deepEqual(chunks.map((chunk) => chunk.length), [4096, 1600]);
+  assert.deepEqual(signals, ["SIGTERM"]);
+  child.stdout.emit("data", Buffer.alloc(32));
+  assert.equal(chunks.length, 2);
+  assert.equal(await controller.stop("drain", { drain: true }), false);
+});
+
+test("cancelling a draining capture settles the wait and rejects late PCM", async () => {
+  const { controller, child, chunks, signals } = drainingCapture();
+  const stopped = controller.stop("drain", { drain: true });
+  assert.equal(controller.stop("drain"), true);
+  assert.equal(await stopped, false);
+  child.stdout.emit("data", Buffer.alloc(1600));
+  child.emit("close", null, "SIGTERM");
+  assert.equal(chunks.length, 0);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("draining stop times out, kills the child and rejects further PCM", async () => {
+  const { controller, child, chunks, signals } = drainingCapture({ stopTimeoutMs: 10 });
+  await assert.rejects(controller.stop("drain", { drain: true }), { code: "PIPEWIRE_CAPTURE_STOP_TIMEOUT" });
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  child.stdout.emit("data", Buffer.alloc(1600));
+  child.emit("close", null, "SIGKILL");
+  assert.equal(chunks.length, 0);
+  assert.equal(controller.captures.size, 0);
+});
+
+test("draining stop reports process errors and abnormal exits without retrying", async () => {
+  for (const failure of ["error", "stdout", "close", "kill", "already-exited", "signal-not-sent"]) {
+    const { controller, child } = drainingCapture();
+    if (failure === "kill") child.kill = () => { throw new Error("signal failed"); };
+    if (failure === "already-exited") child.exitCode = 1;
+    if (failure === "signal-not-sent") child.kill = () => false;
+    const stopped = controller.stop("drain", { drain: true });
+    const rejected = assert.rejects(stopped, /signal failed|capture failed|stopped abnormally/);
+    if (failure === "error") child.emit("error", new Error("capture failed"));
+    if (failure === "stdout") child.stdout.emit("error", new Error("capture failed"));
+    if (failure === "close") child.emit("close", 2, null);
+    if (failure === "already-exited" || failure === "signal-not-sent") child.emit("close", 1, null);
+    await rejected;
+    assert.equal(controller.captures.size, 0);
+  }
+});
+
+test("spontaneous code 1 exit remains a capture failure", async () => {
+  const failures = [];
+  const { controller, child } = drainingCapture({}, { onUnexpectedExit: (details) => failures.push(details) });
+  child.stdout.emit("data", Buffer.alloc(4096));
+  child.emit("close", 1, null);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].code, 1);
+  assert.equal(await controller.stop("drain", { drain: true }), false);
+});
+
+test("draining stop accepts pw-record style code 1 and preserves the real child's final write", { timeout: 5000 }, async (t) => {
+  let child;
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      child = spawn(process.execPath, ["-e", `
+        process.on('SIGTERM', () => {
+          process.stdout.end(Buffer.alloc(1600, 2), () => process.exit(1));
+        });
+        process.stdout.write(Buffer.alloc(4096, 1));
+        setInterval(() => {}, 1000);
+      `], { stdio: ["ignore", "pipe", "pipe"] });
+      return child;
+    },
+  });
+  t.after(() => controller.stopAll());
+  const chunks = [];
+  let gotFirstChunk;
+  const firstChunk = new Promise((resolve) => { gotFirstChunk = resolve; });
+  controller.start("real-drain", "pipewire:source", (chunk) => {
+    chunks.push(chunk);
+    gotFirstChunk();
+  });
+  await firstChunk;
+  const closed = once(child, "close");
+  assert.equal(await controller.stop("real-drain", { drain: true }), true);
+  assert.deepEqual(await closed, [1, null]);
+  assert.deepEqual(Buffer.concat(chunks), Buffer.concat([Buffer.alloc(4096, 1), Buffer.alloc(1600, 2)]));
+});
+
+test("cancelling drain kills a real child that ignores SIGTERM", { timeout: 5000 }, async (t) => {
+  let child;
+  const controller = new PipeWireCaptureController({
+    spawnProcess() {
+      child = spawn(process.execPath, ["-e", `
+        process.on('SIGTERM', () => {});
+        process.stdout.write(Buffer.alloc(4096));
+        setInterval(() => {}, 1000);
+      `], { stdio: ["ignore", "pipe", "pipe"] });
+      return child;
+    },
+  });
+  t.after(() => child?.kill("SIGKILL"));
+  let gotAudio;
+  const audio = new Promise((resolve) => { gotAudio = resolve; });
+  controller.start("cancel-real", "pipewire:source", () => gotAudio());
+  await audio;
+  const closed = once(child, "close");
+  const stopped = controller.stop("cancel-real", { drain: true });
+  controller.stop("cancel-real");
+  assert.equal(await stopped, false);
+  assert.deepEqual(await closed, [null, "SIGKILL"]);
+  assert.equal(controller.captures.size, 0);
+});
 
 test("PipeWire capture uses a normalized 16 kHz mono stream", () => {
   const calls = [];
