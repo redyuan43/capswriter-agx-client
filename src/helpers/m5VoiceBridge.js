@@ -7,6 +7,7 @@ const { randomUUID } = require("crypto");
 const M5DeviceRegistry = require("./m5DeviceRegistry");
 const M5OtaService = require("./m5OtaService");
 const M5RecordingSessions = require("./m5RecordingSessions");
+const HostTriggerOperationQueue = require("./hostTriggerOperationQueue");
 const M5VoiceBridgeRouter = require("./m5VoiceBridgeRouter");
 const CardputerKeyboardBridge = require("./cardputerKeyboardBridge");
 const CardputerPointerBridge = require("./cardputerPointerBridge");
@@ -378,6 +379,7 @@ class M5VoiceBridge {
       ],
     });
     this.hostTriggerSessions = new Map();
+    this.hostTriggerOperationQueues = new Map();
     this.rendererSessionId = "";
     this.rendererPendingSessionId = "";
     this.rendererQueue = [];
@@ -466,6 +468,7 @@ class M5VoiceBridge {
     this.cardputerPointer.stop();
     this.recordingSessions.clear();
     this.hostTriggerSessions.clear();
+    this.hostTriggerOperationQueues.clear();
     this.rendererQueue = [];
     this.rendererSessionId = "";
     this.rendererPendingSessionId = "";
@@ -1898,16 +1901,26 @@ loadBluetoothDevices();
       });
       return;
     }
+    const stopping = session.captureMode === "host_capture"
+      ? (session.httpStopPromise ||= this.stopRecordingSession(session, body, stopReceivedAt))
+      : this.stopRecordingSession(session, body, stopReceivedAt);
+    const { statusCode, response } = await stopping;
+    this.sendJson(res, statusCode, !req.vibeDevice && statusCode === 200
+      ? { ...response, state: this.buildState() }
+      : response);
+  }
+
+  async stopRecordingSession(session, body, stopReceivedAt) {
+    const sessionId = session.id;
     session.stopReceivedAt ||= stopReceivedAt;
     if (session.protocolVersion >= 2) {
       if (body.upload_failed === true) {
         this.abortSession(session, "device_audio_upload_failed");
-        this.sendJson(res, 422, {
+        return { statusCode: 422, response: {
           success: false,
           recording: { status: "recording_failed", session_id: sessionId },
           error: "device reported an audio upload failure",
-        });
-        return;
+        } };
       }
       const totalChunks = Number(body.total_chunks);
       const totalBytes = Number(body.total_bytes);
@@ -1919,27 +1932,32 @@ loadBluetoothDevices();
           reportedChunks: body.total_chunks,
           reportedBytes: body.total_bytes,
         });
-        this.sendJson(res, 422, {
+        return { statusCode: 422, response: {
           success: false,
           recording: { status: "recording_failed", session_id: sessionId },
           error: "audio totals do not match",
-        });
-        return;
+        } };
       }
-    }
-    if (session.bytes === 0) {
-      this.abortSession(session, "audio_input_empty");
-      this.sendJson(res, 422, {
-        success: false,
-        recording: { status: "recording_failed", session_id: sessionId },
-        error: "recording contains no audio",
-      });
-      return;
     }
     session.status = "stopping";
     if (session.watchdogTimer) {
       clearTimeout(session.watchdogTimer);
       session.watchdogTimer = null;
+    }
+    if (session.captureMode === "host_capture" && !await this.drainHostCapture(session)) {
+      return { statusCode: 422, response: {
+        success: false,
+        recording: { status: session.status, session_id: sessionId },
+        error: session.result?.error || "recording was cancelled while stopping",
+      } };
+    }
+    if (session.bytes === 0) {
+      this.abortSession(session, "audio_input_empty");
+      return { statusCode: 422, response: {
+        success: false,
+        recording: { status: "recording_failed", session_id: sessionId },
+        error: "recording contains no audio",
+      } };
     }
     this.pipeWireCapture.stop(sessionId);
     if (session.captureMode === "remote_device" && session.sourceDeviceId) {
@@ -1996,8 +2014,7 @@ loadBluetoothDevices();
         message: result.error || result.message || "",
       },
     };
-    if (!req.vibeDevice) response.state = this.buildState();
-    this.sendJson(res, 200, response);
+    return { statusCode: 200, response };
   }
 
   getAudioRoutingState() {
@@ -2066,7 +2083,30 @@ loadBluetoothDevices();
     this.sendJson(res, 200, { success: true, acknowledgement });
   }
 
-  async handleHostTriggerDown(triggerId, targetWindowId = "", options = {}) {
+  queueHostTriggerOperation(triggerId, operation) {
+    let queue = this.hostTriggerOperationQueues.get(triggerId);
+    if (!queue) {
+      queue = new HostTriggerOperationQueue();
+      this.hostTriggerOperationQueues.set(triggerId, queue);
+    }
+    const pending = queue.enqueue(() => this.hostTriggerOperationQueues.get(triggerId) === queue
+      ? operation()
+      : { handled: false, cancelled: true });
+    const release = () => {
+      if (queue.pending === pending && this.hostTriggerOperationQueues.get(triggerId) === queue) {
+        this.hostTriggerOperationQueues.delete(triggerId);
+      }
+    };
+    pending.then(release, release);
+    return pending;
+  }
+
+  handleHostTriggerDown(triggerId, targetWindowId = "", options = {}) {
+    return this.queueHostTriggerOperation(triggerId,
+      () => this.startHostTriggerSession(triggerId, targetWindowId, options));
+  }
+
+  async startHostTriggerSession(triggerId, targetWindowId, options) {
     if (this.hostTriggerSessions.has(triggerId)) {
       const sessionId = this.hostTriggerSessions.get(triggerId);
       return { handled: true, duplicate: true, session_id: sessionId };
@@ -2172,16 +2212,20 @@ loadBluetoothDevices();
     return session;
   }
 
-  async handleHostTriggerUp(triggerId) {
+  handleHostTriggerUp(triggerId) {
+    return this.queueHostTriggerOperation(triggerId, () => this.stopHostTriggerSession(triggerId));
+  }
+
+  async stopHostTriggerSession(triggerId) {
     const sessionId = this.hostTriggerSessions.get(triggerId);
     if (!sessionId) {
       this.audioRouting.clearActiveRoute(triggerId);
       this.restoreUnifiedDefaultSource();
       return { handled: false };
     }
-    this.hostTriggerSessions.delete(triggerId);
     const session = this.sessions.get(sessionId);
     if (!session || session.done) {
+      this.hostTriggerSessions.delete(triggerId);
       return { handled: true, session_id: sessionId };
     }
     session.stopReceivedAt ||= Date.now();
@@ -2192,7 +2236,9 @@ loadBluetoothDevices();
     }
     let acknowledgement = null;
     if (session.captureMode === "host_capture") {
-      this.pipeWireCapture.stop(sessionId);
+      if (!await this.drainHostCapture(session)) {
+        return { handled: true, session_id: sessionId, error: session.result?.error || "recording cancelled" };
+      }
     } else {
       const command = this.commandBroker.enqueue(session.sourceDeviceId, {
         type: "recording_stop",
@@ -2228,6 +2274,10 @@ loadBluetoothDevices();
       });
       acknowledgement = await this.waitForRemoteAudioDrain(session, acknowledgementPromise);
     }
+    this.hostTriggerSessions.delete(triggerId);
+    if (session.done || session.terminationStarted) {
+      return { handled: true, session_id: sessionId, acknowledgement };
+    }
     if (session.bytes === 0) {
       if (this.isRendererVisibleSession(session)) {
         session.rendererErrorDispatched = true;
@@ -2252,6 +2302,24 @@ loadBluetoothDevices();
     this.audioRouting.clearActiveRoute(triggerId);
     this.restoreUnifiedDefaultSource();
     return { handled: true, session_id: sessionId, acknowledgement };
+  }
+
+  async drainHostCapture(session) {
+    try {
+      const drained = await this.pipeWireCapture.stop(session.id, { drain: true });
+      if (session.done || session.terminationStarted) return false;
+      if (!drained) throw new Error("PipeWire capture stopped before audio drain completed");
+      return true;
+    } catch (error) {
+      if (session.done || session.terminationStarted) return false;
+      const message = error?.message || String(error);
+      this.logger?.warn?.("Host capture could not drain final audio", {
+        sessionId: session.id,
+        error: message,
+      });
+      this.abortSession(session, "audio_capture_drain_failed", { error: message });
+      return false;
+    }
   }
 
   async waitForRemoteAudioDrain(session, acknowledgementPromise) {

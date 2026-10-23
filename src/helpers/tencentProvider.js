@@ -6,11 +6,17 @@ const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const hmac = (key, value, algorithm = 'sha256') => crypto.createHmac(algorithm, key).update(value).digest();
 const query = (params) => Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join('&');
 
-function realtimeUrl(credentials, engine, voiceId, hotword = '', now = Math.floor(Date.now() / 1000), nonce = crypto.randomInt(1, 1000000000)) {
+function realtimeUrl(credentials, engine, voiceId, hotword = '', now = Math.floor(Date.now() / 1000), nonce = crypto.randomInt(1, 1000000000), { noiseThreshold } = {}) {
   const params = { engine_model_type: engine, expired: now + 600, secretid: credentials.tencentSecretId,
     timestamp: now, nonce, voice_id: voiceId, voice_format: 1, needvad: 1, sub_service_type: 1,
     convert_num_mode: 1, filter_dirty: 0, filter_modal: 0, filter_punc: 0 };
   if (engine === STANDARD) params.word_info = 2;
+  // 低电平麦克风可校准云端 VAD；未配置时保留腾讯默认值，不改变音频或发送节奏。
+  if (noiseThreshold !== undefined && noiseThreshold !== null && String(noiseThreshold).trim() !== '') {
+    const value = Number(noiseThreshold);
+    if (!Number.isFinite(value) || value < -2 || value > 2) throw new Error('腾讯噪声阈值必须在 -2 到 2 之间');
+    params.noise_threshold = value;
+  }
   if (hotword) params.hotword_list = hotword;
   const hostPath = `asr.cloud.tencent.com/asr/v2/${credentials.tencentAppId}`;
   const signature = hmac(credentials.tencentSecretKey, `${hostPath}?${query(params)}`, 'sha1').toString('base64');
@@ -38,7 +44,12 @@ async function readJson(fetchImpl, url, init, timeout = 4000) {
 }
 
 class TencentProvider {
-  constructor({ getCredentials, fetchImpl = globalThis.fetch } = {}) { this.getCredentials = getCredentials; this.fetch = fetchImpl; }
+  constructor({ getCredentials, fetchImpl = globalThis.fetch,
+    noiseThreshold = process.env.CAPSWRITER_TENCENT_NOISE_THRESHOLD } = {}) {
+    this.getCredentials = getCredentials;
+    this.fetch = fetchImpl;
+    this.noiseThreshold = noiseThreshold;
+  }
 
   credentials() {
     const c = this.getCredentials();
@@ -46,7 +57,9 @@ class TencentProvider {
     return c;
   }
 
-  realtimeUrl(engine, id, hotword) { return realtimeUrl(this.credentials(), engine, id, hotword); }
+  realtimeUrl(engine, id, hotword) {
+    return realtimeUrl(this.credentials(), engine, id, hotword, undefined, undefined, { noiseThreshold: this.noiseThreshold });
+  }
 
   async resources() {
     const rows = [];

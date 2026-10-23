@@ -4,18 +4,20 @@ const { STANDARD, MODEL2, normalizeSegments, joinSegments } = require('./tencent
 const FRAME = 6400, RATE = 32000, MAX_PENDING = RATE * 10;
 
 // 主进程内的 PCM 适配器。云端 URL 与签名始终留在这里。
-function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getSnapshot, WebSocketImpl = WebSocket }) {
+function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getSnapshot, WebSocketImpl = WebSocket,
+  tailSilenceMs = process.env.CAPSWRITER_TENCENT_TAIL_SILENCE_MS || 0 }) {
   let snapshot = initialSnapshot;
   const id = randomUUID();
   let upstream, engine, started = false, ready = false, finishing = false, done = false, endSent = false;
   let sent = 0, queued = Buffer.alloc(0), nextAt = 0, pumpTimer, helloTimer, finalTimer;
+  let recordingBytes = null, tailBytes = 0;
   const segments = new Map();
   const emit = (payload) => { if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(payload)); };
   const payload = (type) => {
     const ordered = [...segments.values()].sort((a, b) => a.id - b.id);
     const text = joinSegments(ordered);
     return { type, success: true, text, asr_text: text, raw_text: text, final_text: text, partial_text: type === 'partial' ? text : '',
-      segments: ordered, provider: 'tencent', engine, session_id: id, duration: sent / RATE,
+      segments: ordered, provider: 'tencent', engine, session_id: id, duration: Math.min(sent, recordingBytes ?? sent) / RATE,
       hotword: snapshot.hotword, dictionary_version: snapshot.version, optimize_mode: 'none', postprocess_mode: 'none' };
   };
   const stop = (state, message) => {
@@ -46,7 +48,7 @@ function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getS
       nextAt = Math.max(nextAt, performance.now()) + frame.length / RATE * 1000;
       const before = Math.floor(sent / RATE);
       sent += frame.length;
-      if (sent > RATE * 7200) { stop('failed', '单次录音不能超过两小时'); return; }
+      if (Math.min(sent, recordingBytes ?? sent) > RATE * 7200) { stop('failed', '单次录音不能超过两小时'); return; }
       try { if (Math.floor(sent / RATE) > before) quota.record(id, sent / RATE); }
       catch { stop('failed', '本地额度记录失败'); return; }
       pumpTimer = setTimeout(pump, Math.max(1, nextAt - performance.now()));
@@ -87,7 +89,7 @@ function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getS
       if (!ready) {
         ready = true;
         clearTimeout(helloTimer);
-        emit({ type: 'ready', success: true, provider: 'tencent', engine, session_id: id, ...quota.status(),
+        emit({ type: 'ready', success: true, provider: 'tencent', ...quota.status(), engine, session_id: id,
           hotword: snapshot.hotword, dictionary_version: snapshot.version,
           capabilities: { asr: true, optimize: false, translate: false } });
       }
@@ -116,11 +118,21 @@ function relayTencent(client, { provider, quota, snapshot: initialSnapshot, getS
     if (command.type === 'cancel') { stop('cancelled'); return; }
     if (command.type === 'start' && !started) {
       if (command.sample_rate !== 16000 || !['none', '', undefined, false].includes(command.optimize_mode)) { stop('failed', '腾讯直连需要 16000 Hz PCM；翻译请另选连接'); return; }
+      const tailMs = Number(tailSilenceMs);
+      if (!Number.isInteger(tailMs) || tailMs < 0 || tailMs > 2000) { stop('failed', '腾讯句尾静音必须为 0 到 2000 毫秒的整数'); return; }
+      tailBytes = tailMs * RATE / 1000;
       started = true;
       try { snapshot = getSnapshot?.() || initialSnapshot; engine = quota.begin(id); } catch { stop('failed', '本地词库或额度记录失败'); return; }
       connect(); return;
     }
-    if (command.type === 'finish' && ready && !finishing) { finishing = true; pump(); return; }
+    if (command.type === 'finish' && ready && !finishing) {
+      finishing = true;
+      clearTimeout(idleTimer);
+      recordingBytes = sent + queued.length;
+      // 低电平语音校准可留出云端 VAD 的句尾判定时间；原录音和展示时长不变，额度按实际上送计。
+      if (recordingBytes && tailBytes) queued = Buffer.concat([queued, Buffer.alloc(tailBytes)]);
+      pump(); return;
+    }
     stop('failed', '录音控制消息顺序无效');
   });
   client.once('close', () => stop('cancelled'));
