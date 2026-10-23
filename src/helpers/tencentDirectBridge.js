@@ -13,9 +13,9 @@ const MAX_UPLOAD = 100 * 1024 * 1024;
 // 仅客户端内部使用的回环适配层，随应用退出。随机地址防止网页调用本机付费接口。
 // 云端密钥不进入地址或 renderer；各入口继续使用同一套 PCM / multipart 协议。
 class TencentDirectBridge {
-  constructor({ dataDirectory, getCredentials, hotWordsStore, provider, quota } = {}) {
+  constructor({ dataDirectory, getCredentials, hotWordsStore, provider, quota, getRealtimeEngine } = {}) {
     this.provider = provider || new TencentProvider({ getCredentials });
-    this.quota = quota || new TencentQuota({ dataDirectory });
+    this.quota = quota || new TencentQuota({ dataDirectory, getRealtimeEngine });
     this.hotWordsStore = hotWordsStore;
     this.prefix = `/${randomBytes(32).toString('hex')}`;
     this.filesActive = 0;

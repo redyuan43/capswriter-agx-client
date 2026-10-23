@@ -22,9 +22,10 @@ function freeSeconds(packages, now = Date.now()) {
 }
 
 class TencentQuota {
-  constructor({ dataDirectory, clock = Date.now } = {}) {
+  constructor({ dataDirectory, clock = Date.now, getRealtimeEngine = () => 'auto' } = {}) {
     this.filePath = path.join(dataDirectory, 'tencent-usage.json');
     this.clock = clock;
+    this.getRealtimeEngine = getRealtimeEngine;
     this.state = { credits: {}, sessions: {} };
     this.known = false;
     this.checkedAt = 0;
@@ -65,9 +66,12 @@ class TencentQuota {
     const remaining = known ? row.blocked ? 0 : Math.max(0, row.remaining - (this.total(month) - row.baseline)) : null;
     const reserved = Object.values(this.state.sessions).filter((s) => s.month === month && s.engine === STANDARD && s.state === 'active')
       .reduce((v, s) => v + Math.max(0, RESERVE - s.seconds), 0);
-    const engine = known && remaining - reserved >= RESERVE ? STANDARD : MODEL2;
-    return { engine, quota: { known, remaining_seconds: remaining, checked_at: this.checkedAt / 1000, month,
-      message: known ? `免费余量约 ${Math.floor(remaining)} 秒${engine === MODEL2 ? '，使用 2.0' : ''}` : '未确认免费额度，使用 2.0', reserve_seconds: RESERVE },
+    const preference = this.getRealtimeEngine() === MODEL2 ? MODEL2 : 'auto';
+    const engine = preference === MODEL2 ? MODEL2 : known && remaining - reserved >= RESERVE ? STANDARD : MODEL2;
+    const message = preference === MODEL2 ? '已选择大模型 2.0（付费，不使用经典版免费额度）'
+      : known ? `免费余量约 ${Math.floor(remaining)} 秒${engine === MODEL2 ? '，使用 2.0' : ''}` : '未确认免费额度，使用 2.0';
+    return { engine, realtime_engine_preference: preference,
+      quota: { known, remaining_seconds: remaining, checked_at: this.checkedAt / 1000, month, message, reserve_seconds: RESERVE },
       usage_seconds: { standard: this.total(month), model2: this.total(month, MODEL2), flash: this.total(month, 'flash_16k_zh') } };
   }
 

@@ -42,6 +42,38 @@ function preserveProtected(original, output) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// 只规范显式增强的专名，不把普通词表中的命令名改成大小写敏感的另一写法。
+function normalizeTermCase(text, entries) {
+  const protectedRanges = protectedSpans(text);
+  const candidates = [];
+  for (const entry of entries) {
+    if (entry.enabled === false || entry.weight !== 100 || !/[A-Za-z]/.test(entry.term || '')) continue;
+    const escaped = entry.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const match of text.matchAll(new RegExp(escaped, 'gi'))) {
+      const start = match.index, end = start + match[0].length;
+      const line = text.slice(text.lastIndexOf('\n', start - 1) + 1, text.indexOf('\n', end) < 0 ? text.length : text.indexOf('\n', end));
+      // 未加反引号的调用、赋值和命令仍按代码保留，不从这些片段猜测专名。
+      if (/\b(?:const|let|var|function|class|def|import|export)\s|[=;{}|&<>]|(?:^|\s)--?[A-Za-z]/.test(line) ||
+          /^\s*\(/.test(text.slice(end))) continue;
+      if (match[0] === entry.term ||
+          /[A-Za-z0-9_]/.test(text[start - 1] || '') ||
+          /[A-Za-z0-9_]/.test(text[end] || '') ||
+          overlaps(protectedRanges, start, end)) continue;
+      const context = text.slice(Math.max(0, start - 16), end + 16);
+      if ((entry.exclusions || []).some(word => word && context.includes(word))) continue;
+      candidates.push({ start, end, text: entry.term, source: match[0] });
+    }
+  }
+  candidates.sort((a, b) => b.end - b.start - (a.end - a.start) || a.start - b.start);
+  const selected = [];
+  for (const match of candidates) if (!overlaps(selected, match.start, match.end)) selected.push(match);
+  let result = text;
+  for (const match of selected.sort((a, b) => b.start - a.start)) {
+    result = result.slice(0, match.start) + match.text + result.slice(match.end);
+  }
+  return { text: result, matches: selected.reverse() };
+}
+
 function applyAliases(text, entries) {
   const protectedRanges = protectedSpans(text);
   const candidates = [];
@@ -73,4 +105,4 @@ function applyAliases(text, entries) {
   return { text: result, matches: selected.reverse() };
 }
 
-module.exports = { protectedSpans, overlaps, preserveProtected, segmentWithOffsets, applyAliases };
+module.exports = { protectedSpans, overlaps, preserveProtected, segmentWithOffsets, applyAliases, normalizeTermCase };

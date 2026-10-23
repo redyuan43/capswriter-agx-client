@@ -7,6 +7,10 @@ const BUNDLED_FILE = path.join(PROJECT_ROOT, "assets", "hot-words.txt");
 const FILE_NAME = "hot-words.txt";
 const MAX_TERMS = 128; // 腾讯硬上限
 const DEFAULT_WEIGHT = 5;
+const MAX_REGULAR_WEIGHT = 11;
+const FORCED_WEIGHT = 100;
+const isSupportedWeight = weight => Number.isInteger(weight) &&
+  ((weight >= 1 && weight <= MAX_REGULAR_WEIGHT) || weight === FORCED_WEIGHT);
 const GROUPS = { coding: ['GitHub', 'commit', 'release', 'API', 'skills', 'bug', 'AGENTS.md', 'Codex', 'Markdown', 'branch', 'worker', 'README', 'agent', 'Git', 'Qwen3', 'fallback', 'skill', 'subagent', 'upstream', 'ACP', 'DeepSeek', 'TUI', 'NPM', 'analysis', 'repo', 'token', 'SDK', 'context', 'clone', 'fork', 'CLI', 'OpenClaw'],
   hardware: ['ADB', 'APK', 'Nano', 'USB', 'TTS', 'Ubuntu', 'OTA', 'AGX', 'GUI', 'GPU', 'AMD', 'ASR', 'Linux', 'CPU', 'ESP', 'GPS', 'IMU', 'K20', 'VAD', 'ARM', 'nx1', 'nx2', 'nx3', 'nx4', 'nx5', 'nx6', 'nx7'],
   network: ['WiFi', 'Wi-Fi', 'SSH', 'VNC', 'VPN', 'Tailscale', 'server', 'CDP', 'VPS'],
@@ -55,7 +59,7 @@ function parseHotWords(text, { maxTerms = Infinity, defaultWeight = DEFAULT_WEIG
     const idx = line.lastIndexOf("|");
     if (idx > 0) {
       const maybeWeight = line.slice(idx + 1).trim();
-      if (/^\d+$/.test(maybeWeight) && Number(maybeWeight) >= 1 && Number(maybeWeight) <= 11) {
+      if (/^\d+$/.test(maybeWeight) && isSupportedWeight(Number(maybeWeight))) {
         term = line.slice(0, idx).trim();
         weight = Number(maybeWeight);
       } else {
@@ -142,11 +146,12 @@ class HotWordsStore {
     const active = this.entries.filter((e) => e.enabled !== false && !termError(e.term) &&
       (this.activeGroups.includes(e.group) || (e.updatedAt && Date.now() - e.updatedAt < 3 * 86400000)));
     const ranked = active.map((entry, index) => ({ entry, index,
-      score: (context && [entry.term, ...entry.aliases].some((s) => context.includes(s)) ? 100 : 0) + entry.weight +
+      // 100 是识别服务的特殊权重，不应越过词条筛选原有的上下文优先级。
+      score: (context && [entry.term, ...entry.aliases].some((s) => context.includes(s)) ? 100 : 0) + Math.min(entry.weight, MAX_REGULAR_WEIGHT) +
         (entry.updatedAt && Date.now() - entry.updatedAt < 3 * 86400000 ? 8 : 0),
     })).sort((a, b) => b.score - a.score || (b.entry.updatedAt || 0) - (a.entry.updatedAt || 0) || a.index - b.index);
     const selected = ranked.slice(0, MAX_TERMS).map(({ entry }) => ({ ...entry,
-      weight: this.managedWeights ? (entry.strong ? 11 : 5) : entry.weight }));
+      weight: this.managedWeights && entry.weight !== FORCED_WEIGHT ? (entry.strong ? 11 : 5) : entry.weight }));
     const version = require('crypto').createHash('sha256').update(JSON.stringify([this.entries, this.activeGroups, this.managedWeights])).digest('hex').slice(0, 16);
     this.snapshots.set(version, structuredClone(this.entries));
     if (this.snapshots.size > 20) this.snapshots.delete(this.snapshots.keys().next().value);
@@ -255,7 +260,7 @@ function termError(term) {
 function normalizeEntry(entry) {
   const strings = (items) => [...new Set((Array.isArray(items) ? items : []).map(String).map((s) => s.trim()).filter((s) => s && s.length <= 100))].slice(0, 32);
   return { term: String(entry.term || '').trim(),
-    weight: Number.isInteger(Number(entry.weight)) && Number(entry.weight) >= 1 && Number(entry.weight) <= 11 ? Number(entry.weight) : DEFAULT_WEIGHT,
+    weight: isSupportedWeight(Number(entry.weight)) ? Number(entry.weight) : DEFAULT_WEIGHT,
     enabled: entry.enabled !== false, aliases: strings(entry.aliases), exclusions: strings(entry.exclusions),
     group: GROUP_NAMES[entry.group] ? entry.group : defaultGroup(String(entry.term || '')), strong: entry.strong === true,
     updatedAt: Number.isFinite(entry.updatedAt) ? Math.max(0, entry.updatedAt) : 0 };
