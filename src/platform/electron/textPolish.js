@@ -93,7 +93,11 @@ class TextPolisher {
           degraded: applied.error || null });
         result.degraded = applied.error;
         const entries = this.hotWordsStore?.entriesForVersion(result.dictionary_version);
-        const aliased = require('../../helpers/protectedText').applyAliases(current, entries || []);
+        const { applyAliases, normalizeTermCase } = require('../../helpers/protectedText');
+        const normalized = normalizeTermCase(current, options.longFormat?.isTerminal === true ? [] : entries || []);
+        current = normalized.text;
+        result.stages.push({ stage: 'term_case', matches: normalized.matches });
+        const aliased = applyAliases(current, entries || []);
         current = aliased.text;
         result.stages.push({ stage: 'aliases', matches: aliased.matches });
       }

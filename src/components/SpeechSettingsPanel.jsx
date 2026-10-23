@@ -23,6 +23,7 @@ const fallbackMessage = (reason) => {
 export default function SpeechSettingsPanel() {
   const api = window.electronAPI;
   const [mode, setMode] = useState('light');
+  const [realtimeEngine, setRealtimeEngine] = useState('auto');
   const [localStatus, setLocalStatus] = useState(null);
   const [enabled, setEnabled] = useState(true);
   const [status, setStatus] = useState({ configured: {} });
@@ -35,9 +36,10 @@ export default function SpeechSettingsPanel() {
   const [previewInput, setPreviewInput] = useState('');
   const [preview, setPreview] = useState(null);
   const reload = useCallback(async () => {
-    const [provider, words, savedMode, savedEnabled] = await Promise.all([api.getProviderStatus(), api.getHotWords(), api.getSetting('text_processing_mode', 'light'), api.getSetting('text_polish_enabled', true)]);
+    const [provider, words, savedMode, savedEnabled, savedEngine] = await Promise.all([api.getProviderStatus(), api.getHotWords(), api.getSetting('text_processing_mode', 'light'), api.getSetting('text_polish_enabled', true), api.getSetting('tencent_realtime_engine', 'auto')]);
     setStatus(provider); setDictionary(words); setMode(['natural', 'prompt'].includes(savedMode) ? savedMode : 'light');
     setEnabled(savedEnabled !== false);
+    setRealtimeEngine(savedEngine === '16k_zh_en_2.0' ? savedEngine : 'auto');
   }, [api]);
   useEffect(() => { void reload().catch((e) => setMessage(e.message)); }, [reload]);
   useEffect(() => { if (mode === 'natural') api.probeLongTextService().then(setLocalStatus).catch(() => setLocalStatus({ available: false })); }, [api, mode]);
@@ -89,13 +91,18 @@ export default function SpeechSettingsPanel() {
         <button className="ml-3 text-sm text-blue-700" disabled={busy} onClick={() => run(async () => {
           await api.activateAsrConnectionProfile('tencent-direct'); setMessage('已切换腾讯本机直连');
         })}>启用腾讯本机直连</button>
-        <p className="text-xs text-gray-600">实时识别优先使用已确认的普通版免费额度；额度未知或不足时使用 2.0，2.0 和文件极速识别可能计费。</p>
+        <label className="block text-sm">实时识别方式<select className={`${INPUT} mt-1`} value={realtimeEngine} disabled={busy} onChange={e => {
+          const value = e.target.value; void run(async () => {
+            await api.setSetting('tencent_realtime_engine', value); setRealtimeEngine(value); setMessage('识别方式已保存，下次录音生效');
+          });
+        }}><option value="auto">自动 · 优先使用普通版免费额度</option><option value="16k_zh_en_2.0">大模型 2.0 · 中英混合识别（计费）</option></select></label>
+        <p className="text-xs text-gray-600">自动模式在免费额度未知或不足时使用 2.0。选择大模型 2.0 后每次录音都使用该模型，不使用普通版免费额度；按腾讯云当前价格和账号套餐计费。文件极速识别单独计费。</p>
       </div>
     </details>
     <details>
       <summary className="cursor-pointer text-sm font-medium text-blue-700">热词库 · {dictionary.count || 0} 条</summary>
       <div className="mt-3 space-y-3">
-        <p className="text-xs text-gray-600">本次可发送 {dictionary.selected || 0} 条，省略 {dictionary.omitted || 0} 条，格式不适用 {dictionary.invalid?.length || 0} 条。选中词组和最近三天编辑的词优先入选，词库完整保留；普通权重为 5。仅明确别名会参与文字替换。</p>
+        <p className="text-xs text-gray-600">本次可发送 {dictionary.selected || 0} 条，省略 {dictionary.omitted || 0} 条，格式不适用 {dictionary.invalid?.length || 0} 条。选中词组和最近三天编辑的词优先入选，词库完整保留；普通权重为 5。同音增强的专名按词表统一大小写；明确别名可用于文字替换。</p>
         <div className="flex flex-wrap gap-3">
           {Object.entries(dictionary.groups || {}).map(([id, label]) => <label key={id} className="text-sm"><input type="checkbox" checked={dictionary.activeGroups?.includes(id) || false} disabled={busy} onChange={(e) => run(async () => {
             const groups = e.target.checked ? [...dictionary.activeGroups, id] : dictionary.activeGroups.filter(g => g !== id);
@@ -104,7 +111,7 @@ export default function SpeechSettingsPanel() {
         </div>
         <label className="block text-sm"><input type="checkbox" checked={dictionary.managedWeights || false} disabled={busy} onChange={e => run(async () => {
           await api.configureHotWords({ managedWeights: e.target.checked }); await reload();
-        })} /> 普通词统一为 5，明确指定的强热词为 11（保留原始权重，可撤销）</label>
+        })} /> 普通词统一为 5，强热词为 11，同音增强保持开启（保留原始权重，可撤销）</label>
         <button className="text-sm text-blue-700" disabled={busy} onClick={() => run(async () => {
           const clipboard = await api.readClipboard();
           if (clipboard?.success === false) throw new Error('无法读取剪贴板');
@@ -119,13 +126,16 @@ export default function SpeechSettingsPanel() {
         <div className="max-h-40 overflow-auto rounded border">
           {dictionary.dictionary?.filter((e) => e.term.toLowerCase().includes(search.toLowerCase())).map((e) => <button key={e.term}
             className="flex w-full justify-between border-b px-3 py-2 text-left text-sm hover:bg-blue-50" onClick={() => setEntry(e)}>
-            <span>{e.term}</span><span className="text-gray-500">{e.enabled ? `权重 ${e.weight}` : '停用'}</span>
+            <span>{e.term}</span><span className="text-gray-500">{e.enabled ? e.weight === 100 ? '同音增强' : `权重 ${e.weight}` : '停用'}</span>
           </button>)}
         </div>
         <label className="block text-sm">词条<input className={INPUT} value={entry.term} onChange={(e) => setEntry({ ...entry, term: e.target.value })} /></label>
-        <label className="block text-sm">权重<input className={INPUT} type="number" min="1" max="11" value={entry.weight} onChange={(e) => setEntry({ ...entry, weight: Number(e.target.value) })} /></label>
+        <label className="block text-sm">识别权重<select className={INPUT} value={entry.weight} onChange={(e) => {
+          const weight = Number(e.target.value); setEntry({ ...entry, weight, strong: weight === 11 });
+        }}>{[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 100].map(weight => <option key={weight} value={weight}>{weight === 100 ? '同音增强' : weight === 11 ? '11 · 强热词' : weight}</option>)}</select></label>
+        {entry.weight === 100 && <p className="text-xs text-gray-600">识别服务会优先采用这个标准名称，无需填写错写别名。仅对经常识别错误的专名开启，可能影响同音普通词的识别。</p>}
         <label className="block text-sm">词组<select className={INPUT} value={entry.group || 'general'} onChange={e => setEntry({ ...entry, group: e.target.value })}>{Object.entries(dictionary.groups || { general: '其他词' }).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-        <label className="block text-sm"><input type="checkbox" checked={entry.strong || false} onChange={e => setEntry({ ...entry, strong: e.target.checked, weight: e.target.checked ? 11 : 5 })} /> 明确指定为强热词</label>
+        <label className="block text-sm"><input type="checkbox" checked={entry.strong || false} disabled={entry.weight === 100} onChange={e => setEntry({ ...entry, strong: e.target.checked, weight: e.target.checked ? 11 : 5 })} /> 明确指定为强热词</label>
         <label className="block text-sm">明确别名（逗号分隔）<input className={INPUT} value={entry.aliasesText ?? entry.aliases.join(',')} onChange={(e) => setEntry({ ...entry, aliases: split(e.target.value), aliasesText: e.target.value })} /></label>
         <label className="block text-sm">排除上下文（逗号分隔）<input className={INPUT} value={entry.exclusionsText ?? entry.exclusions.join(',')} onChange={(e) => setEntry({ ...entry, exclusions: split(e.target.value), exclusionsText: e.target.value })} /></label>
         <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={entry.enabled} onChange={(e) => setEntry({ ...entry, enabled: e.target.checked })} />启用</label>

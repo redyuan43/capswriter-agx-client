@@ -448,7 +448,8 @@ const longTextFormatter = new SpeechTextFormatter({
   getAsrProfileId: () => asrConnectionProfiles.readConfig().activeProfileId,
 });
 const hotWordsStore = new HotWordsStore({ dataDirectory, logger });
-const tencentDirectBridge = new TencentDirectBridge({ dataDirectory, getCredentials: () => providerSecrets.get(), hotWordsStore });
+const tencentDirectBridge = new TencentDirectBridge({ dataDirectory, getCredentials: () => providerSecrets.get(), hotWordsStore,
+  getRealtimeEngine: () => databaseManager.getSetting('tencent_realtime_engine', 'auto') });
 asrConnectionProfiles.directConnection = () => tencentDirectBridge.connection();
 const naturalProfile = databaseManager.getSetting('natural_formatter_profile', 'cec3');
 const textPolisher = new TextPolisher({ dataDirectory, logger, longFormatter: longTextFormatter,
