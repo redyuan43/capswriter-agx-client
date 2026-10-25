@@ -319,3 +319,59 @@ test('编排记录原始、纠正、最终结果，服务失败仍保留列举�
   assert.equal(result.raw_text, raw); assert.equal(result.corrected_text, raw);
   assert.match(result.final_text, /\n/); assert.equal(result.copyOnly, true); assert.equal(result.degraded, 'http_429');
 });
+
+test('配置自有端点后逐字保真改走本机；本机不可用才回退云端后备模型', async (t) => {
+  t.after(() => {
+    delete process.env.CAPSWRITER_POLISH_ENDPOINT;
+    delete process.env.CAPSWRITER_POLISH_MODEL;
+  });
+  const calls = [];
+  const record = (url, init) => { calls.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization }); };
+  const answer = (content) => mockReply(content);
+
+  process.env.CAPSWRITER_POLISH_ENDPOINT = 'http://127.0.0.1:18111/v1/chat/completions';
+  process.env.CAPSWRITER_POLISH_MODEL = 'siyuan-local';
+  const local = new SpeechTextFormatter({ getApiKey: () => 'cloud-key', fetchImpl: async (url, init) => {
+    record(url, init); return answer('我们先把整个资料，生成SVG的，找个图来，整体分析一下。');
+  } });
+  const first = await local.format('我们先把整个。资料。生成SVG的。找个图来。整体分析一下。');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://127.0.0.1:18111/v1/chat/completions');
+  assert.equal(calls[0].body.model, 'siyuan-local');
+  // 本机端点不带云端密钥，也不发只有 GLM 认的思考开关
+  assert.equal(calls[0].auth, undefined);
+  assert.equal(calls[0].body.thinking, undefined);
+  assert.deepEqual(calls[0].body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(first.provider, 'self');
+  assert.equal(first.model, 'siyuan-local');
+  assert.equal(first.text, '我们先把整个资料，生成SVG的，找个图来，整体分析一下。');
+
+  calls.length = 0;
+  const fallback = new SpeechTextFormatter({ getApiKey: () => 'cloud-key', fetchImpl: async (url, init) => {
+    record(url, init);
+    if (url.includes('127.0.0.1')) throw new Error('connect ECONNREFUSED');
+    return answer('原文保留。');
+  } });
+  const second = await fallback.format('原文保留。', { timeoutMs: 3000 });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].url, 'https://open.bigmodel.cn/api/paas/v4/chat/completions');
+  assert.equal(calls[1].body.model, 'glm-4.5-air');
+  assert.equal(calls[1].auth, 'Bearer cloud-key');
+  assert.deepEqual(calls[1].body.thinking, { type: 'disabled' });
+  assert.equal(second.provider, 'glm');
+  assert.equal(second.model, 'glm-4.5-air');
+  assert.equal(second.text, '原文保留。');
+
+  // 没配自有端点的机器行为不变：单次云端请求，默认模型仍是 glm-4.7-flash
+  delete process.env.CAPSWRITER_POLISH_ENDPOINT;
+  delete process.env.CAPSWRITER_POLISH_MODEL;
+  calls.length = 0;
+  const plain = new SpeechTextFormatter({ getApiKey: () => 'cloud-key', fetchImpl: async (url, init) => {
+    record(url, init); return answer('保留原文');
+  } });
+  await plain.format('保留原文');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://open.bigmodel.cn/api/paas/v4/chat/completions');
+  assert.equal(calls[0].body.model, 'glm-4.7-flash');
+  assert.equal(calls[0].auth, 'Bearer cloud-key');
+});
