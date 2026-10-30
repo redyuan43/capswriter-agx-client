@@ -46,7 +46,14 @@ test('模型身份、凭据和安全 endpoint 仍受约束',async()=>{
  const mismatch=new AiNaturalFormatter({env:{},getApiKey:()=> 'x',fetchImpl:async()=>({ok:true,json:async()=>({data:[{id:MODEL,root:'/different'}]})})});
  assert.equal((await mismatch.format(original)).degraded,'model_identity_mismatch');
  const {formatter}=setup();const evidence={passed:true,profile:PROFILE,model:MODEL,model_root:MODEL_ROOT,prompt_version:PROMPT_VERSION,policy_hash:POLICY_HASH};
- assert.equal(formatter.isApproved(evidence),true);assert.equal(formatter.isApproved({...evidence,policy_hash:'stale'}),false);
+ // 标点投影模式下模型正文不落地（punctuationFromCandidate 用原文重放），默认不再要求离线评测证据；
+ // 完整 evidence 校验仍在 CAPSWRITER_PUNCT_STRICT=1 下生效，过期 policy_hash 必须被拒。
+ assert.equal(formatter.isApproved(evidence),true);
+ process.env.CAPSWRITER_PUNCT_STRICT='1';
+ try{
+  assert.equal(formatter.isApproved(evidence),true);
+  assert.equal(formatter.isApproved({...evidence,policy_hash:'stale'}),false);
+ }finally{delete process.env.CAPSWRITER_PUNCT_STRICT;}
  assert.throws(()=>new AiNaturalFormatter({env:{CAPSWRITER_NATURAL_ENDPOINT:'http://example.com/v1/chat/completions'}}));
 });
 test('输出差异可重建，程序保真限制独立于原始模型候选',()=>{
