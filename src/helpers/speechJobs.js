@@ -1,11 +1,22 @@
 const { randomUUID } = require('crypto');
 
+// 松手后必须在这个窗口内交付，ASR 迟到就立刻给基础文本（原有契约，勿随意放宽）。
+const LEGACY_DELIVERY_MS = 2000;
+
 // Inference/persistence only. Delivery is explicitly requested once by the renderer;
 // a background completion has no route to clipboard, paste or TTS.
 class SpeechJobs {
   constructor({ polisher, database, approved = () => false, now = Date.now } = {}) {
     Object.assign(this, { polisher, database, approved, now });
     this.jobs = new Map();
+    // 交付预算（毫秒）。默认沿用原契约：松手后 2 秒内必须交付，ASR 迟到就立刻给基础文本。
+    // 只有显式设置 CAPSWRITER_DELIVERY_MAX_MS 才启用「给模型留窗口」的扩展模式 —— ASR 定稿
+    // 本身要 1.8s（VAD + 网络），原窗口下模型只剩约 200ms，实测必然 background_pending。
+    //   CAPSWRITER_MODEL_MIN_MS：ASR 就绪后至少留给整理模型的窗口
+    //   CAPSWRITER_DELIVERY_MAX_MS：从松手算起的总等待上限（0/未设 = 关闭扩展模式）
+    const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; };
+    this.modelMinMs = num(process.env.CAPSWRITER_MODEL_MIN_MS, 1500);
+    this.deliveryMaxMs = num(process.env.CAPSWRITER_DELIVERY_MAX_MS, 0);
   }
 
   run(text, options = {}, owner = null) {
@@ -20,7 +31,11 @@ class SpeechJobs {
     const stopped = Number(options.stoppedAtMs) || started;
     const needsModel = this.polisher.naturalFormatter.shouldFormat?.(text) !== false;
     const canAutoDeliver = needsModel && this.approved() === true;
-    const deliveryDeadline = Math.min(started + 2000, stopped + 2000);
+    // 扩展模式只影响模型窗口；needsModel=false（如 CAPSWRITER_PUNCT_OFF=1）时 deadline 恒为 started，
+    // 两条路径都立即交付基础文本，不会因为这里放宽而变慢。
+    const deliveryDeadline = this.deliveryMaxMs > 0
+      ? Math.max(started + this.modelMinMs, stopped + this.deliveryMaxMs)
+      : Math.min(started + LEGACY_DELIVERY_MS, stopped + LEGACY_DELIVERY_MS);
     const deadline = !canAutoDeliver || options.backgroundOnly || options.waitForModel === false ? started : deliveryDeadline;
     const record = this.database.createSpeechRecord(id, text);
     const job = { id, owner, controller, started, stopped, done: false, foregroundReturned: false,

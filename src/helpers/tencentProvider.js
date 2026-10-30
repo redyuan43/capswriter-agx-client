@@ -11,6 +11,16 @@ function realtimeUrl(credentials, engine, voiceId, hotword = '', now = Math.floo
     timestamp: now, nonce, voice_id: voiceId, voice_format: 1, needvad: 1, sub_service_type: 1,
     convert_num_mode: 1, filter_dirty: 0, filter_modal: 0, filter_punc: 0 };
   if (engine === STANDARD) params.word_info = 2;
+  // 2026-10-30（NX6）：云端 VAD 默认 1000ms 静音就断句，口语停顿频繁 → 平均 10 字一句、23% 是 ≤6 字碎句。
+  // 用 CAPSWRITER_TENCENT_VAD_SILENCE_MS 调整（腾讯允许 500-2000ms），未配置时保留默认行为。
+  const vadSilence = Number(process.env.CAPSWRITER_TENCENT_VAD_SILENCE_MS);
+  if (Number.isFinite(vadSilence) && vadSilence >= 500 && vadSilence <= 2000) {
+    params.vad_silence_time = Math.round(vadSilence);
+  }
+  // 2026-10-31：腾讯 domain 参数专门提升特定领域的识别效果（1=科技）。口述代码/运维术语时
+  // 比纯热词更有效，且不占 128 个热词名额。默认不开，用 CAPSWRITER_TENCENT_DOMAIN 指定。
+  const domain = Number(process.env.CAPSWRITER_TENCENT_DOMAIN);
+  if (Number.isInteger(domain) && domain >= 0 && domain <= 3) params.domain = domain;
   // 低电平麦克风可校准云端 VAD；未配置时保留腾讯默认值，不改变音频或发送节奏。
   if (noiseThreshold !== undefined && noiseThreshold !== null && String(noiseThreshold).trim() !== '') {
     const value = Number(noiseThreshold);
@@ -104,8 +114,30 @@ function normalizeSegments(data) {
   return segments.filter((s) => Number.isInteger(s.id) && s.id >= 0);
 }
 
-function joinSegments(segments) {
-  return segments.reduce((result, s) => result + (/[A-Za-z0-9,.!?;:)]$/.test(result) && /^[A-Za-z0-9]/.test(s.text) ? ' ' : '') + s.text, '');
+// 2026-10-30（NX6）：腾讯按 VAD 切句，每段末尾补「。」→ 口语里满屏句号。
+// 这里做兜底合并：非末句、以「。」结尾、有效字数 ≤ CAPSWRITER_SENTENCE_MERGE_MAX（默认 8）的，
+// 句号降级成逗号；「？！」「；」不动，末句不动，设为 0 可整体关闭。
+function mergeShortSentences(text) {
+  const limit = Number(process.env.CAPSWRITER_SENTENCE_MERGE_MAX ?? 8);
+  if (!Number.isFinite(limit) || limit <= 0) return text;
+  // 保留纯标点段（用 [^…]+|[。！？；]+ 而不是单个 [^…]+，否则开头的孤立标点会被 match 丢掉）
+  const parts = text.match(/[^。！？；]+[。！？；]?|[。！？；]+/g);
+  if (!parts || parts.length < 2) return text;
+  const out = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    const core = part.replace(/[。！？；]+$/, '');
+    const length = Array.from(core.replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '')).length;
+    const isLast = i === parts.length - 1;
+    if (!isLast && part.endsWith('。') && length > 0 && length <= limit) out.push(`${core}，`);
+    else out.push(part);
+  }
+  return out.join('').replace(/，。/g, '。');
 }
 
-module.exports = { TencentProvider, realtimeUrl, cloudRequest, normalizeSegments, joinSegments, STANDARD, MODEL2 };
+function joinSegments(segments) {
+  const joined = segments.reduce((result, s) => result + (/[A-Za-z0-9,.!?;:)]$/.test(result) && /^[A-Za-z0-9]/.test(s.text) ? ' ' : '') + s.text, '');
+  return mergeShortSentences(joined);
+}
+
+module.exports = { TencentProvider, realtimeUrl, cloudRequest, normalizeSegments, joinSegments, mergeShortSentences, STANDARD, MODEL2 };
